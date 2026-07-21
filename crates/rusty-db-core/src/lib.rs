@@ -11,6 +11,7 @@
 //! gets passed to `Engine::new`.
 
 pub mod audit;
+pub mod automap;
 pub mod backup;
 pub mod connection;
 pub mod dialect;
