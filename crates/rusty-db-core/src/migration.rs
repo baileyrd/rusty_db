@@ -7,7 +7,8 @@
 
 use std::collections::HashSet;
 
-use crate::engine::Engine;
+use crate::dialect::Dialect;
+use crate::engine::{Engine, Transaction};
 use crate::error::{Error, Result};
 use crate::query::{Delete, Insert, Select, Table};
 
@@ -35,7 +36,11 @@ pub struct AppliedMigration {
 }
 
 /// Applies/reverts `Migration`s against an `Engine`, tracking which have
-/// run in a bookkeeping table (`_rusty_db_migrations` by default).
+/// run in a bookkeeping table (`_rusty_db_migrations` by default). Each
+/// migration runs in its own dedicated transaction (see `up`). To instead
+/// fold migrations into a larger unit of work — sharing atomicity with
+/// other reads/writes, and only taking effect when that unit of work
+/// commits — use `Session::migrate` instead of `Migrator`.
 pub struct Migrator<'a> {
     engine: &'a Engine,
     table: &'static str,
@@ -61,16 +66,7 @@ impl<'a> Migrator<'a> {
         self.engine
             .connect()
             .await?
-            .execute(
-                &format!(
-                    "CREATE TABLE IF NOT EXISTS {quoted} (\
-                        version INTEGER PRIMARY KEY, \
-                        name TEXT NOT NULL, \
-                        applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP\
-                    )"
-                ),
-                &[],
-            )
+            .execute(&create_table_ddl(&quoted), &[])
             .await?;
         Ok(())
     }
@@ -204,4 +200,62 @@ fn check_unique_versions(sorted: &[&Migration]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn create_table_ddl(quoted_table: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {quoted_table} (\
+            version INTEGER PRIMARY KEY, \
+            name TEXT NOT NULL, \
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP\
+        )"
+    )
+}
+
+/// Applies every migration in `migrations` not already recorded as applied
+/// (in ascending version order) through `txn`, without committing or
+/// rolling it back — that's left to the caller. This is what
+/// `Session::migrate` uses to fold migrations into a session's own
+/// transaction; `Migrator::up` instead wraps each migration in its own
+/// dedicated transaction via `Engine::begin`.
+pub(crate) async fn apply_pending(
+    txn: &mut Transaction,
+    dialect: &dyn Dialect,
+    table: &str,
+    migrations: &[Migration],
+) -> Result<Vec<i64>> {
+    let quoted = dialect.quote_ident(table);
+    txn.execute(&create_table_ddl(&quoted), &[]).await?;
+
+    let mut sorted: Vec<&Migration> = migrations.iter().collect();
+    sorted.sort_by_key(|m| m.version);
+    check_unique_versions(&sorted)?;
+
+    let table_ref = Table::new(table);
+    let applied_query = Select::from(&table_ref).order_by(table_ref.col("version").asc());
+    let already: HashSet<i64> = txn
+        .fetch_all(&applied_query, dialect)
+        .await?
+        .iter()
+        .map(|row| row.get_by_name::<i64>("version"))
+        .collect::<Result<_>>()?;
+
+    let mut newly_applied = Vec::new();
+    for migration in sorted {
+        if already.contains(&migration.version) {
+            continue;
+        }
+
+        for statement in migration.up {
+            txn.execute(statement, &[]).await?;
+        }
+        let record = Insert::into_table(&table_ref)
+            .value("version", migration.version)
+            .value("name", migration.name);
+        txn.execute_query(&record, dialect).await?;
+
+        newly_applied.push(migration.version);
+    }
+
+    Ok(newly_applied)
 }
