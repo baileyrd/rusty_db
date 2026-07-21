@@ -166,6 +166,31 @@ impl Column {
         Expr::Column(self.clone()).is_in(values)
     }
 
+    /// `COUNT(self)`.
+    pub fn count(&self) -> Expr {
+        Expr::Column(self.clone()).count()
+    }
+
+    /// `SUM(self)`.
+    pub fn sum(&self) -> Expr {
+        Expr::Column(self.clone()).sum()
+    }
+
+    /// `AVG(self)`.
+    pub fn avg(&self) -> Expr {
+        Expr::Column(self.clone()).avg()
+    }
+
+    /// `MIN(self)`.
+    pub fn min(&self) -> Expr {
+        Expr::Column(self.clone()).min()
+    }
+
+    /// `MAX(self)`.
+    pub fn max(&self) -> Expr {
+        Expr::Column(self.clone()).max()
+    }
+
     pub fn asc(&self) -> (Column, bool) {
         (self.clone(), true)
     }

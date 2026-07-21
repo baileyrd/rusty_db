@@ -11,10 +11,10 @@ mod update;
 
 pub use bulk_insert::BulkInsert;
 pub use delete::Delete;
-pub use expr::{BinOp, Expr};
+pub use expr::{AggFunc, BinOp, Expr};
 pub use insert::Insert;
 pub use join::{Join, JoinKind};
-pub use select::Select;
+pub use select::{Select, SelectExpr};
 pub use table::{Column, Table};
 pub use update::Update;
 

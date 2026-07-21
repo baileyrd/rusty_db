@@ -31,6 +31,30 @@ impl BinOp {
     }
 }
 
+/// A SQL aggregate function — `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, all
+/// ANSI-standard and identical across every dialect this crate supports,
+/// so (unlike `BinOp::ILike`) rendering these needs no `Dialect` hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggFunc {
+    fn as_sql(self) -> &'static str {
+        match self {
+            AggFunc::Count => "COUNT",
+            AggFunc::Sum => "SUM",
+            AggFunc::Avg => "AVG",
+            AggFunc::Min => "MIN",
+            AggFunc::Max => "MAX",
+        }
+    }
+}
+
 /// A boolean/scalar SQL expression tree, built up from `Column`s and
 /// literal values, rendered to portable SQL by a `Dialect`.
 #[derive(Debug, Clone)]
@@ -50,6 +74,12 @@ pub enum Expr {
     /// rewritten to the target dialect's actual placeholder syntax in
     /// bind-parameter order. See `text()`.
     Raw(String, Vec<Value>),
+    /// `COUNT(*)` — the one aggregate with a wildcard form; every other
+    /// `AggFunc` always takes an argument, hence the separate `Agg`
+    /// variant below rather than folding this into it as `Agg(_, None)`.
+    CountAll,
+    /// `COUNT(expr)`/`SUM(expr)`/`AVG(expr)`/`MIN(expr)`/`MAX(expr)`.
+    Agg(AggFunc, Box<Expr>),
 }
 
 impl Expr {
@@ -138,6 +168,38 @@ impl Expr {
         )
     }
 
+    /// `COUNT(*)`. An associated function rather than a method on `Expr`
+    /// like the other aggregates below, since `COUNT(*)` has no inner
+    /// expression to call it on.
+    pub fn count_all() -> Self {
+        Expr::CountAll
+    }
+
+    /// `COUNT(self)`.
+    pub fn count(self) -> Self {
+        Expr::Agg(AggFunc::Count, Box::new(self))
+    }
+
+    /// `SUM(self)`.
+    pub fn sum(self) -> Self {
+        Expr::Agg(AggFunc::Sum, Box::new(self))
+    }
+
+    /// `AVG(self)`.
+    pub fn avg(self) -> Self {
+        Expr::Agg(AggFunc::Avg, Box::new(self))
+    }
+
+    /// `MIN(self)`.
+    pub fn min(self) -> Self {
+        Expr::Agg(AggFunc::Min, Box::new(self))
+    }
+
+    /// `MAX(self)`.
+    pub fn max(self) -> Self {
+        Expr::Agg(AggFunc::Max, Box::new(self))
+    }
+
     /// Render this expression to SQL, pushing any literal values into
     /// `params` in the order their placeholders appear.
     pub fn render(&self, dialect: &dyn Dialect, params: &mut Vec<Value>) -> String {
@@ -192,6 +254,10 @@ impl Expr {
                     rendered.push(ch);
                 }
                 rendered
+            }
+            Expr::CountAll => "COUNT(*)".to_string(),
+            Expr::Agg(func, inner) => {
+                format!("{}({})", func.as_sql(), inner.render(dialect, params))
             }
         }
     }
