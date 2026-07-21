@@ -4,6 +4,7 @@ use crate::connection::{Connection, Driver};
 use crate::dialect::Dialect;
 use crate::error::Result;
 use crate::mapping::FromRow;
+use crate::migration::Migrator;
 use crate::query::ToSql;
 use crate::row::Row;
 use crate::session::Session;
@@ -93,6 +94,11 @@ impl Engine {
     /// A unit-of-work session backed by this engine (see `Session`).
     pub fn session(&self) -> Session {
         Session::new(self.clone())
+    }
+
+    /// A migration runner backed by this engine (see `Migrator`).
+    pub fn migrator(&self) -> Migrator<'_> {
+        Migrator::new(self)
     }
 }
 

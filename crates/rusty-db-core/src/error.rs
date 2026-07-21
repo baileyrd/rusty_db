@@ -19,6 +19,9 @@ pub enum Error {
 
     #[error("query builder error: {0}")]
     QueryBuilder(String),
+
+    #[error("migration error: {0}")]
+    Migration(String),
 }
 
 /// Identifies a column either by its position or its name, for error reporting.

@@ -147,9 +147,38 @@ let users_by_id: HashMap<i64, User> = Order::load_user(&engine, &orders).await?;
 
 `has_many`'s loader name is the pluralized (naive `+s`) snake_case child type (`load_orders`); `belongs_to`'s is the singular snake_case parent type (`load_user`). Both are generated from, and callable directly as, `rusty_db::relations::load_many`/`load_one` if you'd rather not use the attributes (e.g. for a relationship keyed by something other than the primary key). There's no lazy-loading proxy or identity map here — relationships are always loaded explicitly, in a batch, by calling one of these functions.
 
+### Migrations
+
+`Engine::migrator()` (or `Migrator::new(&engine)`) runs versioned schema migrations, tracking which have applied in a bookkeeping table (`_rusty_db_migrations` by default). Migrations are plain SQL — the query builder covers DML, not DDL, and DDL syntax diverges more across databases than DML does, so there's no attempt to make a migration portable for you:
+
+```rust
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "create_users",
+        up: &["CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"],
+        down: &["DROP TABLE users"],
+    },
+    Migration {
+        version: 2,
+        name: "add_users_email",
+        up: &["ALTER TABLE users ADD COLUMN email TEXT"],
+        down: &[], // empty = irreversible
+    },
+];
+
+let migrator = engine.migrator();
+let applied = migrator.up(MIGRATIONS).await?; // runs every not-yet-applied migration, in order
+
+migrator.down(MIGRATIONS).await?; // reverts the most recently applied one (errors if its `down` is empty)
+migrator.status(MIGRATIONS).await?; // Vec<(Migration, bool)> — for diagnostics/tests
+```
+
+Each migration runs in its own transaction (its `up`/`down` statements plus the bookkeeping row update, atomically). If a migration fails partway through a batch, `up()`/`down()` return the error and everything before the failure in that call has already committed — fix the problem and call again to resume. Each entry in `up`/`down` is a separate SQL statement (executed one call at a time), since not every driver's query protocol supports multiple statements per call — split multi-statement changes into multiple slice entries rather than joining them with `;`.
+
 ## Status
 
-This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), and a unit-of-work `Session`. Still missing: an identity map/autoflush and migrations. Postgres and SQLite are the only drivers; both are implemented but only SQLite is exercised by the test suite in this environment (no live Postgres server available here).
+This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), a unit-of-work `Session`, and versioned migrations. Still missing: an identity map/autoflush. Postgres and SQLite are the only drivers; both are implemented but only SQLite is exercised by the test suite in this environment (no live Postgres server available here).
 
 ## Running tests
 
