@@ -1,4 +1,4 @@
-use super::expr::Expr;
+use super::expr::{Case, Expr};
 use super::join::{Join, JoinKind};
 use super::set_op::{SetOp, SetOperation};
 use super::table::{Column, Table};
@@ -60,6 +60,12 @@ impl From<Column> for SelectExpr {
 impl From<Expr> for SelectExpr {
     fn from(expr: Expr) -> Self {
         SelectExpr::new(expr)
+    }
+}
+
+impl From<Case> for SelectExpr {
+    fn from(case: Case) -> Self {
+        SelectExpr::new(case.into())
     }
 }
 

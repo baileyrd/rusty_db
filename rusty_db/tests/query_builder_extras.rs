@@ -6,10 +6,15 @@
 //! fallback to plain `LIKE` on backends without a native `ILIKE` keyword,
 //! `Table::alias` for self-joins, `Expr::text` for raw SQL fragments
 //! composed into the builder, aggregate functions/expression columns via
-//! `SelectExpr`, `Select::group_by`/`.having`, and `Select::union`/
-//! `union_all`/`intersect`/`except`. `RETURNING` on `UPDATE`/`DELETE` has
-//! no SQLite coverage here since SQLite's dialect doesn't support it (see
-//! `query_builder_extras_postgres.rs`).
+//! `SelectExpr`, `Select::group_by`/`.having`, `Select::union`/
+//! `union_all`/`intersect`/`except`, and `Column::lower`/`upper`/`concat`/
+//! `add`/`sub`/`mul`/`div`, `Expr::now`/`coalesce`, and `Case`.
+//! `RETURNING` on `UPDATE`/`DELETE` has no SQLite coverage here since
+//! SQLite's dialect doesn't support it (see
+//! `query_builder_extras_postgres.rs`); `Column::concat`'s `CONCAT(...)`
+//! fallback on MySQL/MariaDB (vs. `||` elsewhere) is dialect-specific
+//! enough to get its own live-server coverage there too (see
+//! `query_builder_extras_mysql.rs`).
 
 use rusty_db::prelude::*;
 
@@ -395,6 +400,101 @@ async fn set_operations_chain_to_combine_more_than_two_selects() -> rusty_db::Re
         rows,
         vec!["Ada".to_string(), "Grace".to_string(), "ada".to_string()]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn string_functions_and_arithmetic_execute_and_decode_correctly() -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    // id=1: customer "Ada", amount 10.
+    let row = engine
+        .fetch_one(
+            &Select::from(&orders)
+                .columns([
+                    SelectExpr::from(orders.col("customer").lower()).alias("lower_name"),
+                    SelectExpr::from(orders.col("customer").upper()).alias("upper_name"),
+                    SelectExpr::from(orders.col("customer").concat(Expr::lit("!"))).alias("shout"),
+                    SelectExpr::from(orders.col("amount").mul(Expr::lit(2_i64))).alias("doubled"),
+                ])
+                .filter(orders.col("id").eq(1_i64)),
+        )
+        .await?;
+    assert_eq!(row.get_by_name::<String>("lower_name")?, "ada");
+    assert_eq!(row.get_by_name::<String>("upper_name")?, "ADA");
+    assert_eq!(row.get_by_name::<String>("shout")?, "Ada!");
+    assert_eq!(row.get_by_name::<i64>("doubled")?, 20);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn case_and_coalesce_execute_and_decode_correctly() -> rusty_db::Result<()> {
+    let engine = SqliteDriver::engine("sqlite::memory:").await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE customers (id INTEGER PRIMARY KEY, nickname TEXT, name TEXT NOT NULL, \
+             amount INTEGER NOT NULL)",
+            &[],
+        )
+        .await?;
+
+    let customers = Table::new("customers");
+    engine
+        .execute(
+            &Insert::into_table(&customers)
+                .value("id", 1_i64)
+                .value("nickname", Value::Null)
+                .value("name", "Ada")
+                .value("amount", 200_i64),
+        )
+        .await?;
+    engine
+        .execute(
+            &Insert::into_table(&customers)
+                .value("id", 2_i64)
+                .value("nickname", "Gracie")
+                .value("name", "Grace")
+                .value("amount", 30_i64),
+        )
+        .await?;
+
+    let tier = Case::new()
+        .when(customers.col("amount").gt(100_i64), Expr::lit("gold"))
+        .when(customers.col("amount").gt(50_i64), Expr::lit("silver"))
+        .otherwise(Expr::lit("bronze"));
+
+    let rows = engine
+        .fetch_all(
+            &Select::from(&customers)
+                .columns([
+                    SelectExpr::from(Expr::coalesce([
+                        Expr::col(customers.col("nickname")),
+                        Expr::col(customers.col("name")),
+                    ]))
+                    .alias("display_name"),
+                    SelectExpr::from(tier).alias("tier"),
+                ])
+                .order_by(customers.col("id").asc()),
+        )
+        .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[0].get_by_name::<String>("display_name")?,
+        "Ada",
+        "nickname is NULL, so COALESCE falls back to name"
+    );
+    assert_eq!(rows[0].get_by_name::<String>("tier")?, "gold");
+    assert_eq!(
+        rows[1].get_by_name::<String>("display_name")?,
+        "Gracie",
+        "nickname is present, so COALESCE uses it directly"
+    );
+    assert_eq!(rows[1].get_by_name::<String>("tier")?, "bronze");
 
     Ok(())
 }

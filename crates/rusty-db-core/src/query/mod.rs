@@ -12,7 +12,7 @@ mod update;
 
 pub use bulk_insert::BulkInsert;
 pub use delete::Delete;
-pub use expr::{AggFunc, BinOp, Expr};
+pub use expr::{AggFunc, ArithOp, BinOp, Case, Expr};
 pub use insert::Insert;
 pub use join::{Join, JoinKind};
 pub use select::{Select, SelectExpr};
