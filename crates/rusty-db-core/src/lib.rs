@@ -1,0 +1,27 @@
+//! `rusty-db-core`: the database-agnostic layer of rusty_db.
+//!
+//! This crate defines everything that does *not* depend on any particular
+//! database: a portable query builder (`Table`, `Column`, `Expr`, `Select`,
+//! `Insert`, `Update`, `Delete`), a decoded-row type (`Row`, `Value`), and
+//! the trait objects (`Driver`, `Connection`, `Executor`) a concrete driver
+//! crate (e.g. `rusty-db-sqlite`, `rusty-db-postgres`) must implement.
+//!
+//! Application code depends only on `Engine` plus the query builder; which
+//! database is actually behind it is decided at startup by which `Driver`
+//! gets passed to `Engine::new`.
+
+pub mod connection;
+pub mod dialect;
+pub mod engine;
+pub mod error;
+pub mod query;
+pub mod row;
+pub mod value;
+
+pub use connection::{Connection, Driver, Executor};
+pub use dialect::Dialect;
+pub use engine::{Engine, Transaction};
+pub use error::{Error, Result};
+pub use query::{Column, Delete, Expr, Insert, Select, Table, ToSql, Update};
+pub use row::Row;
+pub use value::{FromValue, Value};

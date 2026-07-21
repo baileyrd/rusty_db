@@ -1,0 +1,11 @@
+[package]
+name = "rusty-db-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Database-agnostic query builder and driver abstraction (the SQLAlchemy-Core-like layer of rusty_db)"
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
