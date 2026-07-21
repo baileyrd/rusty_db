@@ -9,8 +9,8 @@ use sqlx::{Column as _, Row as _, Sqlite, SqlitePool, TypeInfo as _, ValueRef as
 
 use rusty_db_core::dialect::QuestionMarkDialect;
 use rusty_db_core::{
-    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, ForeignKey, PoolConfig,
-    PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
+    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, ForeignKey, IndexInfo,
+    PoolConfig, PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
 };
 
 static DIALECT: QuestionMarkDialect = QuestionMarkDialect;
@@ -138,16 +138,18 @@ impl Driver for SqliteDriver {
             .collect::<Result<Vec<_>>>()?;
 
         // SQLite implements UNIQUE constraints as unique indexes; the one
-        // backing the primary key itself (origin = "pk") is excluded, since
-        // that's already `ColumnInfo::primary_key`, not a separate UNIQUE.
+        // backing the primary key itself (origin = "pk") is excluded from
+        // both `indexes` and `unique_constraints`, since that's already
+        // `ColumnInfo::primary_key`.
         let index_rows = conn
             .fetch_all(&format!("PRAGMA index_list({quoted_table})"), &[])
             .await?;
         let mut unique_constraints = Vec::new();
+        let mut indexes = Vec::new();
         for index_row in &index_rows {
             let is_unique = index_row.get_by_name::<i64>("unique")? != 0;
             let origin = index_row.get_by_name::<String>("origin")?;
-            if !is_unique || origin == "pk" {
+            if origin == "pk" {
                 continue;
             }
             let index_name = index_row.get_by_name::<String>("name")?;
@@ -163,7 +165,15 @@ impl Driver for SqliteDriver {
                     columns.push(name);
                 }
             }
-            if !columns.is_empty() {
+            if columns.is_empty() {
+                continue;
+            }
+            indexes.push(IndexInfo {
+                name: index_name.clone(),
+                columns: columns.clone(),
+                unique: is_unique,
+            });
+            if is_unique {
                 unique_constraints.push(UniqueConstraint {
                     name: index_name,
                     columns,
@@ -221,6 +231,7 @@ impl Driver for SqliteDriver {
             unique_constraints,
             check_constraints,
             foreign_keys,
+            indexes,
         }))
     }
 }

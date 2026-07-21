@@ -11,7 +11,8 @@ use sqlx::{Column as _, MySql, MySqlPool, Row as _, TypeInfo as _};
 use rusty_db_core::dialect::MySqlDialect;
 use rusty_db_core::{
     CheckConstraint, ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, ForeignKey,
-    PoolConfig, PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
+    IndexInfo, PoolConfig, PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint,
+    Value,
 };
 
 static DIALECT: MySqlDialect = MySqlDialect;
@@ -194,10 +195,25 @@ impl Driver for MySqlDriver {
                    AND table_name = ? \
                    AND referenced_table_name IS NOT NULL \
                  ORDER BY constraint_name, ordinal_position",
-                &[table_value],
+                std::slice::from_ref(&table_value),
             )
             .await?;
         let foreign_keys = group_foreign_keys(&fk_rows)?;
+
+        // `index_name = "PRIMARY"` is the primary key's own backing index
+        // (already `ColumnInfo::primary_key`), so it's excluded here.
+        let index_rows = conn
+            .fetch_all(
+                "SELECT index_name, non_unique, column_name \
+                 FROM information_schema.statistics \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = ? \
+                   AND index_name != 'PRIMARY' \
+                 ORDER BY index_name, seq_in_index",
+                &[table_value],
+            )
+            .await?;
+        let indexes = group_indexes(&index_rows)?;
 
         Ok(Some(TableSchema {
             name: table.to_string(),
@@ -205,6 +221,7 @@ impl Driver for MySqlDriver {
             unique_constraints,
             check_constraints,
             foreign_keys,
+            indexes,
         }))
     }
 }
@@ -248,6 +265,29 @@ fn group_foreign_keys(rows: &[Row]) -> Result<Vec<ForeignKey>> {
                 referenced_table: row.get_by_name::<String>("referenced_table_name")?,
                 referenced_columns: vec![referenced_column],
             }),
+        }
+    }
+    Ok(result)
+}
+
+/// Groups rows of `(index_name, non_unique, column_name)` — ordered by
+/// `index_name` then `seq_in_index` — into one `IndexInfo` per distinct
+/// name. `non_unique` is MySQL's own inverted spelling: `0` means unique.
+fn group_indexes(rows: &[Row]) -> Result<Vec<IndexInfo>> {
+    let mut result: Vec<IndexInfo> = Vec::new();
+    for row in rows {
+        let name = row.get_by_name::<String>("index_name")?;
+        let column = row.get_by_name::<String>("column_name")?;
+        match result.last_mut() {
+            Some(last) if last.name == name => last.columns.push(column),
+            _ => {
+                let non_unique = row.get_by_name::<i64>("non_unique")?;
+                result.push(IndexInfo {
+                    name,
+                    columns: vec![column],
+                    unique: non_unique == 0,
+                })
+            }
         }
     }
     Ok(result)
