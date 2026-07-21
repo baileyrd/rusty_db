@@ -216,6 +216,35 @@ impl Engine {
         self.driver.table_schema(table).await
     }
 
+    /// Generates `#[derive(Mapped)]` struct source for one table, straight
+    /// from live schema reflection — a starting point for mapping an
+    /// existing database, not a fully automatic replacement for writing
+    /// it by hand. See `crate::automap::generate_struct` for exactly what
+    /// it does and doesn't attempt (column type mapping is a best-effort
+    /// heuristic; relationships aren't generated, just listed in a
+    /// trailing comment).
+    pub async fn automap_table(&self, table: &str) -> Result<String> {
+        let schema = self
+            .table_schema(table)
+            .await?
+            .ok_or_else(|| Error::Database(format!("table {table:?} does not exist")))?;
+        Ok(crate::automap::generate_struct(&schema))
+    }
+
+    /// Like `automap_table`, for every table in the database (per
+    /// `list_tables`), concatenated together.
+    pub async fn automap_all(&self) -> Result<String> {
+        let tables = self.list_tables().await?;
+        let mut out = String::new();
+        for table in &tables {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&self.automap_table(table).await?);
+        }
+        Ok(out)
+    }
+
     /// A snapshot of the underlying connection pool: how many connections
     /// are open, idle, and in use against `max_connections`, how many
     /// callers are waiting on one right now, and how many acquires have
