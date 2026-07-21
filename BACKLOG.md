@@ -57,9 +57,11 @@ keys/indexes/unique constraints/check constraints/column defaults);
 logical backup/restore; read replicas; TLS; query timeouts; connection-pool
 observability; connection-level event hooks (`PoolConfig::with_on_connect`/
 `.with_before_acquire`/`.with_after_release`); a tunable per-connection
-statement-cache capacity (`PoolConfig::with_statement_cache_capacity`); and
-streaming query results (`Engine::fetch_stream`/`fetch_stream_as`).
-See `README.md` for the full tour with examples.
+statement-cache capacity (`PoolConfig::with_statement_cache_capacity`);
+streaming query results (`Engine::fetch_stream`/`fetch_stream_as`); and
+automap-style `#[derive(Mapped)]` struct generation from live schema
+reflection (`Engine::automap_table`/`automap_all`). See `README.md` for
+the full tour with examples.
 
 ---
 
@@ -125,11 +127,11 @@ See `README.md` for the full tour with examples.
 - **A migration CLI** (an Alembic-equivalent command-line tool — `rusty-db
   migrate up`/`down`/`status` as a standalone binary, vs. today's
   library-only `Migrator`/`session.migrate()` API) — there's no binary
-  crate anywhere in the workspace yet. **M**
-- **Automap-style reverse engineering** (generate `#[derive(Mapped)]`
-  structs from an existing database's schema, using the reflection this
-  crate already has) — a natural, self-contained follow-on now that FK
-  reflection is in place. **L**
+  crate anywhere in the workspace yet. Note: migrations are always defined
+  as compile-time Rust `const` arrays (`&'static [Migration]`), not loaded
+  from files on disk, so a genuinely standalone binary needs a file-based
+  migration format invented first — a bigger prerequisite than the effort
+  guess suggests. **M**
 
 ---
 
