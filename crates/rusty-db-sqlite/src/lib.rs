@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
 use sqlx::{
@@ -665,5 +666,20 @@ impl Executor for SqliteConnection {
 impl Connection for SqliteConnection {
     fn cached_statement_count(&self) -> usize {
         self.conn.cached_statements_size()
+    }
+
+    fn fetch_stream(
+        self: Box<Self>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> rusty_db_core::BoxStream<'static, Result<Row>> {
+        let SqliteConnection { mut conn } = *self;
+        Box::pin(async_stream::try_stream! {
+            let query = bind_params!(sqlx::query(&sql), &params);
+            let mut rows = query.fetch(&mut *conn);
+            while let Some(row) = rows.next().await {
+                yield row_from_sqlite(&row.map_err(to_core_err)?)?;
+            }
+        })
     }
 }
