@@ -8,7 +8,7 @@ use crate::engine::{Engine, Transaction};
 use crate::error::{Error, Result};
 use crate::mapping::{Entity, FromRow, Identifiable, Mapped};
 use crate::migration::{self, Migration};
-use crate::query::{BulkInsert, Insert, Select, Table, ToSql, Update};
+use crate::query::{BulkInsert, Delete, Insert, Select, Table, ToSql, Update};
 use crate::value::Value;
 
 /// One write queued by `add`/`update`/`delete`, tagged with what it's for
@@ -192,6 +192,59 @@ impl Session {
             operation: AuditOperation::Delete,
             query,
             requires_row_affected: T::VERSION_COLUMN.is_some(),
+        });
+    }
+
+    /// Queue an arbitrary `UPDATE` against `T`'s table — not bound to any
+    /// single entity — for changing every row matching a filter in one
+    /// statement, instead of loading each one and calling `update` per
+    /// instance. Not sent until the next flush, and audit-logged the same
+    /// way `add`/`update`/`delete` are when enabled.
+    ///
+    /// Bypasses the identity map entirely: any already-cached instances of
+    /// `T` this happens to touch are not updated in memory and will look
+    /// stale until evicted (`clear_identity_map()`) or reloaded. There's
+    /// also no optimistic-locking check here even if `T` has a
+    /// `#[table(version)]` field — matching zero rows is a normal, silent
+    /// outcome for a filter-scoped bulk update, unlike a single entity's
+    /// `update`, which always expects to match the one row it was loaded
+    /// from.
+    ///
+    /// ```
+    /// # use rusty_db_core::{Mapped, Session, Table, Update};
+    /// # fn example<T: Mapped>(session: &mut Session) {
+    /// let table = Table::new(T::TABLE_NAME);
+    /// session.bulk_update::<T>(
+    ///     Update::table(&table)
+    ///         .set("active", false)
+    ///         .filter(table.col("last_login").lt("2020-01-01")),
+    /// );
+    /// # }
+    /// ```
+    pub fn bulk_update<T: Mapped>(&mut self, update: Update) {
+        self.pending.push(PendingWrite {
+            table: T::TABLE_NAME,
+            operation: AuditOperation::Update,
+            query: Box::new(update),
+            requires_row_affected: false,
+        });
+    }
+
+    /// Queue an arbitrary `DELETE` against `T`'s table — not bound to any
+    /// single entity — for removing every row matching a filter in one
+    /// statement. Not sent until the next flush.
+    ///
+    /// Bypasses the identity map and any `#[table(soft_delete)]` column:
+    /// this is always a real, hard `DELETE` (use `Session::delete` for the
+    /// soft-delete-aware, single-entity path). Any already-cached
+    /// instances of `T` this happens to touch stay cached; evict them
+    /// yourself (`clear_identity_map()`) if that matters.
+    pub fn bulk_delete<T: Mapped>(&mut self, delete: Delete) {
+        self.pending.push(PendingWrite {
+            table: T::TABLE_NAME,
+            operation: AuditOperation::Delete,
+            query: Box::new(delete),
+            requires_row_affected: false,
         });
     }
 
