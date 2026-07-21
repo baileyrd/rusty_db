@@ -23,7 +23,7 @@
 //! ```
 //!
 //! generates:
-//! - `impl Mapped for User` (`TABLE_NAME`, `COLUMNS`, `PRIMARY_KEY`, `VERSION_COLUMN`)
+//! - `impl Mapped for User` (`TABLE_NAME`, `COLUMNS`, `PRIMARY_KEY`, `VERSION_COLUMN`, `SOFT_DELETE_COLUMN`)
 //! - `impl FromRow for User` (decodes a `Row` by column name)
 //! - `impl Entity for User` (so `Session::add` can queue it generically)
 //! - `User::table() -> Table`
@@ -47,6 +47,14 @@
 //! `Session::update`/`delete`, which turn a resulting zero-rows-affected
 //! outcome into `Error::Conflict` — someone else changed or deleted the
 //! row since this struct was loaded.
+//!
+//! A field marked `#[table(soft_delete)]` (a `bool` column; requires
+//! `#[table(primary_key)]` too) turns on soft deletes: `Session::delete`
+//! marks the row (`SET <column> = true`) instead of removing it, and
+//! `Session::get` treats an already-marked row as not found. `delete_query`
+//! itself is unaffected — it's always a real `DELETE`, for explicit/direct
+//! use outside a `Session`. See `Mapped::not_deleted_filter` for building
+//! the same "still active" condition into your own queries.
 //!
 //! Field types must implement `Into<Value>` on an owned clone (i.e. the set
 //! of types `Value` already converts from: `bool`, `i64`, `i32`, `f64`,
@@ -74,6 +82,7 @@ struct FieldInfo {
     column: String,
     primary_key: bool,
     version: bool,
+    soft_delete: bool,
 }
 
 /// The shared shape of `#[has_many(Target, foreign_key = "...")]` and
@@ -148,6 +157,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         let mut column = ident.to_string();
         let mut primary_key = false;
         let mut version = false;
+        let mut soft_delete = false;
 
         for attr in &field.attrs {
             if !attr.path().is_ident("table") {
@@ -164,9 +174,12 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 } else if meta.path.is_ident("version") {
                     version = true;
                     Ok(())
+                } else if meta.path.is_ident("soft_delete") {
+                    soft_delete = true;
+                    Ok(())
                 } else {
                     Err(meta.error(
-                        "unsupported #[table(...)] field attribute; expected `column = \"...\"`, `primary_key`, or `version`",
+                        "unsupported #[table(...)] field attribute; expected `column = \"...\"`, `primary_key`, `version`, or `soft_delete`",
                     ))
                 }
             })?;
@@ -178,6 +191,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             column,
             primary_key,
             version,
+            soft_delete,
         });
     }
 
@@ -205,6 +219,21 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         ));
     }
 
+    let soft_delete_fields: Vec<&FieldInfo> = fields.iter().filter(|f| f.soft_delete).collect();
+    if soft_delete_fields.len() > 1 {
+        return Err(syn::Error::new_spanned(
+            struct_ident,
+            "at most one field may be marked #[table(soft_delete)]",
+        ));
+    }
+    let soft_delete_field = soft_delete_fields.into_iter().next();
+    if soft_delete_field.is_some() && primary_key.is_none() {
+        return Err(syn::Error::new_spanned(
+            struct_ident,
+            "#[table(soft_delete)] requires a #[table(primary_key)] field too",
+        ));
+    }
+
     let core = core_crate_path();
 
     let column_lits: Vec<&str> = fields.iter().map(|f| f.column.as_str()).collect();
@@ -228,6 +257,14 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     };
 
     let version_column_const = match version_field {
+        Some(f) => {
+            let column = &f.column;
+            quote! { ::std::option::Option::Some(#column) }
+        }
+        None => quote! { ::std::option::Option::None },
+    };
+
+    let soft_delete_column_const = match soft_delete_field {
         Some(f) => {
             let column = &f.column;
             quote! { ::std::option::Option::Some(#column) }
@@ -326,6 +363,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             const COLUMNS: &'static [&'static str] = &[#(#column_lits),*];
             const PRIMARY_KEY: ::std::option::Option<&'static str> = #primary_key_const;
             const VERSION_COLUMN: ::std::option::Option<&'static str> = #version_column_const;
+            const SOFT_DELETE_COLUMN: ::std::option::Option<&'static str> = #soft_delete_column_const;
         }
 
         impl #core::FromRow for #struct_ident {

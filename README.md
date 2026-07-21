@@ -264,6 +264,30 @@ session.commit().await?; // Err(Error::Conflict(_)) — the stored version is al
 
 `update`'s generated `WHERE` clause requires the version column to still match what this struct was loaded with (and its `SET` clause increments it); `delete_query`'s `WHERE` clause requires the same match, unchanged. When `Session::update`/`delete`'s statement ends up matching zero rows — because the version moved on (or the row's gone entirely) — `flush`/`commit` return `Error::Conflict` instead of treating it as a silent no-op. A type with no `#[table(version)]` field is completely unaffected: a stale/missing-row update or delete on it stays a silent no-op, exactly as before this feature existed.
 
+### Soft deletes
+
+A `#[table(soft_delete)]` field (a `bool` column, alongside `#[table(primary_key)]`) turns `Session::delete` from a real `DELETE` into a marker `UPDATE`, and makes reads transparently skip marked rows:
+
+```rust
+#[derive(Mapped)]
+#[table(name = "users")]
+struct User {
+    #[table(primary_key)]
+    id: i64,
+    #[table(soft_delete)]
+    deleted: bool,
+    name: String,
+}
+
+session.delete(&user); // issues `UPDATE users SET deleted = true WHERE id = 1`, not a DELETE
+session.commit().await?;
+
+assert_eq!(session.get::<User>(1_i64).await?, None); // treated the same as a row that was never there
+let active = session.load_active::<User>().await?; // every row except ones marked deleted
+```
+
+`Mapped::not_deleted_filter()` gives you the same `<column> = false` condition for building into your own queries (`Select::from(&table).filter(User::not_deleted_filter().unwrap())`) — it needs no per-type code generation, since it's built entirely from `TABLE_NAME` and the `SOFT_DELETE_COLUMN` const at the trait-default level. `delete_query()` itself is untouched — always a real `DELETE` — so calling it directly still gives you a genuine hard delete on a soft-deletable type if you ever need one. A type with no `#[table(soft_delete)]` field is completely unaffected: `delete` stays a real delete, and `get`/`load_active` (equivalent to `load_all` here) see every row.
+
 ### Identity map
 
 `Session::get`/`load_all` cache decoded rows by `(type, primary key)`: loading the same row twice through the same session returns the exact same `Rc<RefCell<T>>` handle rather than two independently-decoded copies, and mutations made through one handle are visible through any other handle to that row — including handles you fetch *after* the mutation, since the identity map wins over what's actually in the database:
@@ -394,6 +418,8 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 `tests/optimistic_locking.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — the two conflict-detection tests, since the identity/no-op-without-`#[table(version)]` cases don't need re-proving per driver) cover `#[table(version)]`: updating with the current version succeeds and increments the stored version; updating with a stale version (superseded by someone else's edit) fails with `Error::Conflict` and leaves the other edit intact; updating a row someone else already deleted also conflicts; the same two cases for `delete`; and a type with no `#[table(version)]` field keeps its pre-existing behavior of a silent no-op on a stale/missing-row write — proving the feature is fully opt-in.
 
 `tests/bulk_insert.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — the round-trip and rollback tests, since `BulkInsert::combine`'s own rendering/validation is pure query-builder logic that doesn't need a live server to re-prove per driver) cover `BulkInsert`/`Session::add_all`: combining several `Insert`s renders one statement with one `VALUES` group per row; combining zero inserts yields `None` rather than an invalid empty statement; combining `Insert`s from different tables is rejected; `add_all` queues exactly one pending write for the whole slice (not one per entity) and an empty slice is a no-op; a failing bulk insert (a duplicate primary key partway through) rolls back the entire batch, including rows that would've inserted fine on their own; and a `BulkInsert` works standalone through `engine.execute()`, without a `Session` at all.
+
+`tests/soft_delete.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests that most directly exercise the feature end to end, since the query-builder-level `not_deleted_filter`/`load_active` coverage and the plain-type-is-unaffected case don't need re-proving per driver) cover `#[table(soft_delete)]`: `Session::delete` marks the row (`SET <column> = true`) instead of removing it; `Session::get` treats an already-marked row the same as one that was never there, including from a fresh `Session` with no identity-map cache from before the delete; `Mapped::not_deleted_filter()` and `Session::load_active` both exclude marked rows from query results; calling an entity's own `delete_query()` directly still issues a real, unmarked `DELETE`; and a type with no `#[table(soft_delete)]` field keeps `Session::delete`'s pre-existing behavior of a genuine hard delete, proving the feature is fully opt-in.
 
 ## Running tests
 
