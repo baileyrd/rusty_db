@@ -58,3 +58,10 @@ pub use uuid::Uuid;
 /// without depending on the `bigdecimal` crate directly — this is exactly
 /// the type `Value::Decimal` wraps, so the versions can never mismatch.
 pub use bigdecimal::BigDecimal;
+
+/// `serde_json`'s own `Value` type, re-exported (and renamed, to avoid
+/// colliding with this crate's own `Value`) so a `#[derive(Mapped)]` field
+/// can be typed `Json` without depending on `serde_json` directly — this
+/// is exactly the type `Value::Json` wraps, so the versions can never
+/// mismatch.
+pub use serde_json::Value as Json;
