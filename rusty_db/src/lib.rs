@@ -54,7 +54,7 @@ pub mod prelude {
         Join, JoinKind, Json, Mapped, Migration, Migrator, NaiveDate, NaiveDateTime, NaiveTime,
         PoolConfig, PoolStats, ReplicaSet, Row, Savepoint, Select, SelectExpr, Session,
         SessionQuery, SetOperation, Table, TableDump, TableSchema, ToSql, Transaction, Update, Utc,
-        Uuid, Value,
+        Uuid, Value, Window,
     };
 
     // `Mapped` above is the trait (type namespace); this is the derive

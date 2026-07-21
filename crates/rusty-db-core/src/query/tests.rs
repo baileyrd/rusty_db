@@ -770,3 +770,85 @@ fn scalar_subquery_renders_as_a_parenthesized_select_and_can_be_aliased() {
         r#"SELECT "users"."id", (SELECT COUNT(*) FROM "orders" WHERE "orders"."user_id" = "users"."id") AS "order_count" FROM "users""#
     );
 }
+
+#[test]
+fn row_number_renders_with_partition_by_and_order_by() {
+    let orders = Table::new("orders");
+    let row_num = Expr::row_number().over(
+        Window::new()
+            .partition_by([orders.col("customer")])
+            .order_by(orders.col("id").asc()),
+    );
+
+    let (sql, params) = Select::from(&orders)
+        .columns([SelectExpr::from(row_num).alias("rn")])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT ROW_NUMBER() OVER (PARTITION BY "orders"."customer" ORDER BY "orders"."id" ASC) AS "rn" FROM "orders""#
+    );
+    assert!(params.is_empty());
+}
+
+#[test]
+fn rank_and_dense_rank_render_their_own_function_name() {
+    let orders = Table::new("orders");
+
+    let (rank_sql, _) = Select::from(&orders)
+        .columns([SelectExpr::from(
+            Expr::rank().over(Window::new().order_by(orders.col("amount").desc())),
+        )
+        .alias("r")])
+        .to_sql(&QuestionMarkDialect);
+    assert!(rank_sql.contains("RANK() OVER (ORDER BY \"orders\".\"amount\" DESC)"));
+
+    let (dense_rank_sql, _) = Select::from(&orders)
+        .columns([SelectExpr::from(
+            Expr::dense_rank().over(Window::new().order_by(orders.col("amount").desc())),
+        )
+        .alias("dr")])
+        .to_sql(&QuestionMarkDialect);
+    assert!(dense_rank_sql.contains("DENSE_RANK() OVER (ORDER BY \"orders\".\"amount\" DESC)"));
+}
+
+#[test]
+fn an_aggregate_can_be_used_as_a_window_function() {
+    let orders = Table::new("orders");
+    let running_total = orders.col("amount").sum().over(
+        Window::new()
+            .partition_by([orders.col("customer")])
+            .order_by(orders.col("id").asc()),
+    );
+
+    let (sql, _) = Select::from(&orders)
+        .columns([SelectExpr::from(running_total).alias("running_total")])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT SUM("orders"."amount") OVER (PARTITION BY "orders"."customer" ORDER BY "orders"."id" ASC) AS "running_total" FROM "orders""#
+    );
+}
+
+#[test]
+fn window_with_partition_by_only_omits_order_by() {
+    let orders = Table::new("orders");
+    let (sql, _) = Select::from(&orders)
+        .columns([SelectExpr::from(
+            Expr::count_all().over(Window::new().partition_by([orders.col("customer")])),
+        )
+        .alias("n")])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT COUNT(*) OVER (PARTITION BY "orders"."customer") AS "n" FROM "orders""#
+    );
+}
+
+#[test]
+fn window_with_neither_clause_renders_an_empty_over() {
+    let orders = Table::new("orders");
+    let (sql, _) = Select::from(&orders)
+        .columns([SelectExpr::from(Expr::count_all().over(Window::new())).alias("n")])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"SELECT COUNT(*) OVER () AS "n" FROM "orders""#);
+}
