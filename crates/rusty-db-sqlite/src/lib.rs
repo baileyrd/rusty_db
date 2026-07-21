@@ -578,6 +578,15 @@ macro_rules! bind_params {
                 // SQLite has no native JSON type either; bind its text
                 // form, same as any other text value.
                 Value::Json(j) => query.bind(j.to_string()),
+                // SQLite has no native DATE/TIME/DATETIME type either;
+                // bind each's ISO 8601 text form, same as any other text
+                // value — `FromValue` parses that same form back.
+                Value::Date(d) => query.bind(d.to_string()),
+                Value::Time(t) => query.bind(t.to_string()),
+                Value::DateTime(dt) => query.bind(dt.to_string()),
+                // Same reasoning, but RFC 3339 (so the offset survives),
+                // since SQLite has no native TIMESTAMPTZ-equivalent type.
+                Value::Timestamp(ts) => query.bind(ts.to_rfc3339()),
             };
         }
         query

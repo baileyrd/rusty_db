@@ -65,3 +65,10 @@ pub use bigdecimal::BigDecimal;
 /// is exactly the type `Value::Json` wraps, so the versions can never
 /// mismatch.
 pub use serde_json::Value as Json;
+
+/// Re-exported so a `#[derive(Mapped)]` field can be typed `NaiveDate`/
+/// `NaiveTime`/`NaiveDateTime`/`DateTime<Utc>` without depending on the
+/// `chrono` crate directly — these are exactly the types
+/// `Value::Date`/`Value::Time`/`Value::DateTime`/`Value::Timestamp` wrap,
+/// so the versions can never mismatch.
+pub use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};

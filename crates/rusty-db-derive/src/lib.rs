@@ -73,8 +73,9 @@
 //!
 //! Field types must implement `Into<Value>` on an owned clone (i.e. the set
 //! of types `Value` already converts from: `bool`, `i64`, `i32`, `f64`,
-//! `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, `Json`, and `Option<_>` of
-//! those — plus any type carrying `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]`,
+//! `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, `Json`, `NaiveDate`,
+//! `NaiveTime`, `NaiveDateTime`, `DateTime<Utc>`, and `Option<_>` of those
+//! — plus any type carrying `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]`,
 //! below, or implementing `Into<Value>`/`FromValue` itself by hand). A
 //! `#[table(version)]` field's type must also support `+ 1` (in practice,
 //! `i64`/`i32`).

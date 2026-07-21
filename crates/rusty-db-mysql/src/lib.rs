@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
 use sqlx::pool::PoolConnection;
-use sqlx::types::chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::{Column as _, MySql, MySqlPool, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::MySqlDialect;
@@ -372,22 +372,32 @@ fn row_from_mysql(row: &MySqlRow) -> Result<Row> {
                 .unwrap_or(Value::Null),
             // DATE/TIME/DATETIME/TIMESTAMP are packed binary structures on
             // MySQL's wire protocol, not text (unlike DECIMAL/JSON below) —
-            // decode via `chrono` and format to text, since `Value` has no
-            // dedicated temporal variant.
+            // each needs its own typed decode via `chrono`.
             "DATE" => row
                 .try_get::<Option<NaiveDate>, _>(i)
                 .map_err(to_core_err)?
-                .map(|v| Value::Text(v.to_string()))
+                .map(Value::Date)
                 .unwrap_or(Value::Null),
             "TIME" => row
                 .try_get::<Option<NaiveTime>, _>(i)
                 .map_err(to_core_err)?
-                .map(|v| Value::Text(v.to_string()))
+                .map(Value::Time)
                 .unwrap_or(Value::Null),
-            "DATETIME" | "TIMESTAMP" => row
+            // DATETIME has no time zone at all in MySQL's own semantics;
+            // TIMESTAMP, unlike DATETIME, always stores and reports as UTC
+            // (converting to/from the session's own time zone on the
+            // wire), so it maps to Value::Timestamp instead — same
+            // Postgres TIMESTAMP-vs-TIMESTAMPTZ split, by name rather than
+            // by wire format (both are the same packed bytes on MySQL).
+            "DATETIME" => row
                 .try_get::<Option<NaiveDateTime>, _>(i)
                 .map_err(to_core_err)?
-                .map(|v| Value::Text(v.to_string()))
+                .map(Value::DateTime)
+                .unwrap_or(Value::Null),
+            "TIMESTAMP" => row
+                .try_get::<Option<DateTime<Utc>>, _>(i)
+                .map_err(to_core_err)?
+                .map(Value::Timestamp)
                 .unwrap_or(Value::Null),
             "NULL" => Value::Null,
             // VARCHAR, TEXT, CHAR, DECIMAL, JSON, ENUM, and anything else
@@ -431,6 +441,13 @@ macro_rules! bind_params {
                 // MySQL/MariaDB sends JSON as text on its own wire
                 // protocol; bind its text form directly.
                 Value::Json(j) => query.bind(j.to_string()),
+                // DATE/TIME/DATETIME/TIMESTAMP are all native binary wire
+                // types on MySQL/MariaDB too (see row_from_mysql above);
+                // bind each directly rather than as text.
+                Value::Date(d) => query.bind(*d),
+                Value::Time(t) => query.bind(*t),
+                Value::DateTime(dt) => query.bind(*dt),
+                Value::Timestamp(ts) => query.bind(*ts),
             };
         }
         query
