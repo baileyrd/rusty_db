@@ -8,6 +8,9 @@ pub enum Error {
     #[error("connection error: {0}")]
     Connection(String),
 
+    #[error("operation timed out after {0:?}")]
+    Timeout(std::time::Duration),
+
     #[error("no rows returned")]
     RowNotFound,
 
