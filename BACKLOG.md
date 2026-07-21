@@ -12,17 +12,17 @@ surface area it touches (query builder vs. derive macro vs. `Session` vs.
 per-driver code), not a real estimate.
 
 Every item below is also tracked as a GitHub issue, grouped under one
-tracking epic per section: [Query builder (#38)](https://github.com/baileyrd/rusty_db/issues/38),
-[Schema/DDL/reflection (#54)](https://github.com/baileyrd/rusty_db/issues/54),
+tracking epic per section: [Schema/DDL/reflection (#54)](https://github.com/baileyrd/rusty_db/issues/54),
 [Mapping/derive macro (#60)](https://github.com/baileyrd/rusty_db/issues/60),
 [Relationships/eager loading (#66)](https://github.com/baileyrd/rusty_db/issues/66),
 [Async & performance (#77)](https://github.com/baileyrd/rusty_db/issues/77),
 [Topology/deployment (#80)](https://github.com/baileyrd/rusty_db/issues/80),
 [Tooling (#83)](https://github.com/baileyrd/rusty_db/issues/83).
 
-Two tracking epics are fully done and no longer listed above: [Value/type
-system (#46)](https://github.com/baileyrd/rusty_db/issues/46) and
-[Session/unit-of-work (#73)](https://github.com/baileyrd/rusty_db/issues/73)
+Three tracking epics are fully done and no longer listed above: [Value/type
+system (#46)](https://github.com/baileyrd/rusty_db/issues/46),
+[Session/unit-of-work (#73)](https://github.com/baileyrd/rusty_db/issues/73), and
+[Query builder (#38)](https://github.com/baileyrd/rusty_db/issues/38)
 — see "current state" below for what they added.
 
 ## How to read "current state"
@@ -38,7 +38,9 @@ raw SQL into an otherwise builder-constructed query, `COUNT`/`SUM`/`AVG`/
 `SetOperation`, `LOWER`/`UPPER`/concatenation/arithmetic/`CASE`/
 `COALESCE`/`CURRENT_TIMESTAMP`, subqueries — `IN (subquery)`,
 correlated `EXISTS`, and scalar subqueries, though not yet a subquery in a
-`FROM` clause — and CTEs via `Cte`, including `WITH RECURSIVE`); first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
+`FROM` clause — CTEs via `Cte`, including `WITH RECURSIVE`, and window
+functions (`ROW_NUMBER`/`RANK`/`DENSE_RANK`, and aggregates as window
+functions, via `Window`/`.over(...)`); first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
 `chrono`'s `NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`, and
 `Vec<T>` arrays (native on Postgres, JSON-flattened on MySQL/MariaDB and
 SQLite); `#[derive(Mapped)]` with one primary key, one version column, one
@@ -56,11 +58,6 @@ logical backup/restore; read replicas; TLS; query timeouts; connection-pool
 observability. See `README.md` for the full tour with examples.
 
 ---
-
-## Query builder (Core-equivalent)
-
-- **Window functions** (`OVER (PARTITION BY ... ORDER BY ...)`, `ROW_NUMBER`,
-  `RANK`, running totals) — absent. **L**
 
 ## Schema / DDL / reflection
 
