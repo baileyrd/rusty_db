@@ -35,7 +35,8 @@ As of the most recently merged work: a query builder (`Select`/`Insert`/
 raw SQL into an otherwise builder-constructed query, `COUNT`/`SUM`/`AVG`/
 `MIN`/`MAX`/arbitrary expression `SELECT` columns via `SelectExpr`,
 `GROUP BY`/`HAVING`, `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` via
-`SetOperation`); first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
+`SetOperation`, `LOWER`/`UPPER`/concatenation/arithmetic/`CASE`/
+`COALESCE`/`CURRENT_TIMESTAMP`); first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
 `chrono`'s `NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`, and
 `Vec<T>` arrays (native on Postgres, JSON-flattened on MySQL/MariaDB and
 SQLite); `#[derive(Mapped)]` with one primary key, one version column, one
@@ -64,9 +65,6 @@ observability. See `README.md` for the full tour with examples.
   particular have no workaround at all today. **L**
 - **Window functions** (`OVER (PARTITION BY ... ORDER BY ...)`, `ROW_NUMBER`,
   `RANK`, running totals) — absent. **L**
-- **`CASE` expressions, `COALESCE`, arithmetic/string SQL functions**
-  (`func.now()`-equivalent, `LOWER`/`UPPER`/`||`, date arithmetic) — `Expr`
-  only has comparisons and boolean combinators, no function-call construct. **L**
 
 ## Schema / DDL / reflection
 
@@ -100,8 +98,10 @@ observability. See `README.md` for the full tour with examples.
   discriminator concept. **XL**
 - **Computed / hybrid properties** (a Rust-side derived attribute that can
   also translate into a SQL expression for filtering, à la
-  `hybrid_property`) — depends on the expression-column work above to be
-  useful for the "filter by it" half. **L**
+  `hybrid_property`) — the query builder now has the expression-column
+  support (`SelectExpr`, arithmetic/string functions, `CASE`/`COALESCE`)
+  needed for the "filter by it" half; this is now just the derive-macro
+  wiring to expose it as a `hybrid_property`-equivalent. **L**
 
 ## Relationships / eager loading
 
