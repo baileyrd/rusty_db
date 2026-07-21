@@ -6,6 +6,7 @@ use std::rc::Rc;
 use crate::engine::{Engine, Transaction};
 use crate::error::Result;
 use crate::mapping::{Entity, FromRow, Identifiable, Mapped};
+use crate::migration::{self, Migration};
 use crate::query::{Select, Table, ToSql};
 use crate::value::Value;
 
@@ -127,6 +128,50 @@ impl Session {
 
         self.pending.clear();
         Ok(())
+    }
+
+    /// Apply every migration in `migrations` not already recorded as
+    /// applied (bookkeeping table `_rusty_db_migrations`), the same as
+    /// `Migrator::up`, but running them inside this session's own ongoing
+    /// transaction — autoflushing queued writes first, beginning the
+    /// transaction if none is open yet — rather than each migration in its
+    /// own transaction. This means the migrations share atomicity with
+    /// everything else in this unit of work: nothing they do is visible to
+    /// another connection, and none of it takes effect at all, until this
+    /// session's `commit()` runs.
+    ///
+    /// On failure, the whole transaction (including anything flushed or
+    /// migrated earlier in its lifetime) is rolled back, same as `flush`.
+    pub async fn migrate(&mut self, migrations: &[Migration]) -> Result<Vec<i64>> {
+        self.migrate_with_table(migrations, "_rusty_db_migrations")
+            .await
+    }
+
+    /// Like `migrate`, using a bookkeeping table name other than the
+    /// default `_rusty_db_migrations` (matching `Migrator::with_table`).
+    pub async fn migrate_with_table(
+        &mut self,
+        migrations: &[Migration],
+        table: &str,
+    ) -> Result<Vec<i64>> {
+        self.flush().await?;
+
+        if self.txn.is_none() {
+            self.txn = Some(self.engine.begin().await?);
+        }
+
+        let dialect = self.engine.dialect();
+        let txn = self.txn.as_mut().expect("just set");
+        let result = migration::apply_pending(txn, dialect, table, migrations).await;
+
+        if let Err(err) = result {
+            if let Some(txn) = self.txn.take() {
+                let _ = txn.rollback().await;
+            }
+            return Err(err);
+        }
+
+        result
     }
 
     /// Flush any remaining queued writes, then commit this session's

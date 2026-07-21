@@ -214,9 +214,21 @@ migrator.status(MIGRATIONS).await?; // Vec<(Migration, bool)> — for diagnostic
 
 Each migration runs in its own transaction (its `up`/`down` statements plus the bookkeeping row update, atomically). If a migration fails partway through a batch, `up()`/`down()` return the error and everything before the failure in that call has already committed — fix the problem and call again to resume. Each entry in `up`/`down` is a separate SQL statement (executed one call at a time), since not every driver's query protocol supports multiple statements per call — split multi-statement changes into multiple slice entries rather than joining them with `;`.
 
+To instead fold migrations into a `Session`'s own unit of work — sharing atomicity with regular reads/writes, so a schema change and the data migration that depends on it commit (or roll back) together — use `session.migrate(MIGRATIONS)` instead of a standalone `Migrator`:
+
+```rust
+let mut session = engine.session();
+
+session.migrate(MIGRATIONS).await?; // runs inside the session's own transaction, not a separate one
+session.add(&User { id: 1, name: "ada".into(), active: true });
+session.commit().await?; // the schema change and the row both take effect together
+```
+
+Unlike `Migrator::up`, which commits each migration independently, `session.migrate` applies every pending migration inside the session's single ongoing transaction (autoflushing queued writes first) — so nothing it does is visible to another connection, and none of it takes effect, until that session's `commit()` runs. A failure rolls back the whole transaction, same as `flush()`.
+
 ## Status
 
-This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), versioned migrations, and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Still missing: migrations don't participate in a session's transaction. Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 ## Running tests
 
