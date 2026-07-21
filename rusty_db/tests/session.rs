@@ -78,7 +78,7 @@ async fn session_rollback_discards_pending_writes() -> rusty_db::Result<()> {
         name: "ada".to_string(),
         active: true,
     });
-    session.rollback();
+    session.rollback().await?;
     assert_eq!(session.pending_len(), 0);
 
     let rows: Vec<User> = engine.fetch_all_as(&Select::from(&User::table())).await?;
