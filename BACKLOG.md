@@ -11,6 +11,17 @@ Each item has a rough effort guess (S/M/L/XL) — a gut-feel for how much
 surface area it touches (query builder vs. derive macro vs. `Session` vs.
 per-driver code), not a real estimate.
 
+Every item below is also tracked as a GitHub issue, grouped under one
+tracking epic per section: [Query builder (#38)](https://github.com/baileyrd/rusty_db/issues/38),
+[Value/type system (#46)](https://github.com/baileyrd/rusty_db/issues/46),
+[Schema/DDL/reflection (#54)](https://github.com/baileyrd/rusty_db/issues/54),
+[Mapping/derive macro (#60)](https://github.com/baileyrd/rusty_db/issues/60),
+[Relationships/eager loading (#66)](https://github.com/baileyrd/rusty_db/issues/66),
+[Session/unit-of-work (#73)](https://github.com/baileyrd/rusty_db/issues/73),
+[Async & performance (#77)](https://github.com/baileyrd/rusty_db/issues/77),
+[Topology/deployment (#80)](https://github.com/baileyrd/rusty_db/issues/80),
+[Tooling (#83)](https://github.com/baileyrd/rusty_db/issues/83).
+
 ## How to read "current state"
 
 As of the most recently merged work: a query builder (`Select`/`Insert`/
