@@ -384,6 +384,43 @@ engine.execute(&account.insert()).await?; // stores status as the text "banned_u
 
 By default each variant stores as `Value::Text` holding its own snake_case name (`Active` → `"active"`) — override one with `#[mapped_enum(rename = "...")]` on that specific variant, as `Banned` does above. `#[mapped_enum(as_int)]` on the enum itself switches the whole thing to `Value::I64` instead, storing each variant's own discriminant (`v as i64`, so explicit `= N` values on individual variants are honored) rather than its name; unlike the text form, this doesn't survive the enum's variants being reordered or renumbered later; whichever mode is picked, decoding an unrecognized stored value (an unmapped string, or an integer with no matching variant) is an error rather than a silent fallback. This works identically on every backend, since it's an ordinary `TEXT`/`INTEGER` column underneath, not a database-native enum type (Postgres's own `CREATE TYPE ... AS ENUM` isn't required, or supported specially, here).
 
+### Custom types
+
+A `#[derive(Mapped)]` field's type is never actually limited to the list above — that list is just what `Value` converts from out of the box. Any type implementing `Into<Value>` (on an owned value) and `FromValue` works as a field type, whether or not this crate has ever heard of it, because both are ordinary public traits:
+
+```rust
+struct Email(String);
+
+impl From<Email> for Value {
+    fn from(v: Email) -> Value {
+        Value::Text(v.0)
+    }
+}
+
+impl FromValue for Email {
+    fn from_value(value: &Value) -> Result<Self, String> {
+        String::from_value(value).map(Email)
+    }
+}
+```
+
+`#[derive(MappedNewtype)]` generates exactly that pair of impls for the common case — a single-field tuple struct that should just delegate straight through to its own field's conversion:
+
+```rust
+#[derive(Debug, Clone, PartialEq, MappedNewtype)]
+struct Email(String);
+
+#[derive(Mapped)]
+#[table(name = "users")]
+struct User {
+    #[table(primary_key)]
+    id: i64,
+    email: Email,
+}
+```
+
+It composes with `MappedEnum` too — `#[derive(MappedNewtype)] struct AccountTier(Tier)` works as long as `Tier` itself is `Value`-compatible (a `MappedEnum`, another `MappedNewtype`, or anything else satisfying the same two traits). Reach past `MappedNewtype` for the hand-written form above once there's more to the conversion than pure delegation — validating a raw value on the way in, rejecting a malformed one on the way out, or combining more than one column into a single field — none of which needs a macro or any special support from this crate.
+
 ### Session / unit of work
 
 `Engine::session()` (or `Session::new(engine)`) gives you a unit of work: queue writes with `add`/`update`/`delete` (available for any `#[derive(Mapped)]` type — `add` needs the `Entity` impl every mapped type gets, `update`/`delete` need `Identifiable`, which requires a `#[table(primary_key)]` field), then send them to the database with `commit()`:
@@ -787,7 +824,7 @@ Unlike `Migrator::up`, which commits each migration independently, `session.migr
 
 ## Status
 
-This covers Core (query builder, connections, first-class `Uuid`/`BigDecimal`/`Json` value types), a thin mapping layer (`#[derive(Mapped)]`, `#[derive(MappedEnum)]`, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder, connections, first-class `Uuid`/`BigDecimal`/`Json` value types), a thin mapping layer (`#[derive(Mapped)]`, `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]` for custom field types, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 `tests/concurrent_sessions.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover multiple `Session`s sharing one `Engine`/connection pool at the same time — `Session` is intentionally `!Send` (it hands out `Rc`s for the identity map), so these run via `tokio::task::LocalSet`/`spawn_local` rather than `tokio::spawn`, which is the standard way to get genuinely concurrent, interleaved execution of `!Send` futures on one thread. They cover independent commits landing correctly under a burst of concurrent sessions, one session's flushed-but-uncommitted write staying invisible to a concurrent reader on a separate connection (deterministically ordered via a `oneshot` channel, not timing), and two sessions never sharing identity-map state for the same row. Same skip-if-unreachable behavior as the Postgres/MySQL smoke tests; each test uses its own table to avoid colliding with other tests running concurrently against the same live server.
 
@@ -812,6 +849,8 @@ It also covers cascade rules (`delete_cascading`): deleting a user with `cascade
 `tests/json_value.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `Value::Json`/`Json`: a mapped struct's `Json` field (including an `Option<Json>` one) round-trips correctly on every backend, and — Postgres-only — a native `JSONB` column decodes as `Value::Json` directly rather than `Value::Text`. Getting this working on MySQL/MariaDB surfaced a real quirk: its `JSON` columns report as one of MySQL's own `BLOB`-family types at the wire-protocol level, so they decode as `Value::Bytes`, not `Value::Text` the way `DECIMAL`/`UUID`-as-text columns do elsewhere on that backend — `FromValue for Json` accepts that form too (via UTF-8 first, then JSON parsing), so a `Json` field round-trips there without the caller ever needing to know about the difference.
 
 `tests/mapped_enum.rs` (SQLite) covers `#[derive(MappedEnum)]`: a text-mode enum field round-trips through a mapped struct, including a `#[mapped_enum(rename = "...")]`'d variant storing its overridden text rather than the default snake_case name; an unrenamed variant stores its plain snake_case name; an `as_int`-mode enum field round-trips using each variant's own discriminant, including an explicit `= N` one; and a stored value with no matching variant (an unrecognized string, in text mode) is a decode error rather than a silent fallback. No `_postgres`/`_mysql` counterparts — the generated `From`/`FromValue` impls are pure Rust-side conversions to/from `Value::Text`/`Value::I64`, both already exercised per-driver everywhere else, with nothing left that's actually driver-specific to prove again.
+
+`tests/mapped_newtype.rs` (SQLite) covers `#[derive(MappedNewtype)]`: a mapped struct's newtype fields (wrapping `String`, `i64`, and — composed — a `MappedEnum`) round-trip correctly, each storing in its wrapped type's own form; and an `Option<Newtype>` field stores and reads back as `NULL` when `None`. Same reasoning as `MappedEnum` above for skipping `_postgres`/`_mysql` counterparts — the generated impls just delegate to the wrapped field's own already-covered conversion.
 
 `tests/query_timeout.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `with_timeout`: an operation finishing inside its timeout succeeds normally; a genuinely slow/blocked operation is cancelled and returns `Error::Timeout` instead of hanging; a cancelled operation leaves the pool usable afterward rather than stuck; a timeout on one call has no lingering effect on later calls; and aborting a task running a slow operation (`JoinHandle::abort`, the other standard way to cancel a Rust future) cancels it the same way a timeout would. The SQLite version gets a genuinely blocked (not simulated) query via real lock contention — holding SQLite's write lock on one connection while a second connection attempts a conflicting write, which sqlx's SQLite driver retries against its own 5-second `busy_timeout` rather than erroring immediately. The Postgres/MySQL versions use their real, built-in `pg_sleep()`/`SLEEP()` functions for a genuinely slow query instead.
 
