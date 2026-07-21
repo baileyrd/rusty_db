@@ -1,3 +1,4 @@
+use super::select::Select;
 use super::table::Column;
 use crate::dialect::Dialect;
 use crate::value::Value;
@@ -120,6 +121,20 @@ pub enum Expr {
     /// `CASE WHEN cond1 THEN result1 [WHEN cond2 THEN result2 ...] [ELSE
     /// otherwise] END`. Built via `Case`, not constructed directly.
     Case(Vec<(Expr, Expr)>, Option<Box<Expr>>),
+    /// `expr IN (<subquery>)`. See `.in_subquery(...)`.
+    InSubquery(Box<Expr>, Box<Select>),
+    /// `EXISTS (<subquery>)`. A correlated subquery just means the nested
+    /// `Select`'s filter references a `Column` from the outer query's
+    /// table — that already renders correctly with no special support,
+    /// since `Column` qualifies itself by table name regardless of which
+    /// `Select` it's built into. See `Expr::exists(...)`.
+    Exists(Box<Select>),
+    /// A parenthesized scalar subquery, usable anywhere an ordinary `Expr`
+    /// is (a `SELECT` column, either side of a comparison, ...). The
+    /// caller is responsible for the subquery returning exactly one column
+    /// and (at most) one row — nothing here enforces that. See
+    /// `Expr::subquery(...)`.
+    Subquery(Box<Select>),
 }
 
 impl From<Column> for Expr {
@@ -289,6 +304,55 @@ impl Expr {
             Box::new(Expr::Literal(low.into())),
             Box::new(Expr::Literal(high.into())),
         )
+    }
+
+    /// `self IN (<subquery>)` — like `.is_in(...)`, but against the result
+    /// of a nested `Select` instead of a fixed list of values.
+    ///
+    /// ```
+    /// # use rusty_db_core::{Expr, Select, Table};
+    /// let orders = Table::new("orders");
+    /// let users = Table::new("users");
+    /// let big_spenders = Select::from(&orders)
+    ///     .columns([orders.col("user_id")])
+    ///     .filter(orders.col("amount").gt(100_i64));
+    /// let query = Select::from(&users).filter(users.col("id").in_subquery(big_spenders));
+    /// ```
+    pub fn in_subquery(self, subquery: Select) -> Self {
+        Expr::InSubquery(Box::new(self), Box::new(subquery))
+    }
+
+    /// `EXISTS (<subquery>)`. Correlate it with the outer query by
+    /// referencing the outer table's columns in the subquery's own
+    /// `.filter(...)` — see the module-level doc on `Expr::Exists`.
+    ///
+    /// ```
+    /// # use rusty_db_core::{Expr, Select, Table};
+    /// let orders = Table::new("orders");
+    /// let users = Table::new("users");
+    /// let has_orders = Select::from(&orders).filter(orders.col("user_id").eq_col(&users.col("id")));
+    /// let query = Select::from(&users).filter(Expr::exists(has_orders));
+    /// ```
+    pub fn exists(subquery: Select) -> Self {
+        Expr::Exists(Box::new(subquery))
+    }
+
+    /// A scalar subquery — `(<subquery>)` — usable as a `SELECT` column or
+    /// on either side of a comparison. See `Expr::Subquery` for the
+    /// one-column/at-most-one-row caveat.
+    ///
+    /// ```
+    /// # use rusty_db_core::{Expr, Select, SelectExpr, Table};
+    /// let orders = Table::new("orders");
+    /// let users = Table::new("users");
+    /// let order_count = Select::from(&orders)
+    ///     .columns([SelectExpr::from(Expr::count_all())])
+    ///     .filter(orders.col("user_id").eq_col(&users.col("id")));
+    /// let query = Select::from(&users)
+    ///     .columns([SelectExpr::from(Expr::subquery(order_count)).alias("order_count")]);
+    /// ```
+    pub fn subquery(subquery: Select) -> Self {
+        Expr::Subquery(Box::new(subquery))
     }
 
     /// `COUNT(*)`. An associated function rather than a method on `Expr`
@@ -476,6 +540,17 @@ impl Expr {
                 }
                 sql.push_str(" END");
                 sql
+            }
+            Expr::InSubquery(inner, subquery) => {
+                let lhs = inner.render(dialect, params);
+                let subquery_sql = subquery.render_into(dialect, params);
+                format!("{lhs} IN ({subquery_sql})")
+            }
+            Expr::Exists(subquery) => {
+                format!("EXISTS ({})", subquery.render_into(dialect, params))
+            }
+            Expr::Subquery(subquery) => {
+                format!("({})", subquery.render_into(dialect, params))
             }
         }
     }

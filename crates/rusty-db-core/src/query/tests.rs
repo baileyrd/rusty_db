@@ -611,3 +611,73 @@ fn case_without_an_else_clause_omits_it() {
         r#"SELECT CASE WHEN "orders"."amount" > ? THEN ? END FROM "orders""#
     );
 }
+
+#[test]
+fn in_subquery_renders_a_nested_select_and_numbers_params_sequentially_on_postgres() {
+    let orders = Table::new("orders");
+    let users = Table::new("users");
+    let big_spenders = Select::from(&orders)
+        .columns([orders.col("user_id")])
+        .filter(orders.col("amount").gt(100_i64));
+
+    let query = Select::from(&users)
+        .filter(users.col("active").eq(true))
+        .filter(users.col("id").in_subquery(big_spenders));
+
+    let (sql, params) = query.to_sql(&NumberedDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT * FROM "users" WHERE ("users"."active" = $1) AND ("users"."id" IN (SELECT "orders"."user_id" FROM "orders" WHERE "orders"."amount" > $2))"#
+    );
+    assert_eq!(params, vec![Value::Bool(true), Value::I64(100)]);
+}
+
+#[test]
+fn exists_renders_a_correlated_subquery() {
+    let orders = Table::new("orders");
+    let users = Table::new("users");
+    let has_orders = Select::from(&orders).filter(orders.col("user_id").eq_col(&users.col("id")));
+
+    let (sql, _) = Select::from(&users)
+        .filter(Expr::exists(has_orders))
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT * FROM "users" WHERE EXISTS (SELECT * FROM "orders" WHERE "orders"."user_id" = "users"."id")"#
+    );
+}
+
+#[test]
+fn not_wrapping_exists_renders_not_exists_semantics() {
+    let orders = Table::new("orders");
+    let users = Table::new("users");
+    let has_orders = Select::from(&orders).filter(orders.col("user_id").eq_col(&users.col("id")));
+
+    let (sql, _) = Select::from(&users)
+        .filter(Expr::exists(has_orders).not())
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT * FROM "users" WHERE NOT (EXISTS (SELECT * FROM "orders" WHERE "orders"."user_id" = "users"."id"))"#
+    );
+}
+
+#[test]
+fn scalar_subquery_renders_as_a_parenthesized_select_and_can_be_aliased() {
+    let orders = Table::new("orders");
+    let users = Table::new("users");
+    let order_count = Select::from(&orders)
+        .columns([SelectExpr::from(Expr::count_all())])
+        .filter(orders.col("user_id").eq_col(&users.col("id")));
+
+    let (sql, _) = Select::from(&users)
+        .columns([
+            SelectExpr::from(users.col("id")),
+            SelectExpr::from(Expr::subquery(order_count)).alias("order_count"),
+        ])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT "users"."id", (SELECT COUNT(*) FROM "orders" WHERE "orders"."user_id" = "users"."id") AS "order_count" FROM "users""#
+    );
+}

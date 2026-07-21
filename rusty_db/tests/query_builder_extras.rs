@@ -7,8 +7,9 @@
 //! `Table::alias` for self-joins, `Expr::text` for raw SQL fragments
 //! composed into the builder, aggregate functions/expression columns via
 //! `SelectExpr`, `Select::group_by`/`.having`, `Select::union`/
-//! `union_all`/`intersect`/`except`, and `Column::lower`/`upper`/`concat`/
-//! `add`/`sub`/`mul`/`div`, `Expr::now`/`coalesce`, and `Case`.
+//! `union_all`/`intersect`/`except`, `Column::lower`/`upper`/`concat`/
+//! `add`/`sub`/`mul`/`div`, `Expr::now`/`coalesce`, `Case`, and
+//! subqueries (`Column::in_subquery`, `Expr::exists`, `Expr::subquery`).
 //! `RETURNING` on `UPDATE`/`DELETE` has no SQLite coverage here since
 //! SQLite's dialect doesn't support it (see
 //! `query_builder_extras_postgres.rs`); `Column::concat`'s `CONCAT(...)`
@@ -495,6 +496,156 @@ async fn case_and_coalesce_execute_and_decode_correctly() -> rusty_db::Result<()
         "nickname is present, so COALESCE uses it directly"
     );
     assert_eq!(rows[1].get_by_name::<String>("tier")?, "bronze");
+
+    Ok(())
+}
+
+async fn customers_and_orders_engine() -> rusty_db::Result<Engine> {
+    let engine = SqliteDriver::engine("sqlite::memory:").await?;
+    let mut conn = engine.connect().await?;
+    conn.execute(
+        "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        &[],
+    )
+    .await?;
+    conn.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER NOT NULL, amount INTEGER NOT NULL)",
+        &[],
+    )
+    .await?;
+
+    let customers = Table::new("customers");
+    for (id, name) in [(1_i64, "Ada"), (2, "Grace"), (3, "Zoe")] {
+        engine
+            .execute(
+                &Insert::into_table(&customers)
+                    .value("id", id)
+                    .value("name", name),
+            )
+            .await?;
+    }
+
+    let orders = Table::new("orders");
+    // Ada: one small order. Grace: two orders. Zoe: no orders at all —
+    // the case an INNER JOIN would silently drop but EXISTS/a LEFT-JOIN-
+    // shaped scalar subquery should still surface.
+    for (id, customer_id, amount) in [(1_i64, 1_i64, 30_i64), (2, 2, 100), (3, 2, 50)] {
+        engine
+            .execute(
+                &Insert::into_table(&orders)
+                    .value("id", id)
+                    .value("customer_id", customer_id)
+                    .value("amount", amount),
+            )
+            .await?;
+    }
+
+    Ok(engine)
+}
+
+#[tokio::test]
+async fn in_subquery_filters_rows_against_a_grouped_nested_select() -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    // Grace's orders (50 + 200 = 250) clear 100 total; Ada's ("Ada" and
+    // "ada" are distinct, case-sensitive groups: 10 and 50) don't.
+    let big_spenders = Select::from(&orders)
+        .columns([orders.col("customer")])
+        .group_by([orders.col("customer")])
+        .having(orders.col("amount").sum().gt(100_i64));
+
+    let rows = engine
+        .fetch_all(
+            &Select::from(&orders)
+                .filter(orders.col("customer").in_subquery(big_spenders))
+                .order_by(orders.col("id").asc()),
+        )
+        .await?;
+    assert_eq!(
+        rows.len(),
+        2,
+        "only Grace's two orders clear the subquery's HAVING SUM(amount) > 100"
+    );
+    for row in &rows {
+        assert_eq!(row.get_by_name::<String>("customer")?, "Grace");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn exists_and_not_exists_correlate_against_the_outer_table() -> rusty_db::Result<()> {
+    let engine = customers_and_orders_engine().await?;
+    let customers = Table::new("customers");
+    let orders = Table::new("orders");
+
+    let has_orders =
+        Select::from(&orders).filter(orders.col("customer_id").eq_col(&customers.col("id")));
+    let with_orders = engine
+        .fetch_all(
+            &Select::from(&customers)
+                .columns([customers.col("name")])
+                .filter(Expr::exists(has_orders))
+                .order_by(customers.col("id").asc()),
+        )
+        .await?;
+    assert_eq!(
+        with_orders
+            .iter()
+            .map(|r| r.get_by_name::<String>("name"))
+            .collect::<Result<Vec<_>, _>>()?,
+        vec!["Ada", "Grace"],
+        "Zoe has no orders, so EXISTS excludes her"
+    );
+
+    let has_orders_again =
+        Select::from(&orders).filter(orders.col("customer_id").eq_col(&customers.col("id")));
+    let without_orders = engine
+        .fetch_all(
+            &Select::from(&customers)
+                .columns([customers.col("name")])
+                .filter(Expr::exists(has_orders_again).not()),
+        )
+        .await?;
+    assert_eq!(without_orders.len(), 1);
+    assert_eq!(without_orders[0].get_by_name::<String>("name")?, "Zoe");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn scalar_subquery_computes_a_per_row_aggregate_and_decodes_null_for_no_match(
+) -> rusty_db::Result<()> {
+    let engine = customers_and_orders_engine().await?;
+    let customers = Table::new("customers");
+    let orders = Table::new("orders");
+
+    let order_total = Select::from(&orders)
+        .columns([SelectExpr::from(orders.col("amount").sum())])
+        .filter(orders.col("customer_id").eq_col(&customers.col("id")));
+
+    let rows = engine
+        .fetch_all(
+            &Select::from(&customers)
+                .columns([
+                    SelectExpr::from(customers.col("name")),
+                    SelectExpr::from(Expr::subquery(order_total)).alias("total"),
+                ])
+                .order_by(customers.col("id").asc()),
+        )
+        .await?;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get_by_name::<String>("name")?, "Ada");
+    assert_eq!(rows[0].get_by_name::<Option<i64>>("total")?, Some(30));
+    assert_eq!(rows[1].get_by_name::<String>("name")?, "Grace");
+    assert_eq!(rows[1].get_by_name::<Option<i64>>("total")?, Some(150));
+    assert_eq!(rows[2].get_by_name::<String>("name")?, "Zoe");
+    assert_eq!(
+        rows[2].get_by_name::<Option<i64>>("total")?,
+        None,
+        "SUM over zero matching orders is NULL, not 0"
+    );
 
     Ok(())
 }
