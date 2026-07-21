@@ -188,12 +188,13 @@ async fn wider_column_types_decode_correctly() -> rusty_db::Result<()> {
             .parse::<Uuid>()
             .unwrap()
     );
-    // NUMERIC decodes via BigDecimal, whose Display doesn't necessarily
-    // preserve the column's declared scale (e.g. "3.5000" vs "3.50") — the
-    // point here is that it decodes to a correct number at all, not an
-    // exact textual format.
-    let weight: f64 = rows[0].get_by_name::<String>("weight")?.parse().unwrap();
-    assert!((weight - 3.5).abs() < 1e-9);
+    // A native Postgres NUMERIC column decodes as Value::Decimal, not
+    // text; BigDecimal's own equality is value-based, so this holds
+    // regardless of exactly how many digits of scale the column reports.
+    assert_eq!(
+        rows[0].get_by_name::<BigDecimal>("weight")?,
+        "3.5".parse::<BigDecimal>().unwrap()
+    );
     assert_eq!(rows[0].get_by_name::<String>("created_on")?, "2024-01-15");
     assert_eq!(
         rows[0].get_by_name::<String>("created_at")?,

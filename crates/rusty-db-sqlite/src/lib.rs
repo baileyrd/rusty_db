@@ -572,6 +572,9 @@ macro_rules! bind_params {
                 // SQLite has no native UUID type; bind its hyphenated
                 // string form, same as any other text value.
                 Value::Uuid(u) => query.bind(u.to_string()),
+                // SQLite has no native NUMERIC/DECIMAL type either; bind
+                // its decimal text form, same as any other text value.
+                Value::Decimal(d) => query.bind(d.to_string()),
             };
         }
         query

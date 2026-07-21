@@ -425,6 +425,9 @@ macro_rules! bind_params {
                 // MySQL/MariaDB has no native UUID type; bind its
                 // hyphenated string form, same as any other text value.
                 Value::Uuid(u) => query.bind(u.to_string()),
+                // MySQL/MariaDB sends DECIMAL as text on its own wire
+                // protocol; bind its decimal text form directly.
+                Value::Decimal(d) => query.bind(d.to_string()),
             };
         }
         query
