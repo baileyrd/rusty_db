@@ -73,21 +73,78 @@ async fn table_schema_reports_columns_nullability_and_primary_key() -> rusty_db:
                 type_name: "INTEGER".to_string(),
                 nullable: false,
                 primary_key: true,
+                default: None,
             },
             ColumnInfo {
                 name: "name".to_string(),
                 type_name: "TEXT".to_string(),
                 nullable: false,
                 primary_key: false,
+                default: None,
             },
             ColumnInfo {
                 name: "nickname".to_string(),
                 type_name: "TEXT".to_string(),
                 nullable: true,
                 primary_key: false,
+                default: None,
             },
         ]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_schema_reports_defaults_unique_and_check_constraints() -> rusty_db::Result<()> {
+    let engine = file_engine("constraints").await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE accounts (\
+                 id INTEGER PRIMARY KEY, \
+                 email TEXT NOT NULL, \
+                 balance INTEGER NOT NULL DEFAULT 0, \
+                 CONSTRAINT email_unique UNIQUE (email), \
+                 CONSTRAINT balance_check CHECK (balance >= 0)\
+             )",
+            &[],
+        )
+        .await?;
+
+    let schema = engine
+        .table_schema("accounts")
+        .await?
+        .expect("table exists");
+
+    let balance = schema.columns.iter().find(|c| c.name == "balance").unwrap();
+    assert_eq!(balance.default.as_deref(), Some("0"));
+    let email = schema.columns.iter().find(|c| c.name == "email").unwrap();
+    assert_eq!(
+        email.default, None,
+        "a column with no DEFAULT reflects None"
+    );
+
+    assert_eq!(schema.unique_constraints.len(), 1);
+    // SQLite implements UNIQUE as an index and doesn't actually keep the
+    // `CONSTRAINT email_unique` name from the DDL — it names the backing
+    // index itself instead (`sqlite_autoindex_<table>_<n>`).
+    assert!(
+        schema.unique_constraints[0]
+            .name
+            .starts_with("sqlite_autoindex_accounts_"),
+        "got {:?}",
+        schema.unique_constraints[0].name
+    );
+    assert_eq!(
+        schema.unique_constraints[0].columns,
+        vec!["email".to_string()]
+    );
+
+    assert_eq!(schema.check_constraints.len(), 1);
+    assert_eq!(schema.check_constraints[0].name, "balance_check");
+    assert_eq!(schema.check_constraints[0].expression, "balance >= 0");
 
     Ok(())
 }

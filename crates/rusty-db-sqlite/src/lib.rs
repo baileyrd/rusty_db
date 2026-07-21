@@ -10,7 +10,7 @@ use sqlx::{Column as _, Row as _, Sqlite, SqlitePool, TypeInfo as _, ValueRef as
 use rusty_db_core::dialect::QuestionMarkDialect;
 use rusty_db_core::{
     ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, PoolMetrics,
-    PoolStats, Result, Row, TableSchema, Value,
+    PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
 };
 
 static DIALECT: QuestionMarkDialect = QuestionMarkDialect;
@@ -119,8 +119,10 @@ impl Driver for SqliteDriver {
         // PRAGMA doesn't support bound parameters for the table name;
         // quoting it is the standard mitigation for identifiers that
         // have to be interpolated directly into SQL text.
-        let sql = format!("PRAGMA table_info({})", DIALECT.quote_ident(table));
-        let rows = conn.fetch_all(&sql, &[]).await?;
+        let quoted_table = DIALECT.quote_ident(table);
+        let rows = conn
+            .fetch_all(&format!("PRAGMA table_info({quoted_table})"), &[])
+            .await?;
 
         let columns = rows
             .iter()
@@ -130,14 +132,318 @@ impl Driver for SqliteDriver {
                     type_name: row.get_by_name::<String>("type")?,
                     nullable: row.get_by_name::<i64>("notnull")? == 0,
                     primary_key: row.get_by_name::<i64>("pk")? > 0,
+                    default: row.get_by_name::<Option<String>>("dflt_value")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // SQLite implements UNIQUE constraints as unique indexes; the one
+        // backing the primary key itself (origin = "pk") is excluded, since
+        // that's already `ColumnInfo::primary_key`, not a separate UNIQUE.
+        let index_rows = conn
+            .fetch_all(&format!("PRAGMA index_list({quoted_table})"), &[])
+            .await?;
+        let mut unique_constraints = Vec::new();
+        for index_row in &index_rows {
+            let is_unique = index_row.get_by_name::<i64>("unique")? != 0;
+            let origin = index_row.get_by_name::<String>("origin")?;
+            if !is_unique || origin == "pk" {
+                continue;
+            }
+            let index_name = index_row.get_by_name::<String>("name")?;
+            let info_rows = conn
+                .fetch_all(
+                    &format!("PRAGMA index_info({})", DIALECT.quote_ident(&index_name)),
+                    &[],
+                )
+                .await?;
+            let mut columns = Vec::with_capacity(info_rows.len());
+            for info_row in &info_rows {
+                if let Some(name) = info_row.get_by_name::<Option<String>>("name")? {
+                    columns.push(name);
+                }
+            }
+            if !columns.is_empty() {
+                unique_constraints.push(UniqueConstraint {
+                    name: index_name,
+                    columns,
+                });
+            }
+        }
+
+        // SQLite has no catalog for CHECK constraints at all — the only
+        // place they exist is the table's own CREATE TABLE text.
+        let ddl_row = conn
+            .fetch_optional(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                &[Value::Text(table.to_string())],
+            )
+            .await?;
+        let check_constraints = match ddl_row
+            .map(|row| row.get_by_name::<Option<String>>("sql"))
+            .transpose()?
+            .flatten()
+        {
+            Some(ddl) => check_constraints::parse(&ddl),
+            None => Vec::new(),
+        };
+
         Ok(Some(TableSchema {
             name: table.to_string(),
             columns,
+            unique_constraints,
+            check_constraints,
         }))
+    }
+}
+
+/// A best-effort text scan for `CHECK (...)` clauses in a `CREATE TABLE`
+/// statement's own text — SQLite has no catalog view for these the way
+/// Postgres/MySQL do, so this is the only source available. This is a
+/// small tokenizer, not a full SQL parser: it understands quoted string/
+/// identifier literals (so a `CHECK` keyword or stray paren inside one is
+/// never mistaken for a real clause) and balanced parentheses, but nothing
+/// more exotic about SQLite's grammar. An inline `CHECK (...)` without an
+/// explicit `CONSTRAINT <name>` gets a synthetic, positional name
+/// (`"check_1"`, `"check_2"`, ...), since SQLite doesn't require one.
+mod check_constraints {
+    use rusty_db_core::CheckConstraint;
+
+    #[derive(Debug)]
+    enum Tok {
+        Word(String),
+        Quoted(String),
+        Punct(char),
+    }
+
+    struct Token {
+        kind: Tok,
+        start: usize,
+        end: usize,
+    }
+
+    fn tokenize(chars: &[char]) -> Vec<Token> {
+        let n = chars.len();
+        let mut i = 0;
+        let mut tokens = Vec::new();
+        while i < n {
+            let c = chars[i];
+            if c.is_whitespace() {
+                i += 1;
+                continue;
+            }
+            if c == '\'' || c == '"' || c == '`' {
+                let start = i;
+                let end = skip_quoted(chars, i, c);
+                tokens.push(Token {
+                    kind: Tok::Quoted(
+                        chars[start + 1..end.saturating_sub(1).max(start + 1)]
+                            .iter()
+                            .collect(),
+                    ),
+                    start,
+                    end,
+                });
+                i = end;
+                continue;
+            }
+            if c == '[' {
+                let start = i;
+                let end = skip_through(chars, i, ']');
+                tokens.push(Token {
+                    kind: Tok::Quoted(
+                        chars[start + 1..end.saturating_sub(1).max(start + 1)]
+                            .iter()
+                            .collect(),
+                    ),
+                    start,
+                    end,
+                });
+                i = end;
+                continue;
+            }
+            if c.is_alphanumeric() || c == '_' {
+                let start = i;
+                while i < n && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                tokens.push(Token {
+                    kind: Tok::Word(chars[start..i].iter().collect()),
+                    start,
+                    end: i,
+                });
+                continue;
+            }
+            tokens.push(Token {
+                kind: Tok::Punct(c),
+                start: i,
+                end: i + 1,
+            });
+            i += 1;
+        }
+        tokens
+    }
+
+    /// `chars[open]` is the opening quote; returns the index just past the
+    /// matching close, handling `''`/`""`/` `` ` as an escaped literal quote.
+    fn skip_quoted(chars: &[char], open: usize, quote: char) -> usize {
+        let n = chars.len();
+        let mut i = open + 1;
+        while i < n {
+            if chars[i] == quote {
+                if i + 1 < n && chars[i + 1] == quote {
+                    i += 2;
+                    continue;
+                }
+                return i + 1;
+            }
+            i += 1;
+        }
+        n
+    }
+
+    fn skip_through(chars: &[char], open: usize, close: char) -> usize {
+        let n = chars.len();
+        let mut i = open + 1;
+        while i < n && chars[i] != close {
+            i += 1;
+        }
+        if i < n {
+            i + 1
+        } else {
+            n
+        }
+    }
+
+    fn matching_paren(tokens: &[Token], open_idx: usize) -> Option<usize> {
+        let mut depth = 0;
+        for (i, tok) in tokens.iter().enumerate().skip(open_idx) {
+            match tok.kind {
+                Tok::Punct('(') => depth += 1,
+                Tok::Punct(')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// If `tokens[check_idx]` (the `CHECK` keyword) is immediately preceded
+    /// by `CONSTRAINT <name>`, that name; otherwise `None`.
+    fn preceding_constraint_name(tokens: &[Token], check_idx: usize) -> Option<String> {
+        if check_idx < 2 {
+            return None;
+        }
+        let name = match &tokens[check_idx - 1].kind {
+            Tok::Word(w) => w.clone(),
+            Tok::Quoted(q) => q.clone(),
+            Tok::Punct(_) => return None,
+        };
+        match &tokens[check_idx - 2].kind {
+            Tok::Word(w) if w.eq_ignore_ascii_case("CONSTRAINT") => Some(name),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn parse(ddl: &str) -> Vec<CheckConstraint> {
+        let chars: Vec<char> = ddl.chars().collect();
+        let tokens = tokenize(&chars);
+        let mut constraints = Vec::new();
+        let mut anonymous = 0;
+
+        let mut idx = 0;
+        while idx < tokens.len() {
+            let is_check =
+                matches!(&tokens[idx].kind, Tok::Word(w) if w.eq_ignore_ascii_case("CHECK"));
+            if is_check {
+                if let Some(open_tok) = tokens.get(idx + 1) {
+                    if matches!(open_tok.kind, Tok::Punct('(')) {
+                        if let Some(close_idx) = matching_paren(&tokens, idx + 1) {
+                            let expr_start = tokens[idx + 1].end;
+                            let expr_end = tokens[close_idx].start;
+                            let expression: String = chars[expr_start..expr_end].iter().collect();
+                            let name =
+                                preceding_constraint_name(&tokens, idx).unwrap_or_else(|| {
+                                    anonymous += 1;
+                                    format!("check_{anonymous}")
+                                });
+                            constraints.push(CheckConstraint {
+                                name,
+                                expression: expression.trim().to_string(),
+                            });
+                            idx = close_idx + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            idx += 1;
+        }
+
+        constraints
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse;
+
+        #[test]
+        fn extracts_a_named_check_constraint() {
+            let ddl = "CREATE TABLE t (id INTEGER, age INTEGER, \
+                       CONSTRAINT age_check CHECK (age >= 0))";
+            let constraints = parse(ddl);
+            assert_eq!(constraints.len(), 1);
+            assert_eq!(constraints[0].name, "age_check");
+            assert_eq!(constraints[0].expression, "age >= 0");
+        }
+
+        #[test]
+        fn assigns_synthetic_names_to_anonymous_constraints_in_order() {
+            let ddl = "CREATE TABLE t (id INTEGER, age INTEGER, \
+                       CHECK (age >= 0), CHECK (age < 150))";
+            let constraints = parse(ddl);
+            assert_eq!(constraints.len(), 2);
+            assert_eq!(constraints[0].name, "check_1");
+            assert_eq!(constraints[0].expression, "age >= 0");
+            assert_eq!(constraints[1].name, "check_2");
+            assert_eq!(constraints[1].expression, "age < 150");
+        }
+
+        #[test]
+        fn an_inline_column_level_check_is_still_found() {
+            let ddl = "CREATE TABLE t (age INTEGER CHECK (age >= 0))";
+            let constraints = parse(ddl);
+            assert_eq!(constraints.len(), 1);
+            assert_eq!(constraints[0].expression, "age >= 0");
+        }
+
+        #[test]
+        fn handles_nested_parens_and_string_literals_inside_the_expression() {
+            let ddl = "CREATE TABLE t (status TEXT, \
+                       CHECK (status IN ('a)b', 'c') AND (1 = 1)))";
+            let constraints = parse(ddl);
+            assert_eq!(constraints.len(), 1);
+            assert_eq!(
+                constraints[0].expression,
+                "status IN ('a)b', 'c') AND (1 = 1)"
+            );
+        }
+
+        #[test]
+        fn a_check_keyword_inside_a_string_literal_is_not_mistaken_for_a_constraint() {
+            let ddl = "CREATE TABLE t (note TEXT DEFAULT 'please CHECK (this) later')";
+            assert!(parse(ddl).is_empty());
+        }
+
+        #[test]
+        fn a_table_with_no_check_constraints_yields_none() {
+            let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)";
+            assert!(parse(ddl).is_empty());
+        }
     }
 }
 
