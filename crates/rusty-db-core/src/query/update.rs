@@ -1,6 +1,6 @@
 use super::expr::Expr;
 use super::table::Table;
-use super::ToSql;
+use super::{render_value_placeholder, ToSql};
 use crate::dialect::Dialect;
 use crate::value::Value;
 
@@ -51,11 +51,10 @@ impl ToSql for Update {
             .assignments
             .iter()
             .map(|(col, value)| {
-                params.push(value.clone());
                 format!(
                     "{} = {}",
                     dialect.quote_ident(col),
-                    dialect.placeholder(params.len())
+                    render_value_placeholder(value, dialect, &mut params)
                 )
             })
             .collect::<Vec<_>>()

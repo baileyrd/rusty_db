@@ -422,6 +422,9 @@ macro_rules! bind_params {
                 Value::F64(f) => query.bind(*f),
                 Value::Text(s) => query.bind(s.clone()),
                 Value::Bytes(b) => query.bind(b.clone()),
+                // MySQL/MariaDB has no native UUID type; bind its
+                // hyphenated string form, same as any other text value.
+                Value::Uuid(u) => query.bind(u.to_string()),
             };
         }
         query

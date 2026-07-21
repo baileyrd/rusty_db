@@ -1,5 +1,7 @@
 use std::fmt;
 
+use uuid::Uuid;
+
 /// A dynamically-typed value that can be bound as a query parameter or
 /// decoded out of a result row.
 ///
@@ -16,6 +18,14 @@ pub enum Value {
     F64(f64),
     Text(String),
     Bytes(Vec<u8>),
+    /// A UUID. Postgres has a native `UUID` column type and round-trips
+    /// this variant directly; MySQL/MariaDB and SQLite have no such type
+    /// (a UUID column there is really just `CHAR(36)`/`TEXT`), so those
+    /// drivers bind this as its hyphenated string form and decode UUID
+    /// columns back as `Value::Text` — `FromValue for Uuid` parses that
+    /// text form too, so a mapped struct's `Uuid` field still round-trips
+    /// correctly everywhere, just without Postgres's native wire format.
+    Uuid(Uuid),
 }
 
 impl fmt::Display for Value {
@@ -27,6 +37,7 @@ impl fmt::Display for Value {
             Value::F64(v) => write!(f, "{v}"),
             Value::Text(s) => write!(f, "{s:?}"),
             Value::Bytes(b) => write!(f, "<{} bytes>", b.len()),
+            Value::Uuid(u) => write!(f, "{u}"),
         }
     }
 }
@@ -47,6 +58,7 @@ impl_from!(i32, I64);
 impl_from!(f64, F64);
 impl_from!(String, Text);
 impl_from!(Vec<u8>, Bytes);
+impl_from!(Uuid, Uuid);
 
 impl From<&str> for Value {
     fn from(v: &str) -> Self {
@@ -126,6 +138,20 @@ impl FromValue for Vec<u8> {
         match value {
             Value::Bytes(b) => Ok(b.clone()),
             other => Err(format!("expected bytes, got {other}")),
+        }
+    }
+}
+
+impl FromValue for Uuid {
+    fn from_value(value: &Value) -> Result<Self, String> {
+        match value {
+            Value::Uuid(u) => Ok(*u),
+            // MySQL/MariaDB and SQLite have no native UUID column type, so
+            // a UUID column there decodes as plain text; parse it rather
+            // than requiring the native `Value::Uuid` form only Postgres
+            // ever actually produces.
+            Value::Text(s) => Uuid::parse_str(s).map_err(|e| format!("invalid UUID {s:?}: {e}")),
+            other => Err(format!("expected uuid, got {other}")),
         }
     }
 }

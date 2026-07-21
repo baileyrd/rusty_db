@@ -1,5 +1,5 @@
 use super::table::Table;
-use super::ToSql;
+use super::{render_value_placeholder, ToSql};
 use crate::dialect::Dialect;
 use crate::value::Value;
 
@@ -52,10 +52,7 @@ impl ToSql for Insert {
         let placeholders_sql = self
             .assignments
             .iter()
-            .map(|(_, v)| {
-                params.push(v.clone());
-                dialect.placeholder(params.len())
-            })
+            .map(|(_, v)| render_value_placeholder(v, dialect, &mut params))
             .collect::<Vec<_>>()
             .join(", ");
 

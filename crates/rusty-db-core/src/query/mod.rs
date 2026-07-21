@@ -27,3 +27,27 @@ use crate::value::Value;
 pub trait ToSql {
     fn to_sql(&self, dialect: &dyn Dialect) -> (String, Vec<Value>);
 }
+
+/// Renders one bound value for a `VALUES`/`SET` clause: a literal `NULL`
+/// for `Value::Null` (skipping the placeholder and parameter list
+/// entirely), or the dialect's placeholder otherwise.
+///
+/// Binding `NULL` as a placeholder forces the underlying driver to declare
+/// *some* concrete parameter type for it (SQLite/MySQL don't mind, but
+/// Postgres's strict parameter typing then rejects assigning that type —
+/// whatever it happens to be — into a column of a genuinely different
+/// type, e.g. a `UUID`/`BOOLEAN`/`JSON` column, with no implicit cast
+/// between them). A bare `NULL` literal has no type to conflict with, so
+/// this sidesteps the problem for every dialect, not just Postgres.
+pub(crate) fn render_value_placeholder(
+    value: &Value,
+    dialect: &dyn Dialect,
+    params: &mut Vec<Value>,
+) -> String {
+    if matches!(value, Value::Null) {
+        "NULL".to_string()
+    } else {
+        params.push(value.clone());
+        dialect.placeholder(params.len())
+    }
+}
