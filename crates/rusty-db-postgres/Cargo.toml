@@ -9,7 +9,7 @@ description = "PostgreSQL driver for rusty_db, built on sqlx"
 [dependencies]
 rusty-db-core.workspace = true
 async-trait.workspace = true
-sqlx = { workspace = true, features = ["postgres"] }
+sqlx = { workspace = true, features = ["postgres", "chrono", "bigdecimal", "json", "uuid"] }
 
 [dev-dependencies]
 tokio.workspace = true

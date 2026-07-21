@@ -5,6 +5,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::{PgPoolOptions, PgRow};
+use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use sqlx::types::{BigDecimal, JsonValue, Uuid};
 use sqlx::{Column as _, Postgres, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::NumberedDialect;
@@ -103,7 +105,47 @@ fn row_from_postgres(row: &PgRow) -> Result<Row> {
                 .map_err(to_core_err)?
                 .map(Value::Bytes)
                 .unwrap_or(Value::Null),
-            // TEXT, VARCHAR, CHAR(N)/BPCHAR, UUID, etc. all decode fine as strings.
+            // These are all sent in Postgres's own binary wire formats, not
+            // text (sqlx always requests binary result format), so each
+            // needs its own typed decode; formatted to text afterward,
+            // since `Value` has no dedicated numeric/temporal/JSON variant.
+            "NUMERIC" => row
+                .try_get::<Option<BigDecimal>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| Value::Text(v.to_string()))
+                .unwrap_or(Value::Null),
+            "DATE" => row
+                .try_get::<Option<NaiveDate>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| Value::Text(v.to_string()))
+                .unwrap_or(Value::Null),
+            "TIME" => row
+                .try_get::<Option<NaiveTime>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| Value::Text(v.to_string()))
+                .unwrap_or(Value::Null),
+            "TIMESTAMP" => row
+                .try_get::<Option<NaiveDateTime>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| Value::Text(v.to_string()))
+                .unwrap_or(Value::Null),
+            "TIMESTAMPTZ" => row
+                .try_get::<Option<DateTime<Utc>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| Value::Text(v.to_rfc3339()))
+                .unwrap_or(Value::Null),
+            "UUID" => row
+                .try_get::<Option<Uuid>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| Value::Text(v.to_string()))
+                .unwrap_or(Value::Null),
+            "JSON" | "JSONB" => row
+                .try_get::<Option<JsonValue>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| Value::Text(v.to_string()))
+                .unwrap_or(Value::Null),
+            // TEXT, VARCHAR, CHAR(N)/BPCHAR, NAME, citext, etc. all decode
+            // fine as strings (these genuinely are sent as text).
             _ => row
                 .try_get::<Option<String>, _>(i)
                 .map_err(to_core_err)?
