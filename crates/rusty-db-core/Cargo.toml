@@ -9,3 +9,4 @@ description = "Database-agnostic query builder and driver abstraction (the SQLAl
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true
+tokio.workspace = true

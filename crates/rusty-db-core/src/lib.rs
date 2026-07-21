@@ -22,6 +22,7 @@ pub mod relations;
 pub mod replica;
 pub mod row;
 pub mod session;
+pub mod timeout;
 pub mod value;
 
 pub use connection::{Connection, Driver, Executor};
@@ -35,4 +36,5 @@ pub use query::{Column, Delete, Expr, Insert, Join, JoinKind, Select, Table, ToS
 pub use replica::ReplicaSet;
 pub use row::Row;
 pub use session::Session;
+pub use timeout::with_timeout;
 pub use value::{FromValue, Value};
