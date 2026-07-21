@@ -73,3 +73,12 @@ pub use serde_json::Value as Json;
 /// `Value::Date`/`Value::Time`/`Value::DateTime`/`Value::Timestamp` wrap,
 /// so the versions can never mismatch.
 pub use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+
+/// The return type of `Engine::fetch_stream`/`fetch_stream_as`, re-exported
+/// so callers can name it without depending on `futures-core` directly.
+pub use futures_core::stream::BoxStream;
+
+/// Re-exported so callers can pull `.next()`/etc. off a `BoxStream` from
+/// `Engine::fetch_stream`/`fetch_stream_as` without depending on
+/// `futures-util` directly.
+pub use futures_util::StreamExt;

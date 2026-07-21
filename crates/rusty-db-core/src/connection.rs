@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use futures_core::stream::BoxStream;
+use futures_util::StreamExt;
 
 use crate::error::{Error, Result};
 use crate::pool::PoolStats;
@@ -72,6 +74,36 @@ pub trait Connection: Executor {
     /// a driver/test double with no statement cache to report.
     fn cached_statement_count(&self) -> usize {
         0
+    }
+
+    /// Like `fetch_all`, but yields rows one at a time as they become
+    /// available instead of collecting the entire result set first — the
+    /// escape hatch for large exports/reports where materializing a full
+    /// `Vec<Row>` would be a real memory ceiling. Consumes the connection
+    /// (rather than borrowing `&mut self`, like every other method here)
+    /// since the returned stream has to keep it alive across the whole
+    /// iteration — the same reason `close` above needs `self: Box<Self>`.
+    ///
+    /// The default implementation here still collects everything up
+    /// front (via `fetch_all`) and streams from that `Vec` afterward —
+    /// correct, but no different from `fetch_all` memory-wise. The real
+    /// driver crates (SQLite/Postgres/MySQL) override this with a
+    /// genuine row-at-a-time stream via sqlx's own `Executor::fetch`.
+    fn fetch_stream(
+        self: Box<Self>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> BoxStream<'static, Result<Row>>
+    where
+        Self: 'static,
+    {
+        let mut this = self;
+        futures_util::stream::once(async move { this.fetch_all(&sql, &params).await })
+            .flat_map(|result| match result {
+                Ok(rows) => futures_util::stream::iter(rows.into_iter().map(Ok)).boxed(),
+                Err(err) => futures_util::stream::iter(std::iter::once(Err(err))).boxed(),
+            })
+            .boxed()
     }
 }
 

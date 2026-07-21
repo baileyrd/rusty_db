@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use futures_core::stream::BoxStream;
+use futures_util::StreamExt;
+
 use crate::backup::{DatabaseDump, TableDump};
 use crate::connection::{Connection, Driver};
 use crate::dialect::Dialect;
@@ -41,6 +44,32 @@ impl Engine {
         let (sql, params) = query.to_sql(self.dialect());
         let mut conn = self.connect().await?;
         conn.fetch_all(&sql, &params).await
+    }
+
+    /// Like `fetch_all`, but yields rows one at a time instead of
+    /// collecting the entire result set into a `Vec<Row>` first — for a
+    /// large export/report where materializing everything up front would
+    /// be a real memory ceiling. The returned stream owns the connection
+    /// it checked out (kept alive for as long as the stream is), so
+    /// there's nothing further to release explicitly — dropping the
+    /// stream (e.g. ending iteration early) drops the connection too.
+    pub async fn fetch_stream(&self, query: &dyn ToSql) -> Result<BoxStream<'static, Result<Row>>> {
+        let (sql, params) = query.to_sql(self.dialect());
+        let conn = self.connect().await?;
+        Ok(conn.fetch_stream(sql, params))
+    }
+
+    /// Like `fetch_stream`, decoding each row into a `#[derive(Mapped)]`
+    /// type as it arrives.
+    pub async fn fetch_stream_as<T: FromRow + Send + 'static>(
+        &self,
+        query: &dyn ToSql,
+    ) -> Result<BoxStream<'static, Result<T>>> {
+        Ok(self
+            .fetch_stream(query)
+            .await?
+            .map(|row| T::from_row(&row?))
+            .boxed())
     }
 
     pub async fn fetch_optional(&self, query: &dyn ToSql) -> Result<Option<Row>> {

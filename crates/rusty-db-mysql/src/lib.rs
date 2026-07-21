@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow};
 use sqlx::pool::PoolConnection;
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -557,6 +558,21 @@ impl Connection for MySqlConnection {
     // the connection outright instead of just dropping it.
     fn cached_statement_count(&self) -> usize {
         self.conn.cached_statements_size()
+    }
+
+    fn fetch_stream(
+        self: Box<Self>,
+        sql: String,
+        params: Vec<Value>,
+    ) -> rusty_db_core::BoxStream<'static, Result<Row>> {
+        let MySqlConnection { mut conn } = *self;
+        Box::pin(async_stream::try_stream! {
+            let query = bind_params!(sqlx::query(&sql), &params);
+            let mut rows = query.fetch(&mut *conn);
+            while let Some(row) = rows.next().await {
+                yield row_from_mysql(&row.map_err(to_core_err)?)?;
+            }
+        })
     }
 
     async fn close(self: Box<Self>) -> Result<()> {

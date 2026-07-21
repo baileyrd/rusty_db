@@ -9,6 +9,8 @@ description = "SQLite driver for rusty_db, built on sqlx"
 [dependencies]
 rusty-db-core.workspace = true
 async-trait.workspace = true
+futures-util.workspace = true
+async-stream.workspace = true
 sqlx = { workspace = true, features = ["sqlite"] }
 
 [dev-dependencies]
