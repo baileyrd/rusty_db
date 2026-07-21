@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::backup::{DatabaseDump, TableDump};
 use crate::connection::{Connection, Driver};
 use crate::dialect::Dialect;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::mapping::FromRow;
 use crate::migration::Migrator;
 use crate::pool::PoolStats;
@@ -91,7 +91,75 @@ impl Engine {
     pub async fn begin(&self) -> Result<Transaction> {
         let mut conn = self.connect().await?;
         conn.execute("BEGIN", &[]).await?;
-        Ok(Transaction { conn: Some(conn) })
+        Ok(Transaction {
+            conn: Some(conn),
+            two_phase_gid: None,
+        })
+    }
+
+    /// Begins a transaction that participates in two-phase commit,
+    /// identified by `gid` — a caller-chosen id, unique among whatever
+    /// else might be prepared at the same time, since it's what
+    /// `commit_prepared`/`rollback_prepared` use to find this transaction
+    /// again later, possibly from an entirely different connection or
+    /// process. That's the point of the second phase: a coordinator only
+    /// decides commit-or-rollback once every participant has durably
+    /// prepared, and "durably prepared" has to outlive any one connection
+    /// for that to mean anything.
+    ///
+    /// Run statements through `Transaction::connection` as usual, then
+    /// call `Transaction::prepare` (first phase) instead of `commit`.
+    /// `Err(Error::Unsupported)` if the underlying dialect doesn't support
+    /// it — currently: SQLite.
+    pub async fn begin_two_phase(&self, gid: &str) -> Result<Transaction> {
+        if !self.dialect().supports_two_phase_commit() {
+            return Err(Error::Unsupported(
+                "two-phase commit is not supported by this dialect".to_string(),
+            ));
+        }
+        let mut conn = self.connect().await?;
+        conn.execute_unprepared(&self.dialect().begin_two_phase_sql(gid))
+            .await?;
+        Ok(Transaction {
+            conn: Some(conn),
+            two_phase_gid: Some(gid.to_string()),
+        })
+    }
+
+    /// Second phase: durably finalizes the transaction already prepared
+    /// (via `Transaction::prepare`) under `gid`. Takes just the id — no
+    /// connection or in-memory `Transaction` handle required, since a
+    /// prepared transaction survives independently of both; this is
+    /// typically called well after `prepare()`, once every other
+    /// participant a coordinator is waiting on has also prepared
+    /// successfully.
+    pub async fn commit_prepared(&self, gid: &str) -> Result<()> {
+        if !self.dialect().supports_two_phase_commit() {
+            return Err(Error::Unsupported(
+                "two-phase commit is not supported by this dialect".to_string(),
+            ));
+        }
+        let mut conn = self.connect().await?;
+        conn.execute_unprepared(&self.dialect().commit_prepared_sql(gid))
+            .await?;
+        Ok(())
+    }
+
+    /// Second phase: discards the transaction already prepared (via
+    /// `Transaction::prepare`) under `gid`, undoing its changes. Same
+    /// no-connection-required shape as `commit_prepared` — this is what a
+    /// coordinator calls instead, for every participant, if even one of
+    /// them failed to prepare.
+    pub async fn rollback_prepared(&self, gid: &str) -> Result<()> {
+        if !self.dialect().supports_two_phase_commit() {
+            return Err(Error::Unsupported(
+                "two-phase commit is not supported by this dialect".to_string(),
+            ));
+        }
+        let mut conn = self.connect().await?;
+        conn.execute_unprepared(&self.dialect().rollback_prepared_sql(gid))
+            .await?;
+        Ok(())
     }
 
     /// A unit-of-work session backed by this engine (see `Session`).
@@ -217,6 +285,7 @@ impl Engine {
 /// `Drop`). Always finish with one of those two methods.
 pub struct Transaction {
     conn: Option<Box<dyn Connection>>,
+    two_phase_gid: Option<String>,
 }
 
 impl Transaction {
@@ -263,5 +332,32 @@ impl Transaction {
         let mut conn = self.conn.take().expect("transaction already finished");
         conn.execute("ROLLBACK", &[]).await?;
         Ok(())
+    }
+
+    /// First phase of a two-phase commit, for a transaction started via
+    /// `Engine::begin_two_phase`: durably records this transaction's
+    /// changes without finalizing them — they aren't visible/committed
+    /// until a later `Engine::commit_prepared`, and are undone instead by
+    /// `Engine::rollback_prepared` if that's what the coordinator decides.
+    ///
+    /// Consumes this handle, same as `commit`/`rollback`: once prepared, a
+    /// transaction's fate no longer depends on this connection at all, so
+    /// there's nothing left for it to do — and on some dialects (MySQL's
+    /// `XA`), the underlying session is left unable to do anything else
+    /// anyway until this very transaction is resolved, so the connection
+    /// is closed outright here rather than returned to a pool where
+    /// reusing it would break whoever got it next.
+    ///
+    /// Panics if this transaction wasn't started via `begin_two_phase`.
+    pub async fn prepare(mut self, dialect: &dyn Dialect) -> Result<()> {
+        let gid = self
+            .two_phase_gid
+            .take()
+            .expect("prepare() called on a transaction not started via begin_two_phase");
+        let mut conn = self.conn.take().expect("transaction already finished");
+        for stmt in dialect.prepare_two_phase_sql(&gid) {
+            conn.execute_unprepared(&stmt).await?;
+        }
+        conn.close().await
     }
 }

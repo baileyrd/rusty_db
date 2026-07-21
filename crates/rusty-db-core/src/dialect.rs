@@ -30,6 +30,62 @@ pub trait Dialect: Send + Sync {
     fn ilike_operator(&self) -> &'static str {
         "LIKE"
     }
+
+    /// Whether this dialect supports two-phase (prepared) commit — a
+    /// transaction that's durably prepared on one call and only later,
+    /// possibly from an entirely different connection, either finalized or
+    /// discarded. Postgres (`PREPARE TRANSACTION`) and MySQL/MariaDB (`XA`)
+    /// both support it; SQLite doesn't (there's no concept of a prepared
+    /// transaction surviving independently of its connection), so it keeps
+    /// the default of `false`.
+    fn supports_two_phase_commit(&self) -> bool {
+        false
+    }
+
+    /// The statement that begins a transaction meant to later be prepared
+    /// under `gid` (the two-phase commit's caller-chosen global
+    /// transaction id). Defaults to plain `BEGIN`, since most dialects only
+    /// need the id at prepare time; MySQL's `XA` transactions need it from
+    /// the very start instead (`XA START '<gid>'`).
+    fn begin_two_phase_sql(&self, gid: &str) -> String {
+        let _ = gid;
+        "BEGIN".to_string()
+    }
+
+    /// The statement(s) that prepare (first phase) a transaction started
+    /// via `begin_two_phase_sql`, for `gid`. More than one statement for
+    /// dialects (MySQL) that require ending the transaction proper before
+    /// preparing it.
+    fn prepare_two_phase_sql(&self, gid: &str) -> Vec<String> {
+        vec![format!(
+            "PREPARE TRANSACTION '{}'",
+            escape_sql_string_literal(gid)
+        )]
+    }
+
+    /// Second phase: durably finalizes the transaction already prepared
+    /// under `gid`. Addressed purely by id — no connection or in-memory
+    /// transaction handle needed, since a prepared transaction survives
+    /// independently of both.
+    fn commit_prepared_sql(&self, gid: &str) -> String {
+        format!("COMMIT PREPARED '{}'", escape_sql_string_literal(gid))
+    }
+
+    /// Second phase: discards the transaction already prepared under
+    /// `gid`, undoing its changes. Same no-connection-required shape as
+    /// `commit_prepared_sql`.
+    fn rollback_prepared_sql(&self, gid: &str) -> String {
+        format!("ROLLBACK PREPARED '{}'", escape_sql_string_literal(gid))
+    }
+}
+
+/// Escapes a string for safe inclusion as a single-quoted SQL string
+/// literal (doubling embedded `'` characters) — used for two-phase commit
+/// global transaction ids, which some dialects (MySQL's `XA`, Postgres'
+/// `PREPARE TRANSACTION`) only accept as literal text, not a bound
+/// parameter.
+pub(crate) fn escape_sql_string_literal(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 /// `$1`, `$2`, ... style placeholders (PostgreSQL).
@@ -51,6 +107,10 @@ impl Dialect for NumberedDialect {
 
     fn ilike_operator(&self) -> &'static str {
         "ILIKE"
+    }
+
+    fn supports_two_phase_commit(&self) -> bool {
+        true
     }
 }
 
@@ -83,5 +143,26 @@ impl Dialect for MySqlDialect {
 
     fn placeholder(&self, _position: usize) -> String {
         "?".to_string()
+    }
+
+    fn supports_two_phase_commit(&self) -> bool {
+        true
+    }
+
+    fn begin_two_phase_sql(&self, gid: &str) -> String {
+        format!("XA START '{}'", escape_sql_string_literal(gid))
+    }
+
+    fn prepare_two_phase_sql(&self, gid: &str) -> Vec<String> {
+        let gid = escape_sql_string_literal(gid);
+        vec![format!("XA END '{gid}'"), format!("XA PREPARE '{gid}'")]
+    }
+
+    fn commit_prepared_sql(&self, gid: &str) -> String {
+        format!("XA COMMIT '{}'", escape_sql_string_literal(gid))
+    }
+
+    fn rollback_prepared_sql(&self, gid: &str) -> String {
+        format!("XA ROLLBACK '{}'", escape_sql_string_literal(gid))
     }
 }
