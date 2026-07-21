@@ -65,6 +65,17 @@ pub struct Session {
     identity_map: HashMap<(TypeId, String), Rc<dyn Any>>,
     audit_enabled: bool,
     audit_table: &'static str,
+    next_savepoint_id: u64,
+}
+
+/// A point inside a `Session`'s transaction created by `Session::savepoint`,
+/// for `rollback_to_savepoint`/`release_savepoint`. Its name is generated
+/// (`"rusty_db_sp_0"`, `"rusty_db_sp_1"`, ...) — plain ASCII, so it never
+/// needs identifier quoting — and unique within the session, so nested
+/// savepoints (a savepoint created while another is still open) just work.
+#[derive(Debug)]
+pub struct Savepoint {
+    name: String,
 }
 
 impl Session {
@@ -76,6 +87,7 @@ impl Session {
             identity_map: HashMap::new(),
             audit_enabled: false,
             audit_table: "_rusty_db_audit_log",
+            next_savepoint_id: 0,
         }
     }
 
@@ -449,6 +461,54 @@ impl Session {
         if let Some(txn) = self.txn.take() {
             txn.rollback().await?;
         }
+        Ok(())
+    }
+
+    /// Marks a point inside this session's ongoing transaction that
+    /// `rollback_to_savepoint` can later undo back to, without aborting the
+    /// whole transaction — for a sub-unit of work that might fail and need
+    /// undoing on its own, while everything before it (and, once you're
+    /// past that risk, everything after) still commits normally.
+    ///
+    /// Autoflushes first (the same "see your own writes" boundary `get`/
+    /// `load_all` use) and begins the session's transaction if none is open
+    /// yet, so the savepoint's boundary is well-defined regardless of what
+    /// was queued before this call.
+    pub async fn savepoint(&mut self) -> Result<Savepoint> {
+        self.flush().await?;
+        if self.txn.is_none() {
+            self.txn = Some(self.engine.begin().await?);
+        }
+        let name = format!("rusty_db_sp_{}", self.next_savepoint_id);
+        self.next_savepoint_id += 1;
+        self.execute_or_rollback(&format!("SAVEPOINT {name}"), &[])
+            .await?;
+        Ok(Savepoint { name })
+    }
+
+    /// Undoes every write flushed — or queued but not yet flushed, which
+    /// are simply discarded, since they never reached the database — since
+    /// `savepoint` was created, without aborting the rest of the
+    /// transaction. The session keeps going afterward: further
+    /// `add`/`update`/`delete`/flushes continue in the same, still-open
+    /// transaction, and `savepoint` itself can still be rolled back to
+    /// again later if you keep writing past it.
+    pub async fn rollback_to_savepoint(&mut self, savepoint: &Savepoint) -> Result<()> {
+        self.pending.clear();
+        self.execute_or_rollback(&format!("ROLLBACK TO SAVEPOINT {}", savepoint.name), &[])
+            .await?;
+        Ok(())
+    }
+
+    /// Flushes anything queued since `savepoint`, then releases it —
+    /// keeping its effects as part of the ongoing transaction, just no
+    /// longer available to roll back to on its own. Not required before
+    /// `commit()`/`rollback()`: an unreleased savepoint is
+    /// released/undone right along with the whole transaction either way.
+    pub async fn release_savepoint(&mut self, savepoint: Savepoint) -> Result<()> {
+        self.flush().await?;
+        self.execute_or_rollback(&format!("RELEASE SAVEPOINT {}", savepoint.name), &[])
+            .await?;
         Ok(())
     }
 

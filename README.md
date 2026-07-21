@@ -340,6 +340,28 @@ session.commit().await?; // both run as part of the same flush/transaction
 
 Both are queued the same way `add`/`update`/`delete` are (not sent until the next flush) and audit-logged the same way when enabled. Two things are deliberately bypassed, since neither makes sense for a filter-scoped write that isn't tied to one loaded instance: the identity map (any already-cached instances of the type stay exactly as they were in memory — evict them yourself with `clear_identity_map()` if that matters) and, for `bulk_delete`, a `#[table(soft_delete)]` column (it's always a real, hard `DELETE`; use `Session::delete` for the soft-delete-aware, single-entity path).
 
+### Savepoints (nested transactions)
+
+`session.savepoint()` marks a point inside the session's ongoing transaction that `rollback_to_savepoint` can later undo back to — for a sub-unit of work that might fail and need undoing on its own — without aborting the whole transaction the way a full `Session::rollback()` would:
+
+```rust
+session.add(&User { id: 1, name: "ada".into(), active: true });
+session.flush().await?;
+
+let sp = session.savepoint().await?;
+session.add(&User { id: 2, name: "risky-write".into(), active: true });
+if something_went_wrong {
+    session.rollback_to_savepoint(&sp).await?; // undoes just the risky write
+} else {
+    session.release_savepoint(sp).await?; // keeps it, done with this savepoint
+}
+
+session.add(&User { id: 3, name: "grace".into(), active: true });
+session.commit().await?; // ada and (if kept) the risky write and grace all land
+```
+
+`rollback_to_savepoint` undoes everything since the savepoint — whether already flushed into the transaction or still only queued (those are simply discarded, since they never reached the database) — and the session keeps going afterward in the same, still-open transaction. `release_savepoint` flushes anything queued since the savepoint and keeps its effects, just without being able to roll back to it anymore; it's never required before `commit()`/`rollback()`, since an unreleased savepoint is released or undone right along with the whole transaction either way. Savepoints nest: creating one while another is still open just works, using generated, unique names under the hood.
+
 ### Audit logging / change tracking
 
 `session.with_audit_log()` records every write the session flushes into an append-only audit table (`_rusty_db_audit_log` by default — `with_audit_log_table` picks another), inside the *same transaction* as the write itself: an audit entry only ever exists for a change that actually took effect, and if the transaction rolls back, any audit entries flushed into it roll back right along with it. Opt-in — a plain `session()` never creates or touches an audit table at all.
@@ -550,6 +572,8 @@ Index reflection (`schema.indexes`) rounds out the same test files: a `UNIQUE`-b
 `tests/query_builder_extras.rs` (SQLite) and its `_postgres` counterpart (a reduced version there — just the two things that are actually Postgres-specific, `ILIKE` and `RETURNING` on `UPDATE`/`DELETE`; `DISTINCT`/`BETWEEN`/`Table::alias`/`Expr::text` have no dialect-specific behavior and don't need re-proving against a live server) cover the newer query-builder additions against a real SQL engine rather than just checking rendered SQL strings: `Select::distinct()` actually dedupes matching rows; `Column::between` includes both boundaries inclusively; `Column::ilike` matches case-insensitively via its portable `LIKE` fallback on SQLite and via Postgres's native `ILIKE` keyword; `.returning(...)` on `Update`/`Delete` actually returns the requested columns from a real Postgres server (and is silently ignored on SQLite, whose dialect doesn't support `RETURNING` at all); `Table::alias` supports a genuine self-join (an `employees` table joined to itself to pair each employee with their manager's name); and `Expr::text` composes a raw SQL fragment (with its own `?` placeholder) together with an ordinary builder-constructed filter via `.and(...)`. The pure rendering side of all of these — including that `RETURNING` is dialect-gated, `ilike_operator()` picks the right keyword per dialect, an alias renders `<table> AS <alias>` while an unaliased `Table` is unchanged, and `text()`'s `?` placeholders get rewritten to each dialect's real placeholder syntax in order — is unit-tested directly in `crates/rusty-db-core/src/query/tests.rs`, alongside the rest of the query builder's SQL generation.
 
 `tests/bulk_update_delete.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two round-trip tests, since the identity-map-bypass/audit-log/rollback behavior is `Session`-level logic that doesn't depend on which driver is underneath) cover `Session::bulk_update`/`bulk_delete`: a filter-scoped update/delete changes/removes every matching row in one statement (`pending_len()` stays `1` regardless of how many rows match); an already-cached identity-mapped instance stays exactly as it was in memory after a `bulk_update` touches its row (the database itself is genuinely updated, confirmed by re-fetching through a fresh `Session`); `bulk_delete` is always a real, hard `DELETE` even against a `#[table(soft_delete)]` type, bypassing the soft-delete column entirely; both are recorded the same way ordinary `add`/`update`/`delete` writes are when audit logging is enabled; and a failing write queued in the same batch (a duplicate primary key) rolls the bulk write back too, since they share one all-or-nothing transaction.
+
+`tests/savepoints.rs` (SQLite, 6 tests) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests that most directly prove `SAVEPOINT`/`ROLLBACK TO SAVEPOINT`/`RELEASE SAVEPOINT` actually work against a real server, since the rest is `Session`-level logic independent of the driver underneath) cover `Session::savepoint`/`rollback_to_savepoint`/`release_savepoint`: rolling back to a savepoint undoes a sub-unit of work (whether already flushed or still only queued) without aborting the rest of the transaction, which keeps committing normally afterward; releasing a savepoint keeps its effects and lets the transaction continue; savepoints nest, rolling back an inner one independently of an outer one still open around it; and both an unreleased savepoint and a full `Session::rollback()` behave correctly regardless of whether a savepoint is still open — standard SQL behavior this crate doesn't need to do anything special to get right, beyond generating unique, safe (unquoted) savepoint names so nested savepoints within one session never collide.
 
 ## Running tests
 
