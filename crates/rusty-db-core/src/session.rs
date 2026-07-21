@@ -33,9 +33,14 @@ use crate::value::Value;
 /// `Engine`) directly instead — those reads bypass both the transaction and
 /// the identity map, so they only ever see already-committed data.
 ///
-/// Deleting an entity does not evict it from the identity map — call
-/// `clear_identity_map()` (or start a new `Session`) if you need a clean
-/// slate after deletes.
+/// `delete` also evicts the entity from the identity map immediately (not
+/// deferred to flush), so a subsequent `get`/`load_all` for that primary
+/// key never hands back a stale cached instance — even before `commit()`
+/// runs. Note this eviction isn't undone by `rollback()`: if the delete
+/// itself is rolled back, the row still exists in the database but is no
+/// longer cached, so the next `get`/`load_all` for it just re-fetches and
+/// re-caches it fresh. Call `clear_identity_map()` (or start a new
+/// `Session`) if you need a clean slate for any other reason.
 pub struct Session {
     engine: Engine,
     txn: Option<Transaction>,
@@ -76,8 +81,12 @@ impl Session {
         self.pending.push(Box::new(entity.update()));
     }
 
-    /// Queue a delete for `entity`; not sent until the next flush.
-    pub fn delete<T: Identifiable>(&mut self, entity: &T) {
+    /// Queue a delete for `entity` (not sent until the next flush), and
+    /// evict it from the identity map immediately, so `get`/`load_all`
+    /// can't hand back a stale cached instance for its primary key.
+    pub fn delete<T: Identifiable + 'static>(&mut self, entity: &T) {
+        let key = (TypeId::of::<T>(), entity.primary_key_value().to_string());
+        self.identity_map.remove(&key);
         self.pending.push(Box::new(entity.delete_query()));
     }
 

@@ -140,7 +140,17 @@ session.update(&*ada.borrow()); // queued; autoflushes on the next get/load_all,
 session.commit().await?;
 ```
 
-`get::<T>` requires a `#[table(primary_key)]` field (it looks up by that column); `load_all::<T>` requires `T: Identifiable` for the same reason, since it needs each row's own primary key to key the cache. This is why `Session` isn't `Send` — it hands out `Rc`s, matching how SQLAlchemy's own `Session` is documented as single-thread/task use only. Deleting an entity doesn't evict it from the identity map; call `session.clear_identity_map()` (or start a new `Session`) for a clean slate.
+`get::<T>` requires a `#[table(primary_key)]` field (it looks up by that column); `load_all::<T>` requires `T: Identifiable` for the same reason, since it needs each row's own primary key to key the cache. This is why `Session` isn't `Send` — it hands out `Rc`s, matching how SQLAlchemy's own `Session` is documented as single-thread/task use only.
+
+`session.delete(&entity)` evicts it from the identity map immediately (not deferred to flush), so `get`/`load_all` can never hand back a stale cached instance for a row you've already deleted — even before `commit()` runs:
+
+```rust
+let ada = session.get::<User>(1_i64).await?.unwrap();
+session.delete(&*ada.borrow());
+assert_eq!(session.get::<User>(1_i64).await?, None); // autoflushes the delete, then queries fresh
+```
+
+That eviction isn't undone by `rollback()`: if the delete itself gets rolled back, the row still exists in the database but is no longer cached, so the next `get`/`load_all` for it just re-fetches and re-caches it. Call `session.clear_identity_map()` (or start a new `Session`) for any other clean-slate need.
 
 ### Relationships and eager loading
 
@@ -206,7 +216,7 @@ Each migration runs in its own transaction (its `up`/`down` statements plus the 
 
 ## Status
 
-This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), versioned migrations, and a unit-of-work `Session` with autoflush and an identity map. Still missing: migrations don't participate in a session's transaction, and deleting an entity doesn't evict it from the identity map. Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), versioned migrations, and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Still missing: migrations don't participate in a session's transaction. Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 ## Running tests
 

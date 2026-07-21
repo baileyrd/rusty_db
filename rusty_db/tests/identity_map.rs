@@ -140,3 +140,68 @@ async fn clear_identity_map_forces_a_fresh_decode_next_time() -> rusty_db::Resul
 
     Ok(())
 }
+
+#[tokio::test]
+async fn delete_evicts_from_the_identity_map_immediately() -> rusty_db::Result<()> {
+    let engine = engine_with_users().await?;
+    let mut session = engine.session();
+
+    let ada = session.get::<User>(1_i64).await?.unwrap();
+    assert_eq!(session.identity_map_len(), 1);
+
+    // Eviction happens right away, before the delete is even flushed.
+    session.delete(&*ada.borrow());
+    assert_eq!(session.identity_map_len(), 0);
+    assert_eq!(session.pending_len(), 1);
+
+    // get() autoflushes the queued delete, then queries fresh -> gone.
+    assert_eq!(session.get::<User>(1_i64).await?, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_of_an_uncached_entity_is_a_harmless_no_op_eviction() -> rusty_db::Result<()> {
+    let engine = engine_with_users().await?;
+    let mut session = engine.session();
+
+    // Never loaded through this session, so there's nothing to evict —
+    // deleting it should not panic or otherwise misbehave.
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+        active: true,
+    };
+    assert_eq!(session.identity_map_len(), 0);
+    session.delete(&grace);
+    assert_eq!(session.identity_map_len(), 0);
+
+    session.commit().await?;
+    assert_eq!(session.get::<User>(2_i64).await?, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_all_reflects_a_deletion_and_does_not_recache_the_stale_row() -> rusty_db::Result<()> {
+    let engine = engine_with_users().await?;
+    let mut session = engine.session();
+
+    let all = session
+        .load_all::<User>(&Select::from(&User::table()).order_by(User::table().col("id").asc()))
+        .await?;
+    assert_eq!(all.len(), 2);
+    assert_eq!(session.identity_map_len(), 2);
+
+    session.delete(&*all[0].borrow()); // ada
+    assert_eq!(session.identity_map_len(), 1);
+
+    let remaining = session
+        .load_all::<User>(&Select::from(&User::table()))
+        .await?;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].borrow().name, "grace");
+    assert_eq!(session.identity_map_len(), 1);
+
+    Ok(())
+}
