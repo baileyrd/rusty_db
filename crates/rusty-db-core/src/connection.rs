@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::row::Row;
+use crate::schema::TableSchema;
 use crate::value::Value;
 
 /// The lowest-level operation set every driver must provide: run SQL text
@@ -42,4 +43,27 @@ pub trait Driver: Send + Sync {
     async fn connect(&self) -> Result<Box<dyn Connection>>;
 
     fn dialect(&self) -> &dyn crate::dialect::Dialect;
+
+    /// List every user table in the database's default schema/database,
+    /// in name order.
+    ///
+    /// The default implementation reports no schema introspection
+    /// support at all; the real driver crates (SQLite/Postgres/MySQL)
+    /// override this using their own catalog. A driver that doesn't
+    /// override it (e.g. a test double) simply doesn't support
+    /// reflection, rather than needing to implement it just to satisfy
+    /// the trait.
+    async fn list_tables(&self) -> Result<Vec<String>> {
+        Err(Error::Unsupported(
+            "schema introspection is not implemented for this driver".to_string(),
+        ))
+    }
+
+    /// Look up one table's columns; `Ok(None)` if no such table exists.
+    async fn table_schema(&self, table: &str) -> Result<Option<TableSchema>> {
+        let _ = table;
+        Err(Error::Unsupported(
+            "schema introspection is not implemented for this driver".to_string(),
+        ))
+    }
 }

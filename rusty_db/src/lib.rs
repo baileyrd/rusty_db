@@ -39,9 +39,9 @@ pub use rusty_db_mysql as mysql;
 /// Re-exports the pieces most programs need in scope.
 pub mod prelude {
     pub use rusty_db_core::{
-        with_timeout, Column, Delete, Engine, Entity, Expr, FromRow, Identifiable, Insert, Join,
-        JoinKind, Mapped, Migration, Migrator, PoolConfig, ReplicaSet, Row, Select, Session, Table,
-        ToSql, Update, Value,
+        with_timeout, Column, ColumnInfo, Delete, Engine, Entity, Expr, FromRow, Identifiable,
+        Insert, Join, JoinKind, Mapped, Migration, Migrator, PoolConfig, ReplicaSet, Row, Select,
+        Session, Table, TableSchema, ToSql, Update, Value,
     };
 
     // `Mapped` above is the trait (type namespace); this is the derive

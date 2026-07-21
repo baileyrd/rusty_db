@@ -10,7 +10,8 @@ use sqlx::{Column as _, MySql, MySqlPool, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::MySqlDialect;
 use rusty_db_core::{
-    Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, Result, Row, Value,
+    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, Result, Row,
+    TableSchema, Value,
 };
 
 static DIALECT: MySqlDialect = MySqlDialect;
@@ -71,6 +72,54 @@ impl Driver for MySqlDriver {
 
     fn dialect(&self) -> &dyn Dialect {
         &DIALECT
+    }
+
+    async fn list_tables(&self) -> Result<Vec<String>> {
+        let mut conn = self.connect().await?;
+        let rows = conn
+            .fetch_all(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_schema = DATABASE() AND table_type = 'BASE TABLE' \
+                 ORDER BY table_name",
+                &[],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| row.get_by_name::<String>("table_name"))
+            .collect()
+    }
+
+    async fn table_schema(&self, table: &str) -> Result<Option<TableSchema>> {
+        let mut conn = self.connect().await?;
+        let rows = conn
+            .fetch_all(
+                "SELECT column_name, column_type, is_nullable, column_key \
+                 FROM information_schema.columns \
+                 WHERE table_schema = DATABASE() AND table_name = ? \
+                 ORDER BY ordinal_position",
+                &[Value::Text(table.to_string())],
+            )
+            .await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let columns = rows
+            .iter()
+            .map(|row| {
+                Ok(ColumnInfo {
+                    name: row.get_by_name::<String>("column_name")?,
+                    type_name: row.get_by_name::<String>("column_type")?,
+                    nullable: row.get_by_name::<String>("is_nullable")? == "YES",
+                    primary_key: row.get_by_name::<String>("column_key")? == "PRI",
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Some(TableSchema {
+            name: table.to_string(),
+            columns,
+        }))
     }
 }
 

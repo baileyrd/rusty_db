@@ -11,7 +11,8 @@ use sqlx::{Column as _, Postgres, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::NumberedDialect;
 use rusty_db_core::{
-    Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, Result, Row, Value,
+    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, Result, Row,
+    TableSchema, Value,
 };
 
 static DIALECT: NumberedDialect = NumberedDialect;
@@ -72,6 +73,74 @@ impl Driver for PostgresDriver {
 
     fn dialect(&self) -> &dyn Dialect {
         &DIALECT
+    }
+
+    async fn list_tables(&self) -> Result<Vec<String>> {
+        let mut conn = self.connect().await?;
+        let rows = conn
+            .fetch_all(
+                "SELECT table_name FROM information_schema.tables \
+                 WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+                 ORDER BY table_name",
+                &[],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| row.get_by_name::<String>("table_name"))
+            .collect()
+    }
+
+    async fn table_schema(&self, table: &str) -> Result<Option<TableSchema>> {
+        let mut conn = self.connect().await?;
+        let table_value = Value::Text(table.to_string());
+
+        let rows = conn
+            .fetch_all(
+                "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = $1 \
+                 ORDER BY ordinal_position",
+                std::slice::from_ref(&table_value),
+            )
+            .await?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let pk_rows = conn
+            .fetch_all(
+                "SELECT kcu.column_name \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu \
+                   ON tc.constraint_name = kcu.constraint_name \
+                   AND tc.table_schema = kcu.table_schema \
+                 WHERE tc.constraint_type = 'PRIMARY KEY' \
+                   AND tc.table_schema = 'public' \
+                   AND tc.table_name = $1",
+                &[table_value],
+            )
+            .await?;
+        let primary_keys = pk_rows
+            .iter()
+            .map(|row| row.get_by_name::<String>("column_name"))
+            .collect::<Result<std::collections::HashSet<_>>>()?;
+
+        let columns = rows
+            .iter()
+            .map(|row| {
+                let name = row.get_by_name::<String>("column_name")?;
+                Ok(ColumnInfo {
+                    primary_key: primary_keys.contains(&name),
+                    name,
+                    type_name: row.get_by_name::<String>("data_type")?,
+                    nullable: row.get_by_name::<String>("is_nullable")? == "YES",
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Some(TableSchema {
+            name: table.to_string(),
+            columns,
+        }))
     }
 }
 

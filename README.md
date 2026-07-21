@@ -95,6 +95,22 @@ let rows = with_timeout(Duration::from_secs(5), engine.fetch_all(&Select::from(&
 
 "Cancelled" here means exactly what it means for any Rust future: the operation is dropped without being polled again — the same thing that happens if you `tokio::spawn` a query and call `JoinHandle::abort()` on it instead. Whatever connection it was using is returned to (or, if it was mid-query, discarded from) the pool by the driver's own `Drop` handling, so a cancelled operation never leaves the pool stuck — the next call just gets a fresh connection if the old one couldn't be reused. Note that the database server itself may not learn the query was abandoned until the connection actually closes; this only stops the client from waiting on it.
 
+### Schema introspection (reflection)
+
+`Engine::list_tables`/`table_schema` ask a live database what tables and columns it actually has, straight from its own catalog, rather than relying only on what the application's `#[derive(Mapped)]` structs declare:
+
+```rust
+let tables = engine.list_tables().await?; // Vec<String>, in name order
+
+if let Some(schema) = engine.table_schema("users").await? {
+    for column in &schema.columns {
+        println!("{}: {} (nullable={}, pk={})", column.name, column.type_name, column.nullable, column.primary_key);
+    }
+}
+```
+
+Column type names are reported verbatim from each database's own catalog (SQLite says `"INTEGER"`, Postgres says `"bigint"`, MySQL says `"bigint(20)"` — note MySQL includes the display width) — there's no attempt to unify them into one portable type system, the same scope decision this crate already makes for `Value`. `table_schema` returns `Ok(None)` for a table that doesn't exist. A driver that doesn't implement introspection (only SQLite/Postgres/MySQL do) returns `Err(Error::Unsupported)` rather than requiring every `Driver` implementor to support it.
+
 If a replica's connection attempt fails, the read automatically retries the next replica in the rotation instead of failing outright, and falls back to the primary if every replica turns out to be unreachable — a `ReplicaSet` built with no replicas at all is simply a primary-only fallback, not a case callers need to special-case. `ReplicaSet::session()` deliberately hands back a `Session` backed by the primary, never a replica: a session's autoflush/identity-map guarantees depend on reading back its own not-yet-committed writes, which a lagging replica can't promise.
 
 ### Joins
@@ -280,6 +296,8 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 `tests/replica_set.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `ReplicaSet`: reads round-robin across healthy replicas (verified by seeding each stand-in replica with its own marker row and checking which one a read actually returned, rather than peeking at any internal routing state); a down replica fails over to the next healthy one instead of surfacing an error; every replica being down falls back to the primary; a `ReplicaSet` with zero replicas configured always uses the primary; and writes (`execute`, `Session`) always land on the primary regardless of replica health. Since real database replication is a server-side feature this crate can't spin up in a sandbox, a "down" replica/primary is simulated with a minimal fake `Driver` whose `connect()` always returns `Error::Connection` — the same failure shape a genuinely unreachable server produces — rather than by actually taking a live server down mid-suite; the Postgres/MySQL versions otherwise use real, separate tables on the live servers as replica stand-ins.
 
 `tests/query_timeout.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `with_timeout`: an operation finishing inside its timeout succeeds normally; a genuinely slow/blocked operation is cancelled and returns `Error::Timeout` instead of hanging; a cancelled operation leaves the pool usable afterward rather than stuck; a timeout on one call has no lingering effect on later calls; and aborting a task running a slow operation (`JoinHandle::abort`, the other standard way to cancel a Rust future) cancels it the same way a timeout would. The SQLite version gets a genuinely blocked (not simulated) query via real lock contention — holding SQLite's write lock on one connection while a second connection attempts a conflicting write, which sqlx's SQLite driver retries against its own 5-second `busy_timeout` rather than erroring immediately. The Postgres/MySQL versions use their real, built-in `pg_sleep()`/`SLEEP()` functions for a genuinely slow query instead.
+
+`tests/schema_introspection.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `list_tables`/`table_schema`: created tables are reported (and, for SQLite, internal `sqlite_*` tables never are); a table's columns come back with the right type names, nullability, and primary-key flags; and a table that doesn't exist reports `Ok(None)` rather than an error. Chasing down why the SQLite version's PRAGMA-based columns were coming back entirely `Null` uncovered a real bug in the SQLite driver's row decoder: it was keying off each column's *declared* type (`"NULL"` when SQLite can't infer one statically — true for `PRAGMA` output and other non-plain-table results, not just when the value itself is null) instead of that value's actual *runtime* type, so it silently decoded every column as `Value::Null` whenever SQLite left the static type undeclared. Fixed by falling back to the per-value runtime type (via `try_get_raw`) exactly when the declared type is `"NULL"`, leaving the existing behavior for ordinary table queries (which do have a meaningful declared type) unchanged — confirmed by the rest of the suite still passing unmodified.
 
 ## Running tests
 

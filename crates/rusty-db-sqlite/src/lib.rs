@@ -5,11 +5,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
-use sqlx::{Column as _, Row as _, Sqlite, SqlitePool, TypeInfo as _};
+use sqlx::{Column as _, Row as _, Sqlite, SqlitePool, TypeInfo as _, ValueRef as _};
 
 use rusty_db_core::dialect::QuestionMarkDialect;
 use rusty_db_core::{
-    Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, Result, Row, Value,
+    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, Result, Row,
+    TableSchema, Value,
 };
 
 static DIALECT: QuestionMarkDialect = QuestionMarkDialect;
@@ -71,6 +72,51 @@ impl Driver for SqliteDriver {
     fn dialect(&self) -> &dyn Dialect {
         &DIALECT
     }
+
+    async fn list_tables(&self) -> Result<Vec<String>> {
+        let mut conn = self.connect().await?;
+        let rows = conn
+            .fetch_all(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+                 ORDER BY name",
+                &[],
+            )
+            .await?;
+        rows.iter()
+            .map(|row| row.get_by_name::<String>("name"))
+            .collect()
+    }
+
+    async fn table_schema(&self, table: &str) -> Result<Option<TableSchema>> {
+        if !self.list_tables().await?.iter().any(|t| t == table) {
+            return Ok(None);
+        }
+
+        let mut conn = self.connect().await?;
+        // PRAGMA doesn't support bound parameters for the table name;
+        // quoting it is the standard mitigation for identifiers that
+        // have to be interpolated directly into SQL text.
+        let sql = format!("PRAGMA table_info({})", DIALECT.quote_ident(table));
+        let rows = conn.fetch_all(&sql, &[]).await?;
+
+        let columns = rows
+            .iter()
+            .map(|row| {
+                Ok(ColumnInfo {
+                    name: row.get_by_name::<String>("name")?,
+                    type_name: row.get_by_name::<String>("type")?,
+                    nullable: row.get_by_name::<i64>("notnull")? == 0,
+                    primary_key: row.get_by_name::<i64>("pk")? > 0,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Some(TableSchema {
+            name: table.to_string(),
+            columns,
+        }))
+    }
 }
 
 pub struct SqliteConnection {
@@ -91,7 +137,25 @@ fn row_from_sqlite(row: &SqliteRow) -> Result<Row> {
 
     let mut values = Vec::with_capacity(columns.len());
     for (i, col) in row.columns().iter().enumerate() {
-        let value = match col.type_info().name() {
+        // The column's own declared type is "NULL" when SQLite couldn't
+        // infer a static type for it at prepare time — not "this column
+        // is always NULL". This happens for query results that aren't
+        // plain table columns (PRAGMA output, computed expressions,
+        // `SELECT`s combined by `UNION`, ...), and SQLite is dynamically
+        // typed on a *per-value* basis anyway, so fall back to this row's
+        // actual runtime type for that case instead of assuming NULL.
+        let declared_type = col.type_info().name();
+        let type_name = if declared_type == "NULL" {
+            row.try_get_raw(i)
+                .map_err(to_core_err)?
+                .type_info()
+                .name()
+                .to_string()
+        } else {
+            declared_type.to_string()
+        };
+
+        let value = match type_name.as_str() {
             "INTEGER" | "BIGINT" | "INT" => row
                 .try_get::<Option<i64>, _>(i)
                 .map_err(to_core_err)?
