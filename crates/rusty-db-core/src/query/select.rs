@@ -5,10 +5,67 @@ use super::ToSql;
 use crate::dialect::Dialect;
 use crate::value::Value;
 
+/// One item in a `SELECT` column list: a plain `Column`, or an arbitrary
+/// `Expr` (an aggregate — `Expr::count_all()`/`Column::sum()`/etc — a raw
+/// `Expr::text(...)` fragment, or any other expression), optionally
+/// aliased with `AS`.
+///
+/// `Column` and `Expr` both convert into this via `Into`, so `.columns(...)`
+/// accepts either directly — but only one at a time per call, since a
+/// single `impl IntoIterator` call needs one concrete item type. Mixing
+/// plain columns and expression columns in the same `SELECT` means
+/// wrapping the plain ones in `SelectExpr::from(...)` too:
+///
+/// ```
+/// # use rusty_db_core::{Expr, Select, SelectExpr, Table};
+/// let orders = Table::new("orders");
+/// let query = Select::from(&orders).columns([
+///     SelectExpr::from(orders.col("user_id")),
+///     SelectExpr::from(orders.col("amount").sum()).alias("total"),
+/// ]);
+/// ```
+#[derive(Debug, Clone)]
+pub struct SelectExpr {
+    expr: Expr,
+    alias: Option<String>,
+}
+
+impl SelectExpr {
+    pub fn new(expr: Expr) -> Self {
+        SelectExpr { expr, alias: None }
+    }
+
+    /// `<expr> AS <alias>`.
+    pub fn alias(mut self, alias: impl Into<String>) -> Self {
+        self.alias = Some(alias.into());
+        self
+    }
+
+    fn render(&self, dialect: &dyn Dialect, params: &mut Vec<Value>) -> String {
+        let rendered = self.expr.render(dialect, params);
+        match &self.alias {
+            Some(alias) => format!("{rendered} AS {}", dialect.quote_ident(alias)),
+            None => rendered,
+        }
+    }
+}
+
+impl From<Column> for SelectExpr {
+    fn from(column: Column) -> Self {
+        SelectExpr::new(Expr::Column(column))
+    }
+}
+
+impl From<Expr> for SelectExpr {
+    fn from(expr: Expr) -> Self {
+        SelectExpr::new(expr)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Select {
     table: Table,
-    columns: Vec<Column>,
+    columns: Vec<SelectExpr>,
     distinct: bool,
     joins: Vec<Join>,
     filter: Option<Expr>,
@@ -32,8 +89,11 @@ impl Select {
         }
     }
 
-    pub fn columns(mut self, columns: impl IntoIterator<Item = Column>) -> Self {
-        self.columns = columns.into_iter().collect();
+    /// Accepts plain `Column`s (`SELECT` as before) or `SelectExpr`s (for
+    /// aggregates/arbitrary expressions, optionally aliased) — see
+    /// `SelectExpr`'s own doc for how to mix the two in one call.
+    pub fn columns<C: Into<SelectExpr>>(mut self, columns: impl IntoIterator<Item = C>) -> Self {
+        self.columns = columns.into_iter().map(Into::into).collect();
         self
     }
 
@@ -105,7 +165,7 @@ impl ToSql for Select {
         } else {
             self.columns
                 .iter()
-                .map(|c| c.qualified_sql(dialect))
+                .map(|c| c.render(dialect, &mut params))
                 .collect::<Vec<_>>()
                 .join(", ")
         };

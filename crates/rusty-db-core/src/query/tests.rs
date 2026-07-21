@@ -258,3 +258,64 @@ fn ilike_renders_as_ilike_on_postgres_and_falls_back_to_like_elsewhere() {
     let (sqlite_sql, _) = query.to_sql(&QuestionMarkDialect);
     assert!(sqlite_sql.contains(r#""users"."name" LIKE ?"#));
 }
+
+#[test]
+fn count_all_renders_as_count_star_with_no_params() {
+    let users = Table::new("users");
+    let (sql, params) = Select::from(&users)
+        .columns([SelectExpr::from(Expr::count_all())])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"SELECT COUNT(*) FROM "users""#);
+    assert!(params.is_empty());
+}
+
+#[test]
+fn aggregate_over_a_column_renders_and_can_be_aliased() {
+    let orders = Table::new("orders");
+    let (sql, _) = Select::from(&orders)
+        .columns([SelectExpr::from(orders.col("amount").sum()).alias("total")])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT SUM("orders"."amount") AS "total" FROM "orders""#
+    );
+
+    // Every aggregate this crate supports, unaliased.
+    let (sql, _) = Select::from(&orders)
+        .columns([
+            SelectExpr::from(orders.col("amount").count()),
+            SelectExpr::from(orders.col("amount").avg()),
+            SelectExpr::from(orders.col("amount").min()),
+            SelectExpr::from(orders.col("amount").max()),
+        ])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT COUNT("orders"."amount"), AVG("orders"."amount"), MIN("orders"."amount"), MAX("orders"."amount") FROM "orders""#
+    );
+}
+
+#[test]
+fn plain_and_expression_columns_compose_in_one_select_via_select_expr() {
+    let orders = Table::new("orders");
+    let (sql, _) = Select::from(&orders)
+        .columns([
+            SelectExpr::from(orders.col("user_id")),
+            SelectExpr::from(orders.col("amount").sum()).alias("total"),
+        ])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT "orders"."user_id", SUM("orders"."amount") AS "total" FROM "orders""#
+    );
+}
+
+#[test]
+fn arbitrary_expression_can_be_a_select_column() {
+    let orders = Table::new("orders");
+    let (sql, params) = Select::from(&orders)
+        .columns([SelectExpr::from(Expr::text("amount * ?", [Value::F64(1.1)])).alias("with_tax")])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"SELECT amount * ? AS "with_tax" FROM "orders""#);
+    assert_eq!(params, vec![Value::F64(1.1)]);
+}

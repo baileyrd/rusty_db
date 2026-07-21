@@ -4,9 +4,10 @@
 //! in-memory) SQL engine, not just checking rendered SQL strings:
 //! `Select::distinct`, `Column::between`, `Column::ilike`'s portable
 //! fallback to plain `LIKE` on backends without a native `ILIKE` keyword,
-//! `Table::alias` for self-joins, and `Expr::text` for raw SQL fragments
-//! composed into the builder. `RETURNING` on `UPDATE`/`DELETE` has no
-//! SQLite coverage here since SQLite's dialect doesn't support it (see
+//! `Table::alias` for self-joins, `Expr::text` for raw SQL fragments
+//! composed into the builder, and aggregate functions/expression columns
+//! via `SelectExpr`. `RETURNING` on `UPDATE`/`DELETE` has no SQLite
+//! coverage here since SQLite's dialect doesn't support it (see
 //! `query_builder_extras_postgres.rs`).
 
 use rusty_db::prelude::*;
@@ -194,6 +195,64 @@ async fn text_composes_a_raw_fragment_into_an_otherwise_builder_filter() -> rust
         .collect::<rusty_db::Result<_>>()?;
     // id=1 (Ada, amount=10) fails the amount filter; id=2 (ada, amount=50) matches both.
     assert_eq!(ids, vec![2]);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn aggregate_functions_execute_and_decode_correctly() -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    // amounts: 10, 50, 50, 200
+    let row = engine
+        .fetch_one(&Select::from(&orders).columns([
+            SelectExpr::from(Expr::count_all()).alias("n"),
+            SelectExpr::from(orders.col("amount").sum()).alias("total"),
+            SelectExpr::from(orders.col("amount").avg()).alias("average"),
+            SelectExpr::from(orders.col("amount").min()).alias("smallest"),
+            SelectExpr::from(orders.col("amount").max()).alias("largest"),
+        ]))
+        .await?;
+    assert_eq!(row.get_by_name::<i64>("n")?, 4);
+    assert_eq!(row.get_by_name::<i64>("total")?, 310);
+    assert_eq!(row.get_by_name::<f64>("average")?, 77.5);
+    assert_eq!(row.get_by_name::<i64>("smallest")?, 10);
+    assert_eq!(row.get_by_name::<i64>("largest")?, 200);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn plain_and_aggregate_columns_compose_and_an_expression_column_is_aliased(
+) -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    let row = engine
+        .fetch_one(
+            &Select::from(&orders)
+                .columns([
+                    SelectExpr::from(orders.col("customer")),
+                    SelectExpr::from(Expr::count_all()).alias("n"),
+                ])
+                .filter(orders.col("id").eq(1_i64)),
+        )
+        .await?;
+    assert_eq!(row.get_by_name::<String>("customer")?, "Ada");
+    // COUNT(*) here is scoped by the same WHERE id = 1 filter as the rest
+    // of the query, not the whole table.
+    assert_eq!(row.get_by_name::<i64>("n")?, 1);
+
+    // An arbitrary expression column, not just an aggregate.
+    let row = engine
+        .fetch_one(
+            &Select::from(&orders)
+                .columns([SelectExpr::from(Expr::text("amount * 2", [])).alias("doubled")])
+                .filter(orders.col("id").eq(1_i64)),
+        )
+        .await?;
+    assert_eq!(row.get_by_name::<i64>("doubled")?, 20);
 
     Ok(())
 }
