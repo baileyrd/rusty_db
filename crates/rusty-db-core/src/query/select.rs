@@ -1,0 +1,110 @@
+use super::expr::Expr;
+use super::table::{Column, Table};
+use super::ToSql;
+use crate::dialect::Dialect;
+use crate::value::Value;
+
+#[derive(Debug, Clone)]
+pub struct Select {
+    table: Table,
+    columns: Vec<Column>,
+    filter: Option<Expr>,
+    order_by: Vec<(Column, bool)>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+impl Select {
+    /// `SELECT * FROM table` (add `.columns(...)` to select specific columns).
+    pub fn from(table: &Table) -> Self {
+        Select {
+            table: table.clone(),
+            columns: Vec::new(),
+            filter: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }
+    }
+
+    pub fn columns(mut self, columns: impl IntoIterator<Item = Column>) -> Self {
+        self.columns = columns.into_iter().collect();
+        self
+    }
+
+    pub fn filter(mut self, expr: Expr) -> Self {
+        self.filter = Some(match self.filter {
+            Some(existing) => existing.and(expr),
+            None => expr,
+        });
+        self
+    }
+
+    pub fn order_by(mut self, ordering: (Column, bool)) -> Self {
+        self.order_by.push(ordering);
+        self
+    }
+
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    pub fn offset(mut self, offset: i64) -> Self {
+        self.offset = Some(offset);
+        self
+    }
+}
+
+impl ToSql for Select {
+    fn to_sql(&self, dialect: &dyn Dialect) -> (String, Vec<Value>) {
+        let mut params = Vec::new();
+
+        let columns_sql = if self.columns.is_empty() {
+            "*".to_string()
+        } else {
+            self.columns
+                .iter()
+                .map(|c| c.qualified_sql(dialect))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let mut sql = format!(
+            "SELECT {columns_sql} FROM {}",
+            dialect.quote_ident(self.table.name())
+        );
+
+        if let Some(filter) = &self.filter {
+            sql.push_str(" WHERE ");
+            sql.push_str(&filter.render(dialect, &mut params));
+        }
+
+        if !self.order_by.is_empty() {
+            let order_sql = self
+                .order_by
+                .iter()
+                .map(|(col, asc)| {
+                    format!(
+                        "{} {}",
+                        col.qualified_sql(dialect),
+                        if *asc { "ASC" } else { "DESC" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(" ORDER BY ");
+            sql.push_str(&order_sql);
+        }
+
+        if let Some(limit) = self.limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+
+        if let Some(offset) = self.offset {
+            sql.push_str(&format!(" OFFSET {offset}"));
+        }
+
+        (sql, params)
+    }
+}

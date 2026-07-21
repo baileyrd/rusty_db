@@ -1,0 +1,20 @@
+[package]
+name = "rusty-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A database-agnostic query builder and connection abstraction, in the spirit of SQLAlchemy Core"
+
+[dependencies]
+rusty-db-core.workspace = true
+rusty-db-sqlite = { workspace = true, optional = true }
+rusty-db-postgres = { workspace = true, optional = true }
+
+[features]
+default = []
+sqlite = ["dep:rusty-db-sqlite"]
+postgres = ["dep:rusty-db-postgres"]
+
+[dev-dependencies]
+tokio.workspace = true
