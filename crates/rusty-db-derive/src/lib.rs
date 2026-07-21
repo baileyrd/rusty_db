@@ -74,7 +74,8 @@
 //! Field types must implement `Into<Value>` on an owned clone (i.e. the set
 //! of types `Value` already converts from: `bool`, `i64`, `i32`, `f64`,
 //! `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, `Json`, and `Option<_>` of
-//! those — plus any enum carrying `#[derive(MappedEnum)]`, below). A
+//! those — plus any type carrying `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]`,
+//! below, or implementing `Into<Value>`/`FromValue` itself by hand). A
 //! `#[table(version)]` field's type must also support `+ 1` (in practice,
 //! `i64`/`i32`).
 //!
@@ -101,6 +102,29 @@
 //! survive the enum's variants being reordered or renumbered later, since
 //! the stored value is just a bare integer with no record of which
 //! variant it meant.
+//!
+//! `#[derive(MappedNewtype)]`: maps a single-field tuple struct onto
+//! whatever `Value` its own field already converts to/from, so it can be
+//! used directly as a `#[derive(Mapped)]` field type too — the
+//! newtype/enum pairing named in the "map a newtype or enum onto a
+//! `Value`" escape hatch this crate offers instead of waiting on every
+//! type application code wants to become a built-in `Value` variant.
+//!
+//! ```ignore
+//! #[derive(Debug, Clone, PartialEq, MappedNewtype)]
+//! struct Email(String);
+//! ```
+//!
+//! generates `impl From<Email> for Value` and `impl FromValue for Email`,
+//! each delegating straight to the wrapped field's own conversion (here,
+//! `String`'s). This is only a boilerplate-avoider for the common case of
+//! a newtype around one already-`Value`-compatible type (including
+//! another `MappedEnum`/`MappedNewtype`, so these compose); anything more
+//! involved — validating a raw value while decoding it, or combining more
+//! than one column into a single field — still means implementing
+//! `Into<Value>`/`FromValue` by hand, which needs no macro and no special
+//! support from this crate at all: both traits are ordinary public traits
+//! any downstream type can implement itself.
 
 use heck::ToSnakeCase;
 use proc_macro::TokenStream;
@@ -121,6 +145,14 @@ pub fn derive_mapped(input: TokenStream) -> TokenStream {
 pub fn derive_mapped_enum(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand_mapped_enum(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+#[proc_macro_derive(MappedNewtype)]
+pub fn derive_mapped_newtype(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand_mapped_newtype(input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -1082,6 +1114,49 @@ fn expand_mapped_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
     Ok(quote! {
         #from_impl
         #from_value_impl
+    })
+}
+
+/// `#[derive(MappedNewtype)]`: maps a single-field tuple struct onto
+/// whatever `Value` its own field already converts to/from, delegating
+/// straight through — so it can be used directly as a `#[derive(Mapped)]`
+/// field type.
+fn expand_mapped_newtype(input: DeriveInput) -> syn::Result<TokenStream2> {
+    let ident = &input.ident;
+
+    let Data::Struct(data) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "#[derive(MappedNewtype)] only supports tuple structs with exactly one field",
+        ));
+    };
+    let Fields::Unnamed(fields) = &data.fields else {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "#[derive(MappedNewtype)] only supports tuple structs with exactly one field",
+        ));
+    };
+    if fields.unnamed.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "#[derive(MappedNewtype)] only supports tuple structs with exactly one field",
+        ));
+    }
+
+    let core = core_crate_path();
+
+    Ok(quote! {
+        impl ::std::convert::From<#ident> for #core::Value {
+            fn from(v: #ident) -> Self {
+                #core::Value::from(v.0)
+            }
+        }
+
+        impl #core::FromValue for #ident {
+            fn from_value(value: &#core::Value) -> ::std::result::Result<Self, ::std::string::String> {
+                ::std::result::Result::Ok(#ident(<_ as #core::FromValue>::from_value(value)?))
+            }
+        }
     })
 }
 

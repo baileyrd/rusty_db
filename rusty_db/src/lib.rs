@@ -32,6 +32,11 @@ pub use rusty_db_derive::Mapped;
 #[cfg(feature = "derive")]
 pub use rusty_db_derive::MappedEnum;
 
+/// `#[derive(MappedNewtype)]`: maps a single-field tuple struct onto
+/// whatever `Value` its own field already converts to/from.
+#[cfg(feature = "derive")]
+pub use rusty_db_derive::MappedNewtype;
+
 #[cfg(feature = "sqlite")]
 pub use rusty_db_sqlite as sqlite;
 
@@ -58,6 +63,9 @@ pub mod prelude {
 
     #[cfg(feature = "derive")]
     pub use rusty_db_derive::MappedEnum;
+
+    #[cfg(feature = "derive")]
+    pub use rusty_db_derive::MappedNewtype;
 
     #[cfg(feature = "sqlite")]
     pub use rusty_db_sqlite::SqliteDriver;
