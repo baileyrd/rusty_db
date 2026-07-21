@@ -1,6 +1,6 @@
 use super::insert::Insert;
 use super::table::Table;
-use super::ToSql;
+use super::{render_value_placeholder, ToSql};
 use crate::dialect::Dialect;
 use crate::error::{Error, Result};
 use crate::value::Value;
@@ -100,10 +100,7 @@ impl ToSql for BulkInsert {
             .map(|row| {
                 let placeholders = row
                     .iter()
-                    .map(|value| {
-                        params.push(value.clone());
-                        dialect.placeholder(params.len())
-                    })
+                    .map(|value| render_value_placeholder(value, dialect, &mut params))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({placeholders})")

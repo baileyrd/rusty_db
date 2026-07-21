@@ -181,9 +181,12 @@ async fn wider_column_types_decode_correctly() -> rusty_db::Result<()> {
     let widgets = Table::new("widgets");
     let rows = engine.fetch_all(&Select::from(&widgets)).await?;
     assert_eq!(rows.len(), 1);
+    // A native Postgres UUID column decodes as Value::Uuid, not text.
     assert_eq!(
-        rows[0].get_by_name::<String>("id")?,
+        rows[0].get_by_name::<Uuid>("id")?,
         "11111111-1111-1111-1111-111111111111"
+            .parse::<Uuid>()
+            .unwrap()
     );
     // NUMERIC decodes via BigDecimal, whose Display doesn't necessarily
     // preserve the column's declared scale (e.g. "3.5000" vs "3.50") — the

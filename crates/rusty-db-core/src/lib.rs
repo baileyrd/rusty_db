@@ -48,3 +48,8 @@ pub use schema::{
 pub use session::{Savepoint, Session, SessionQuery};
 pub use timeout::with_timeout;
 pub use value::{FromValue, Value};
+
+/// Re-exported so a `#[derive(Mapped)]` field can be typed `Uuid` without
+/// depending on the `uuid` crate directly — this is exactly the type
+/// `Value::Uuid` wraps, so the versions can never mismatch.
+pub use uuid::Uuid;
