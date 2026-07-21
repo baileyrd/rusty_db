@@ -9,8 +9,8 @@ use sqlx::{Column as _, Row as _, Sqlite, SqlitePool, TypeInfo as _, ValueRef as
 
 use rusty_db_core::dialect::QuestionMarkDialect;
 use rusty_db_core::{
-    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, PoolMetrics,
-    PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
+    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, ForeignKey, PoolConfig,
+    PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
 };
 
 static DIALECT: QuestionMarkDialect = QuestionMarkDialect;
@@ -188,11 +188,39 @@ impl Driver for SqliteDriver {
             None => Vec::new(),
         };
 
+        // SQLite doesn't name foreign keys at all; rows sharing the same
+        // `id` belong to the same (possibly composite) key, ordered by
+        // `seq`, so a synthetic, positional name is the best available.
+        let fk_rows = conn
+            .fetch_all(&format!("PRAGMA foreign_key_list({quoted_table})"), &[])
+            .await?;
+        let mut foreign_keys: Vec<ForeignKey> = Vec::new();
+        let mut last_id: Option<i64> = None;
+        for fk_row in &fk_rows {
+            let id = fk_row.get_by_name::<i64>("id")?;
+            let column = fk_row.get_by_name::<String>("from")?;
+            let referenced_column = fk_row.get_by_name::<String>("to")?;
+            if last_id == Some(id) {
+                let last = foreign_keys.last_mut().expect("last_id implies an entry");
+                last.columns.push(column);
+                last.referenced_columns.push(referenced_column);
+            } else {
+                foreign_keys.push(ForeignKey {
+                    name: format!("fk_{}", foreign_keys.len() + 1),
+                    columns: vec![column],
+                    referenced_table: fk_row.get_by_name::<String>("table")?,
+                    referenced_columns: vec![referenced_column],
+                });
+                last_id = Some(id);
+            }
+        }
+
         Ok(Some(TableSchema {
             name: table.to_string(),
             columns,
             unique_constraints,
             check_constraints,
+            foreign_keys,
         }))
     }
 }

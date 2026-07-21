@@ -52,12 +52,28 @@ pub struct CheckConstraint {
     pub expression: String,
 }
 
+/// A foreign key: the column(s) in this table, in order, that reference
+/// another table's column(s) in the same order (so `columns[i]`
+/// references `referenced_columns[i]`).
+///
+/// SQLite doesn't name foreign keys at all, so its `name` there is
+/// synthetic (`"fk_1"`, `"fk_2"`, ...), not something recoverable from the
+/// database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<String>,
+}
+
 /// A reflected table: its name and columns, in the database's own column
-/// order, plus its `UNIQUE`/`CHECK` constraints.
+/// order, plus its `UNIQUE`/`CHECK`/foreign key constraints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnInfo>,
     pub unique_constraints: Vec<UniqueConstraint>,
     pub check_constraints: Vec<CheckConstraint>,
+    pub foreign_keys: Vec<ForeignKey>,
 }
