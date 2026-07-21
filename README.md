@@ -114,9 +114,42 @@ session.commit().await?; // update + delete, atomically
 
 If any statement in the batch fails, `commit()` rolls back the whole transaction and leaves the queue untouched, so you can fix the problem and call `commit()` again. This is a unit-of-work, not a full ORM session: there's no identity map and no autoflush, so reads (`engine.fetch_all_as`, etc.) never see writes that are queued but not yet committed — always `commit()` before reading anything you just wrote through a `Session`.
 
+### Relationships and eager loading
+
+`#[has_many(Child, foreign_key = "...")]` and `#[belongs_to(Parent, foreign_key = "...")]` declare a relationship between two `#[derive(Mapped)]` types and generate a batched ("select-in") loader — one extra query for the whole batch, not one per row:
+
+```rust
+#[derive(Mapped)]
+#[table(name = "users")]
+#[has_many(Order, foreign_key = "user_id")]
+struct User {
+    #[table(primary_key)]
+    id: i64,
+    name: String,
+}
+
+#[derive(Mapped)]
+#[table(name = "orders")]
+#[belongs_to(User, foreign_key = "user_id")]
+struct Order {
+    #[table(primary_key)]
+    id: i64,
+    user_id: i64,
+    amount: i64,
+}
+
+let users: Vec<User> = engine.fetch_all_as(&Select::from(&User::table())).await?;
+let orders_by_user: HashMap<i64, Vec<Order>> = User::load_orders(&engine, &users).await?;
+
+let orders: Vec<Order> = engine.fetch_all_as(&Select::from(&Order::table())).await?;
+let users_by_id: HashMap<i64, User> = Order::load_user(&engine, &orders).await?;
+```
+
+`has_many`'s loader name is the pluralized (naive `+s`) snake_case child type (`load_orders`); `belongs_to`'s is the singular snake_case parent type (`load_user`). Both are generated from, and callable directly as, `rusty_db::relations::load_many`/`load_one` if you'd rather not use the attributes (e.g. for a relationship keyed by something other than the primary key). There's no lazy-loading proxy or identity map here — relationships are always loaded explicitly, in a batch, by calling one of these functions.
+
 ## Status
 
-This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins), and a unit-of-work `Session`. Still missing: an identity map/autoflush, relationships/eager-loading, and migrations. Postgres and SQLite are the only drivers; both are implemented but only SQLite is exercised by the test suite in this environment (no live Postgres server available here).
+This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), and a unit-of-work `Session`. Still missing: an identity map/autoflush and migrations. Postgres and SQLite are the only drivers; both are implemented but only SQLite is exercised by the test suite in this environment (no live Postgres server available here).
 
 ## Running tests
 
