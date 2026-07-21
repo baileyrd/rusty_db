@@ -13,28 +13,42 @@ per-driver code), not a real estimate.
 
 Every item below is also tracked as a GitHub issue, grouped under one
 tracking epic per section: [Query builder (#38)](https://github.com/baileyrd/rusty_db/issues/38),
-[Value/type system (#46)](https://github.com/baileyrd/rusty_db/issues/46),
 [Schema/DDL/reflection (#54)](https://github.com/baileyrd/rusty_db/issues/54),
 [Mapping/derive macro (#60)](https://github.com/baileyrd/rusty_db/issues/60),
 [Relationships/eager loading (#66)](https://github.com/baileyrd/rusty_db/issues/66),
-[Session/unit-of-work (#73)](https://github.com/baileyrd/rusty_db/issues/73),
 [Async & performance (#77)](https://github.com/baileyrd/rusty_db/issues/77),
 [Topology/deployment (#80)](https://github.com/baileyrd/rusty_db/issues/80),
 [Tooling (#83)](https://github.com/baileyrd/rusty_db/issues/83).
+
+Two tracking epics are fully done and no longer listed above: [Value/type
+system (#46)](https://github.com/baileyrd/rusty_db/issues/46) and
+[Session/unit-of-work (#73)](https://github.com/baileyrd/rusty_db/issues/73)
+— see "current state" below for what they added.
 
 ## How to read "current state"
 
 As of the most recently merged work: a query builder (`Select`/`Insert`/
 `Update`/`Delete`, `INNER`/`LEFT`/`RIGHT`/`FULL JOIN`, `=`/`<>`/`<`/`<=`/
-`>`/`>=`/`LIKE`/`IN`/`IS [NOT] NULL`/`AND`/`OR`/`NOT`, `ORDER BY`, `LIMIT`/
-`OFFSET`, `RETURNING` on `INSERT`); `#[derive(Mapped)]` with one primary
-key, one version column, one soft-delete column, custom column/table
-names; a `Session` unit-of-work with an identity map, autoflush, bulk
-insert, audit logging, optimistic locking, soft deletes; `has_many`/
-`belongs_to` select-in eager loading; hand-written versioned migrations;
-schema introspection (columns/types/nullability/PK only); logical backup/
-restore; read replicas; TLS; query timeouts; connection-pool observability.
-See `README.md` for the full tour with examples.
+`>`/`>=`/`LIKE`/`ILIKE`/`BETWEEN`/`IN`/`IS [NOT] NULL`/`AND`/`OR`/`NOT`,
+`DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`, `RETURNING` on `INSERT`/`UPDATE`/
+`DELETE`, table aliasing/self-joins, a `text()` escape hatch for dropping
+raw SQL into an otherwise builder-constructed query); first-class `Value`
+variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
+`chrono`'s `NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`, and
+`Vec<T>` arrays (native on Postgres, JSON-flattened on MySQL/MariaDB and
+SQLite); `#[derive(Mapped)]` with one primary key, one version column, one
+soft-delete column, custom column/table names, plus `#[derive(MappedEnum)]`
+and `#[derive(MappedNewtype)]` for mapping a Rust enum or newtype onto a
+column; a `Session` unit-of-work with an identity map, autoflush, bulk
+insert, `bulk_update`/`bulk_delete`, audit logging, optimistic locking,
+soft deletes, lifecycle hooks, `expire_on_commit` semantics, savepoints/
+nested transactions, two-phase commit, and a fluent `session.query::<T>()`
+API; `has_many`/`belongs_to`/`has_one`/`many_to_many` select-in eager
+loading with cascade delete/orphan rules; hand-written versioned
+migrations; schema introspection (columns/types/nullability/PK/foreign
+keys/indexes/unique constraints/check constraints/column defaults);
+logical backup/restore; read replicas; TLS; query timeouts; connection-pool
+observability. See `README.md` for the full tour with examples.
 
 ---
 
@@ -45,7 +59,6 @@ See `README.md` for the full tour with examples.
   `Column`s today; there's no expression-column type at all. Blocks
   anything but the simplest reporting queries. **L**
 - **`GROUP BY` / `HAVING`** — no aggregation grouping exists. **M**
-- **`DISTINCT`** — no way to dedupe a result set at the SQL level. **S**
 - **Subqueries** — no way to nest a `Select` inside another query's `FROM`,
   column list, or a filter (`IN (subquery)`, scalar subquery, correlated
   `EXISTS`). Currently the only composition is fetching once and filtering
@@ -58,65 +71,20 @@ See `README.md` for the full tour with examples.
 - **`CASE` expressions, `COALESCE`, arithmetic/string SQL functions**
   (`func.now()`-equivalent, `LOWER`/`UPPER`/`||`, date arithmetic) — `Expr`
   only has comparisons and boolean combinators, no function-call construct. **L**
-- **`BETWEEN` and `ILIKE`/regex-style operators** — smaller gap in the same
-  family as the aggregate-functions item; call out separately since it's a
-  much cheaper first step toward a richer `Expr`. **S**
-- **`RETURNING` on `UPDATE`/`DELETE`** — currently `Insert`-only (and only
-  where `Dialect::supports_returning()` is true); the same plumbing would
-  extend naturally. **S**
-- **Table aliasing / self-joins** — no `Table::alias(...)`-equivalent, so a
-  query can't join a table to itself or reference the same table twice.
-  Also blocks writing correlated subqueries once those exist. **M**
-- **A `text("...")` construct that composes with the builder** — raw SQL
-  exists (`Engine::connect()`/`Transaction::execute`), but only as an
-  all-or-nothing escape hatch; there's no way to drop a raw fragment into
-  an otherwise builder-constructed `Select`/`Expr`. **M**
-
-## Value / type system
-
-- **First-class temporal types** (`Date`/`Time`/`DateTime`/`Timestamp`,
-  ideally interoperating with `chrono`/`time`) — Postgres/MySQL currently
-  decode these via sqlx's typed decoders but flatten them into
-  `Value::Text`; round-tripping a `chrono::NaiveDateTime` through a mapped
-  struct isn't possible today. **L**
-- **UUID as a first-class `Value`** (currently also flattened to text). **M**
-- **JSON/JSONB as a first-class `Value`** (ideally backed by `serde_json`,
-  with query-side JSON path/containment operators eventually). **L**
-- **Decimal/Numeric as a first-class `Value`** (currently flattened to
-  text; `f64` would lose precision, so this needs its own variant, likely
-  backed by a decimal crate). **M**
-- **Array columns** (Postgres native arrays especially) — no representation
-  at all. **L**
-- **Per-field custom type conversion** (a `TypeDecorator`-equivalent hook
-  so application code can map, say, a newtype or enum onto a `Value`
-  without waiting on every type to become a built-in `Value` variant) —
-  this alone would take a lot of pressure off the four items above by
-  letting callers bridge the gap themselves in the meantime. **M**
-- **Enum columns** — map a Rust `enum` onto a text/int column (and, for
-  Postgres, potentially its native `ENUM` type) via the derive macro. **M**
 
 ## Schema / DDL / reflection
 
-- **Foreign key reflection** — `list_tables`/`table_schema` report columns/
-  types/nullability/PK only; no FK relationships are ever queried from the
-  catalog. Blocks any future "generate relationships from an existing
-  schema" tooling and makes `restore()` unable to reason about FK-safe
-  insert ordering. **M**
-- **Index reflection & creation** — absent both for introspection and for
-  any DDL-builder. **M**
-- **Unique constraint reflection & creation** — absent. **S**
-- **Check constraint reflection & creation** — absent. **S**
-- **Column default value reflection** — `ColumnInfo` has no `default`
-  field. **S**
 - **A DDL builder** (`CREATE TABLE`/`CREATE INDEX` construction from Rust,
   the way SQLAlchemy Core's `MetaData`/`Table`/`Column` double as DDL —
   today schema changes are entirely hand-written SQL strings inside a
   migration). **XL**
 - **Alembic-style autogenerate** — diff a mapped model's shape against the
   live database and generate the migration for you, instead of every
-  migration being fully hand-written. Depends on the DDL builder and much
-  richer reflection above; this is the single largest gap in the
-  migrations story. **XL**
+  migration being fully hand-written. Reflection is now rich enough
+  (columns/FKs/indexes/unique/check constraints/defaults) to diff against;
+  this still depends on the DDL builder above to emit the generated
+  migration itself — the single largest remaining gap in the migrations
+  story. **XL**
 
 ## Mapping / derive macro (`#[derive(Mapped)]`)
 
@@ -141,42 +109,12 @@ See `README.md` for the full tour with examples.
 
 ## Relationships / eager loading
 
-- **Many-to-many relationships** (join-table-aware, e.g. `#[many_to_many]`)
-  — only `has_many`/`belongs_to` exist today; a join table has to be
-  modeled and queried by hand. **L**
-- **One-to-one as a first-class relationship kind** (currently only
-  expressible as a `belongs_to` with an incidentally-unique FK — no
-  dedicated ergonomics or validation that it's actually 1:1). **S**
 - **Lazy loading** (an attribute that fetches on first access instead of
   always being eagerly select-in-loaded) — today every relationship is
   eager, which is safe but can over-fetch. **L**
 - **Additional eager-loading strategies** (`joined`/`subquery`, alongside
   the existing select-in) — mostly matters once subqueries/joins-in-`Select`
   exist to make a real choice between strategies meaningful. **M**
-- **Cascade rules** (deleting/soft-deleting a parent doesn't touch children
-  at all right now — no cascade delete, no orphan cleanup). **L**
-
-## Session / unit-of-work
-
-- **A fluent, session-bound query API** (`session.query::<T>().filter(...)`)
-  — today `load_all`/`load_active` take a raw `&dyn ToSql` you build
-  yourself via `Select::from(&T::table())`; there's no type-bound builder
-  that narrows to `T`'s own columns/filters for you. **M**
-- **`bulk_update`/`bulk_delete` through `Session`** (a `WHERE`-scoped
-  `UPDATE`/`DELETE` affecting many rows in one statement, the update/delete
-  counterpart to the existing `add_all` bulk insert) — every `update`/
-  `delete` today is still one `PendingWrite` per entity. **M**
-- **Session-level events/hooks** (`before_flush`/`after_commit`-equivalent)
-  — nothing observes a session's lifecycle today besides audit logging,
-  which is purpose-built rather than a general hook point. **M**
-- **`expire_on_commit`-style semantics** — identity-mapped objects never
-  expire/refresh on commit; stale in-memory state persists until eviction
-  or a fresh `Session`. **M**
-- **Savepoints / nested transactions** — `Session`/`Engine::begin()` only
-  offer one flat transaction; no way to roll back part of a unit of work
-  without aborting all of it. **M**
-- **Two-phase commit / distributed transactions** — absent; niche, but a
-  real SQLAlchemy Core capability. **L**
 
 ## Async & performance
 
@@ -210,8 +148,8 @@ See `README.md` for the full tour with examples.
   crate anywhere in the workspace yet. **M**
 - **Automap-style reverse engineering** (generate `#[derive(Mapped)]`
   structs from an existing database's schema, using the reflection this
-  crate already has) — a natural, self-contained follow-on to richer
-  reflection (FKs especially) above. **L**
+  crate already has) — a natural, self-contained follow-on now that FK
+  reflection is in place. **L**
 
 ---
 
