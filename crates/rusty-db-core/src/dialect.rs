@@ -40,13 +40,31 @@ impl Dialect for NumberedDialect {
     }
 }
 
-/// `?` style placeholders (SQLite, MySQL).
+/// `?` style placeholders (SQLite).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct QuestionMarkDialect;
 
 impl Dialect for QuestionMarkDialect {
     fn name(&self) -> &'static str {
         "sqlite"
+    }
+
+    fn placeholder(&self, _position: usize) -> String {
+        "?".to_string()
+    }
+}
+
+/// `?` style placeholders with backtick-quoted identifiers (MySQL/MariaDB).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MySqlDialect;
+
+impl Dialect for MySqlDialect {
+    fn name(&self) -> &'static str {
+        "mysql"
+    }
+
+    fn quote_ident(&self, ident: &str) -> String {
+        format!("`{}`", ident.replace('`', "``"))
     }
 
     fn placeholder(&self, _position: usize) -> String {
