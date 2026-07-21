@@ -46,6 +46,10 @@ pub enum Expr {
     In(Box<Expr>, Vec<Expr>),
     /// `expr BETWEEN low AND high` (inclusive of both bounds).
     Between(Box<Expr>, Box<Expr>, Box<Expr>),
+    /// A raw SQL fragment inserted verbatim, with `?`-style placeholders
+    /// rewritten to the target dialect's actual placeholder syntax in
+    /// bind-parameter order. See `text()`.
+    Raw(String, Vec<Value>),
 }
 
 impl Expr {
@@ -55,6 +59,34 @@ impl Expr {
 
     pub fn lit(value: impl Into<Value>) -> Self {
         Expr::Literal(value.into())
+    }
+
+    /// A raw SQL fragment that composes into the builder like any other
+    /// `Expr` — the escape hatch for things the builder doesn't model yet
+    /// (a database-specific function, a fragment too complex to build with
+    /// `Expr`, ...) without dropping to `Engine::connect()`/
+    /// `Transaction::execute` and losing composability with `Select`'s
+    /// other clauses (`.filter(...)`, join conditions, `.and`/`.or` with
+    /// ordinary `Expr`s, ...).
+    ///
+    /// Write `sql` in whichever dialect you're actually targeting — it's
+    /// inserted verbatim, so it isn't portable across backends unless you
+    /// keep it portable yourself. Bind parameters are written with `?`
+    /// placeholders regardless of the target dialect; each one is rewritten
+    /// to that dialect's real placeholder syntax (`$1`, `?`, ...) in the
+    /// order they appear, matched up with `params` in the same order — so
+    /// avoid a literal `?` character elsewhere in the fragment (e.g. inside
+    /// a quoted string), since this doesn't parse SQL, it just scans for
+    /// `?` characters.
+    ///
+    /// ```
+    /// # use rusty_db_core::{Expr, Select, Table, Value};
+    /// let users = Table::new("users");
+    /// let query = Select::from(&users)
+    ///     .filter(Expr::text("lower(name) = ?", [Value::Text("ada".to_string())]));
+    /// ```
+    pub fn text(sql: impl Into<String>, params: impl IntoIterator<Item = Value>) -> Self {
+        Expr::Raw(sql.into(), params.into_iter().collect())
     }
 
     pub fn and(self, other: Expr) -> Self {
@@ -145,6 +177,21 @@ impl Expr {
                     low.render(dialect, params),
                     high.render(dialect, params)
                 )
+            }
+            Expr::Raw(sql, values) => {
+                let mut rendered = String::with_capacity(sql.len());
+                let mut values = values.iter();
+                for ch in sql.chars() {
+                    if ch == '?' {
+                        if let Some(value) = values.next() {
+                            params.push(value.clone());
+                            rendered.push_str(&dialect.placeholder(params.len()));
+                            continue;
+                        }
+                    }
+                    rendered.push(ch);
+                }
+                rendered
             }
         }
     }

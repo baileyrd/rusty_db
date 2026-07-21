@@ -206,6 +206,48 @@ fn a_table_without_an_alias_renders_unchanged() {
 }
 
 #[test]
+fn text_rewrites_question_mark_placeholders_per_dialect_in_order() {
+    let users = Table::new("users");
+    let query = Select::from(&users).filter(
+        Expr::text(
+            "lower(name) = ? AND age > ?",
+            [Value::Text("ada".into()), Value::I64(18)],
+        )
+        .and(users.col("active").eq(true)),
+    );
+
+    let (sqlite_sql, sqlite_params) = query.clone().to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sqlite_sql,
+        r#"SELECT * FROM "users" WHERE (lower(name) = ? AND age > ?) AND ("users"."active" = ?)"#
+    );
+    assert_eq!(
+        sqlite_params,
+        vec![Value::Text("ada".into()), Value::I64(18), Value::Bool(true)]
+    );
+
+    let (pg_sql, pg_params) = query.to_sql(&NumberedDialect);
+    assert_eq!(
+        pg_sql,
+        r#"SELECT * FROM "users" WHERE (lower(name) = $1 AND age > $2) AND ("users"."active" = $3)"#
+    );
+    assert_eq!(
+        pg_params,
+        vec![Value::Text("ada".into()), Value::I64(18), Value::Bool(true)]
+    );
+}
+
+#[test]
+fn text_with_no_params_passes_through_unchanged() {
+    let users = Table::new("users");
+    let (sql, params) = Select::from(&users)
+        .filter(Expr::text("1 = 1", []))
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"SELECT * FROM "users" WHERE 1 = 1"#);
+    assert!(params.is_empty());
+}
+
+#[test]
 fn ilike_renders_as_ilike_on_postgres_and_falls_back_to_like_elsewhere() {
     let users = Table::new("users");
     let query = Select::from(&users).filter(users.col("name").ilike("%ada%"));
