@@ -1,10 +1,11 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Connection pool tuning knobs, passed to a driver's `connect_with`/
 /// `engine_with` constructor instead of the plain `connect`/`engine` (which
 /// use the underlying driver's defaults).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PoolConfig {
     /// Maximum number of connections the pool will open at once.
     pub max_connections: u32,
@@ -12,6 +13,16 @@ pub struct PoolConfig {
     /// connection) waits for a free one before giving up, once the pool is
     /// at `max_connections`. `None` uses the underlying driver's default.
     pub acquire_timeout: Option<Duration>,
+    /// SQL run once on every newly-opened physical connection, before it's
+    /// handed to anyone — e.g. `SET application_name = '...'`, `PRAGMA
+    /// foreign_keys = ON`. See `Self::with_on_connect`.
+    pub on_connect: Option<Arc<str>>,
+    /// SQL run every time an idle connection is about to be checked out
+    /// (handed to a caller). See `Self::with_before_acquire`.
+    pub before_acquire: Option<Arc<str>>,
+    /// SQL run every time a connection is checked back in (about to go
+    /// idle in the pool). See `Self::with_after_release`.
+    pub after_release: Option<Arc<str>>,
 }
 
 impl PoolConfig {
@@ -20,11 +31,38 @@ impl PoolConfig {
         PoolConfig {
             max_connections,
             acquire_timeout: None,
+            on_connect: None,
+            before_acquire: None,
+            after_release: None,
         }
     }
 
     pub fn with_acquire_timeout(mut self, timeout: Duration) -> Self {
         self.acquire_timeout = Some(timeout);
+        self
+    }
+
+    /// Run `sql` once on every newly-opened physical connection, before
+    /// it's ever handed to a caller — the natural place for per-connection
+    /// session setup (`SET application_name = '...'`, `PRAGMA foreign_keys
+    /// = ON`) that would otherwise need repeating on every checkout.
+    pub fn with_on_connect(mut self, sql: impl Into<String>) -> Self {
+        self.on_connect = Some(Arc::from(sql.into()));
+        self
+    }
+
+    /// Run `sql` every time a connection is about to be checked out to a
+    /// caller (an idle connection becoming in-use again).
+    pub fn with_before_acquire(mut self, sql: impl Into<String>) -> Self {
+        self.before_acquire = Some(Arc::from(sql.into()));
+        self
+    }
+
+    /// Run `sql` every time a connection is checked back in (about to
+    /// return to idle) — e.g. to reset session-local state a caller may
+    /// have changed before the connection is reused by someone else.
+    pub fn with_after_release(mut self, sql: impl Into<String>) -> Self {
+        self.after_release = Some(Arc::from(sql.into()));
         self
     }
 }
