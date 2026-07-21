@@ -663,6 +663,95 @@ fn not_wrapping_exists_renders_not_exists_semantics() {
 }
 
 #[test]
+fn with_prefixes_a_named_cte_and_it_can_be_queried_by_name() {
+    let orders = Table::new("orders");
+    let big_orders = Cte::new(
+        "big_orders",
+        Select::from(&orders)
+            .columns([orders.col("id")])
+            .filter(orders.col("amount").gt(100_i64)),
+    );
+
+    let cte_ref = Table::new("big_orders");
+    let (sql, params) = Select::from(&cte_ref)
+        .with([big_orders])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"WITH "big_orders" AS (SELECT "orders"."id" FROM "orders" WHERE "orders"."amount" > ?) SELECT * FROM "big_orders""#
+    );
+    assert_eq!(params, vec![Value::I64(100)]);
+}
+
+#[test]
+fn with_recursive_renders_the_recursive_keyword_and_the_anchor_union_recursive_term() {
+    let employees = Table::new("employees");
+    let org_chart = Table::new("org_chart");
+
+    let anchor = Select::from(&employees)
+        .columns([employees.col("id")])
+        .filter(employees.col("manager_id").is_null());
+    let recursive_term = Select::from(&employees)
+        .columns([employees.col("id")])
+        .join(
+            &org_chart,
+            employees.col("manager_id").eq_col(&org_chart.col("id")),
+        );
+    let cte = Cte::recursive_union_all("org_chart", anchor, recursive_term);
+
+    let (sql, _) = Select::from(&org_chart)
+        .with_recursive([cte])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"WITH RECURSIVE "org_chart" AS (SELECT "employees"."id" FROM "employees" WHERE "employees"."manager_id" IS NULL UNION ALL SELECT "employees"."id" FROM "employees" INNER JOIN "org_chart" ON "employees"."manager_id" = "org_chart"."id") SELECT * FROM "org_chart""#
+    );
+}
+
+#[test]
+fn recursive_union_without_all_dedupes_via_plain_union() {
+    let employees = Table::new("employees");
+    let org_chart = Table::new("org_chart");
+
+    let anchor = Select::from(&employees).filter(employees.col("manager_id").is_null());
+    let recursive_term = Select::from(&employees).join(
+        &org_chart,
+        employees.col("manager_id").eq_col(&org_chart.col("id")),
+    );
+    let cte = Cte::recursive_union("org_chart", anchor, recursive_term);
+
+    let (sql, _) = Select::from(&org_chart)
+        .with_recursive([cte])
+        .to_sql(&QuestionMarkDialect);
+    assert!(
+        sql.contains(" UNION SELECT "),
+        "expected plain UNION, not UNION ALL: {sql}"
+    );
+}
+
+#[test]
+fn with_clause_and_outer_query_bind_params_are_numbered_sequentially_on_postgres() {
+    let orders = Table::new("orders");
+    let big_orders = Cte::new(
+        "big_orders",
+        Select::from(&orders)
+            .columns([orders.col("id")])
+            .filter(orders.col("amount").gt(100_i64)),
+    );
+
+    let cte_ref = Table::new("big_orders");
+    let (sql, params) = Select::from(&cte_ref)
+        .with([big_orders])
+        .filter(cte_ref.col("id").lt(1000_i64))
+        .to_sql(&NumberedDialect);
+    assert_eq!(
+        sql,
+        r#"WITH "big_orders" AS (SELECT "orders"."id" FROM "orders" WHERE "orders"."amount" > $1) SELECT * FROM "big_orders" WHERE "big_orders"."id" < $2"#
+    );
+    assert_eq!(params, vec![Value::I64(100), Value::I64(1000)]);
+}
+
+#[test]
 fn scalar_subquery_renders_as_a_parenthesized_select_and_can_be_aliased() {
     let orders = Table::new("orders");
     let users = Table::new("users");

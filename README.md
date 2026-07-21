@@ -376,6 +376,50 @@ let query = Select::from(&users).columns([
 
 A subquery is correlated simply by referencing the outer table's columns in its own `.filter(...)` (`orders.col("user_id").eq_col(&users.col("id"))` above) — no special API for it, since `Column` already qualifies itself by table name regardless of which `Select` it's built into, so both tables just show up in the rendered SQL the way a hand-written correlated subquery would. `NOT IN`/`NOT EXISTS` aren't separate variants; wrap either with `.not()` (`Expr::exists(has_orders).not()`). Bind parameters from the outer query and the nested one share a single, correctly-ordered parameter list, so Postgres's `$1, $2, ...` numbering stays correct across both. Not modeled: a subquery in a `FROM` clause (a derived table) — only nesting inside a filter or column list is supported.
 
+### Common table expressions (`WITH`, `WITH RECURSIVE`)
+
+`Cte::new(name, query)` names a `Select` as a CTE; `Select::with(...)` prefixes an outer query with one or more of them, referenceable in that outer query's own `FROM`/`JOIN`/subqueries by name (an ordinary `Table::new(name)` reaches it):
+
+```rust
+let orders = Table::new("orders");
+let big_orders = Cte::new(
+    "big_orders",
+    Select::from(&orders)
+        .columns([orders.col("id"), orders.col("customer")])
+        .filter(orders.col("amount").gt(1000_i64)),
+);
+
+let cte_ref = Table::new("big_orders");
+let query = Select::from(&cte_ref).with([big_orders]);
+```
+
+A recursive CTE combines an anchor `Select` with a recursive term via `Cte::recursive_union_all`/`recursive_union` (the latter deduplicating like plain `UNION` does), attached with `Select::with_recursive(...)` instead of `.with(...)` (`WITH RECURSIVE` is a different keyword). The recursive term recurses by referencing the CTE's own name in its `FROM`/`JOIN` — again just an ordinary `Table::new(name)`, no special self-reference API:
+
+```rust
+let employees = Table::new("employees");
+let org_chart = Table::new("org_chart");
+
+let anchor = Select::from(&employees)
+    .columns([
+        SelectExpr::from(employees.col("id")),
+        SelectExpr::from(employees.col("name")),
+        SelectExpr::from(Expr::lit(1_i64)).alias("depth"),
+    ])
+    .filter(employees.col("manager_id").is_null());
+let recursive_term = Select::from(&employees)
+    .columns([
+        SelectExpr::from(employees.col("id")),
+        SelectExpr::from(employees.col("name")),
+        SelectExpr::from(org_chart.col("depth").add(Expr::lit(1_i64))).alias("depth"),
+    ])
+    .join(&org_chart, employees.col("manager_id").eq_col(&org_chart.col("id")));
+let cte = Cte::recursive_union_all("org_chart", anchor, recursive_term);
+
+let query = Select::from(&org_chart).with_recursive([cte]);
+```
+
+`WITH`/`WITH RECURSIVE` are both ANSI-standard and render identically on every backend this crate supports. As with subqueries, the CTE's own bind parameters and the outer query's share one correctly-ordered parameter list. Not modeled: a `WITH` clause attached to a `SetOperation` rather than a single `Select` (though a CTE-carrying `Select` can still be one arm of a `UNION`/etc., since `WITH`'s scope naturally extends over the whole statement that follows it — nothing special needed there), and multiple independent recursive CTEs referencing each other in the same `WITH` clause.
+
 ### Struct-to-table mapping (`#[derive(Mapped)]`)
 
 Enable the `derive` feature to map a struct onto a table:
@@ -996,7 +1040,7 @@ Unlike `Migrator::up`, which commits each migration independently, `session.migr
 
 ## Status
 
-This covers Core (query builder — including aggregate functions/expression columns via `SelectExpr`, `GROUP BY`/`HAVING`, set operations (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) via `SetOperation`, SQL functions/arithmetic/`CASE`/`COALESCE`, and subqueries (`IN (subquery)`, correlated `EXISTS`, scalar subqueries) — connections, first-class `Uuid`/`BigDecimal`/`Json`/temporal (`NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`)/array (`Vec<T>`) value types), a thin mapping layer (`#[derive(Mapped)]`, `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]` for custom field types, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder — including aggregate functions/expression columns via `SelectExpr`, `GROUP BY`/`HAVING`, set operations (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) via `SetOperation`, SQL functions/arithmetic/`CASE`/`COALESCE`, subqueries (`IN (subquery)`, correlated `EXISTS`, scalar subqueries), and CTEs (`WITH`/`WITH RECURSIVE` via `Cte`) — connections, first-class `Uuid`/`BigDecimal`/`Json`/temporal (`NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`)/array (`Vec<T>`) value types), a thin mapping layer (`#[derive(Mapped)]`, `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]` for custom field types, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 `tests/concurrent_sessions.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover multiple `Session`s sharing one `Engine`/connection pool at the same time — `Session` is intentionally `!Send` (it hands out `Rc`s for the identity map), so these run via `tokio::task::LocalSet`/`spawn_local` rather than `tokio::spawn`, which is the standard way to get genuinely concurrent, interleaved execution of `!Send` futures on one thread. They cover independent commits landing correctly under a burst of concurrent sessions, one session's flushed-but-uncommitted write staying invisible to a concurrent reader on a separate connection (deterministically ordered via a `oneshot` channel, not timing), and two sessions never sharing identity-map state for the same row. Same skip-if-unreachable behavior as the Postgres/MySQL smoke tests; each test uses its own table to avoid colliding with other tests running concurrently against the same live server.
 
@@ -1057,6 +1101,8 @@ Index reflection (`schema.indexes`) rounds out the same test files: a `UNIQUE`-b
 The same file also covers `Column::lower`/`upper`/`concat`/`add`/`sub`/`mul`/`div`, `Expr::now`/`coalesce`, `Case`, and `.eq_expr`/`.lt_expr`/etc.: `LOWER`/`UPPER`/concatenation/arithmetic execute and decode correctly (a computed `customer` name lowercased, uppercased, and concatenated with a literal; an `amount` doubled); `Case`/`Expr::coalesce` correctly tier customers by amount and fall back from a `NULL` nickname to a name; and `Expr::now()` composes with `.lt_expr(...)` to filter directly, not just render, since `Column`'s own literal-only comparisons can't take an arbitrary `Expr` like `Expr::now()` at all. `tests/query_builder_extras_mysql.rs` gets its own live-server test for the one thing here that's actually MySQL-specific: `.concat(...)` renders `CONCAT(a, b)` on that backend and actually returns the concatenated string against a real server, rather than the `0` a naive `a || b` would silently produce there instead (MySQL/MariaDB's `||` means logical `OR` under the default `sql_mode`, confirmed empirically against this exact server).
 
 `query_builder_extras.rs` also covers subqueries against a real (customers-and-orders) schema: `.in_subquery(...)` filters rows against a `GROUP BY`/`HAVING`-shaped nested `Select` (only the customer whose grouped total actually clears the threshold matches); `Expr::exists(...)` and `.not()` wrapping it correctly split customers into "has at least one order" and "has none at all", including a customer with zero orders that an `INNER JOIN` would have silently dropped instead; and `Expr::subquery(...)` computes a real per-row aggregate (each customer's order total) and decodes as `None` — not `0` — for the customer with no matching orders, since `SUM` over zero rows is `NULL` in SQL. `query_builder_extras_postgres.rs` adds the one thing with real per-dialect risk here too: an outer filter and a nested subquery's own filter binding through the same, correctly-ordered `$1, $2, ...` parameter list rather than each restarting its own count. The pure rendering side — `IN (subquery)`, `EXISTS`, `NOT` wrapping `EXISTS`, a scalar subquery composing into a `SELECT` column with its own alias, and (again) Postgres parameter numbering across an outer query and its nested subquery — is unit-tested directly in `crates/rusty-db-core/src/query/tests.rs`.
+
+`query_builder_extras.rs` also covers CTEs: `.with(...)` filters real rows through a named CTE (only orders clearing the CTE's own `amount > 40` filter come back); and `.with_recursive(...)` walks a genuine three-level management hierarchy (an `employees` table seeded with a root and two levels of reports) via `Cte::recursive_union_all`, computing each person's depth by having the recursive term add one to the CTE's own `depth` column on every step, and returning exactly the right person/depth pairs in order. `query_builder_extras_postgres.rs` adds the matching per-dialect-risk case: a CTE's own filter and the outer query's filter binding through the same, correctly-ordered `$1, $2, ...` parameter list. The pure rendering side — plain `WITH` prefixing a query that then selects from the CTE by name, `WITH RECURSIVE` rendering the anchor `UNION ALL`/`UNION` the recursive term, and (again) Postgres parameter numbering across a CTE and the outer query — is unit-tested directly in `crates/rusty-db-core/src/query/tests.rs`.
 
 `tests/bulk_update_delete.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two round-trip tests, since the identity-map-bypass/audit-log/rollback behavior is `Session`-level logic that doesn't depend on which driver is underneath) cover `Session::bulk_update`/`bulk_delete`: a filter-scoped update/delete changes/removes every matching row in one statement (`pending_len()` stays `1` regardless of how many rows match); an already-cached identity-mapped instance stays exactly as it was in memory after a `bulk_update` touches its row (the database itself is genuinely updated, confirmed by re-fetching through a fresh `Session`); `bulk_delete` is always a real, hard `DELETE` even against a `#[table(soft_delete)]` type, bypassing the soft-delete column entirely; both are recorded the same way ordinary `add`/`update`/`delete` writes are when audit logging is enabled; and a failing write queued in the same batch (a duplicate primary key) rolls the bulk write back too, since they share one all-or-nothing transaction.
 

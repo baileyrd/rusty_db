@@ -1,3 +1,4 @@
+use super::cte::Cte;
 use super::expr::{Case, Expr};
 use super::join::{Join, JoinKind};
 use super::set_op::{SetOp, SetOperation};
@@ -81,6 +82,8 @@ pub struct Select {
     order_by: Vec<(Column, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
+    ctes: Vec<Cte>,
+    with_recursive: bool,
 }
 
 impl Select {
@@ -97,7 +100,28 @@ impl Select {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            ctes: Vec::new(),
+            with_recursive: false,
         }
+    }
+
+    /// Prefixes this query with `WITH cte1 AS (...), cte2 AS (...)`,
+    /// referenceable in this query's own `FROM`/`JOIN`/subqueries by the
+    /// name each `Cte` was given — an ordinary `Table::new(name)` reaches
+    /// it. See `Cte::new`.
+    pub fn with(mut self, ctes: impl IntoIterator<Item = Cte>) -> Self {
+        self.ctes = ctes.into_iter().collect();
+        self.with_recursive = false;
+        self
+    }
+
+    /// Like `.with(...)`, but renders `WITH RECURSIVE` instead of plain
+    /// `WITH` — required when (any of) the attached `Cte`s were built with
+    /// `Cte::recursive_union`/`recursive_union_all`. See `Cte::recursive_union_all`.
+    pub fn with_recursive(mut self, ctes: impl IntoIterator<Item = Cte>) -> Self {
+        self.ctes = ctes.into_iter().collect();
+        self.with_recursive = true;
+        self
     }
 
     /// Accepts plain `Column`s (`SELECT` as before) or `SelectExpr`s (for
@@ -221,6 +245,22 @@ impl Select {
     /// across all of them (Postgres's `$1, $2, ...` would otherwise
     /// restart from `$1` in every arm, colliding instead of continuing).
     pub(crate) fn render_into(&self, dialect: &dyn Dialect, params: &mut Vec<Value>) -> String {
+        let mut with_prefix = String::new();
+        if !self.ctes.is_empty() {
+            with_prefix.push_str("WITH ");
+            if self.with_recursive {
+                with_prefix.push_str("RECURSIVE ");
+            }
+            let ctes_sql = self
+                .ctes
+                .iter()
+                .map(|cte| cte.render_into(dialect, params))
+                .collect::<Vec<_>>()
+                .join(", ");
+            with_prefix.push_str(&ctes_sql);
+            with_prefix.push(' ');
+        }
+
         let columns_sql = if self.columns.is_empty() {
             "*".to_string()
         } else {
@@ -233,7 +273,7 @@ impl Select {
 
         let distinct_sql = if self.distinct { "DISTINCT " } else { "" };
         let mut sql = format!(
-            "SELECT {distinct_sql}{columns_sql} FROM {}",
+            "{with_prefix}SELECT {distinct_sql}{columns_sql} FROM {}",
             self.table.as_clause_sql(dialect)
         );
 

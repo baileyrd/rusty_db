@@ -50,8 +50,8 @@ pub use rusty_db_mysql as mysql;
 pub mod prelude {
     pub use rusty_db_core::{
         with_timeout, AuditEntry, AuditOperation, BigDecimal, BulkInsert, Case, Column, ColumnInfo,
-        DatabaseDump, DateTime, Delete, Engine, Entity, Expr, FromRow, Identifiable, Insert, Join,
-        JoinKind, Json, Mapped, Migration, Migrator, NaiveDate, NaiveDateTime, NaiveTime,
+        Cte, DatabaseDump, DateTime, Delete, Engine, Entity, Expr, FromRow, Identifiable, Insert,
+        Join, JoinKind, Json, Mapped, Migration, Migrator, NaiveDate, NaiveDateTime, NaiveTime,
         PoolConfig, PoolStats, ReplicaSet, Row, Savepoint, Select, SelectExpr, Session,
         SessionQuery, SetOperation, Table, TableDump, TableSchema, ToSql, Transaction, Update, Utc,
         Uuid, Value,
