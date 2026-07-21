@@ -2,10 +2,11 @@
 
 //! Exercises the newer query-builder additions against a real (if
 //! in-memory) SQL engine, not just checking rendered SQL strings:
-//! `Select::distinct`, `Column::between`, and `Column::ilike`'s portable
-//! fallback to plain `LIKE` on backends without a native `ILIKE` keyword.
-//! `RETURNING` on `UPDATE`/`DELETE` has no SQLite coverage here since
-//! SQLite's dialect doesn't support it (see `query_builder_extras_postgres.rs`).
+//! `Select::distinct`, `Column::between`, `Column::ilike`'s portable
+//! fallback to plain `LIKE` on backends without a native `ILIKE` keyword,
+//! and `Table::alias` for self-joins. `RETURNING` on `UPDATE`/`DELETE` has
+//! no SQLite coverage here since SQLite's dialect doesn't support it (see
+//! `query_builder_extras_postgres.rs`).
 
 use rusty_db::prelude::*;
 
@@ -112,6 +113,58 @@ async fn ilike_matches_case_insensitively_via_its_portable_fallback() -> rusty_d
         vec![1, 2],
         "both \"Ada\" and \"ada\" should match a case-insensitive search"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_alias_supports_a_real_self_join() -> rusty_db::Result<()> {
+    let engine = SqliteDriver::engine("sqlite::memory:").await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, manager_id INTEGER)",
+            &[],
+        )
+        .await?;
+
+    let employees = Table::new("employees");
+    for (id, name, manager_id) in [
+        (1_i64, "ada", None::<i64>),
+        (2, "grace", Some(1)),
+        (3, "linus", Some(1)),
+    ] {
+        engine
+            .execute(
+                &Insert::into_table(&employees)
+                    .value("id", id)
+                    .value("name", name)
+                    .value("manager_id", manager_id),
+            )
+            .await?;
+    }
+
+    // Self-join: each employee alongside their manager's name, via a
+    // second, aliased reference to the same underlying table.
+    let managers = employees.alias("managers");
+    let rows = engine
+        .fetch_all(
+            &Select::from(&employees)
+                .columns([employees.col("name"), managers.col("name")])
+                .join(
+                    &managers,
+                    employees.col("manager_id").eq_col(&managers.col("id")),
+                )
+                .order_by(employees.col("id").asc()),
+        )
+        .await?;
+
+    assert_eq!(rows.len(), 2, "only the two employees with a manager join");
+    assert_eq!(rows[0].get::<String>(0)?, "grace");
+    assert_eq!(rows[0].get::<String>(1)?, "ada");
+    assert_eq!(rows[1].get::<String>(0)?, "linus");
+    assert_eq!(rows[1].get::<String>(1)?, "ada");
 
     Ok(())
 }

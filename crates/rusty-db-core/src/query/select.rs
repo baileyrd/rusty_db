@@ -113,14 +113,14 @@ impl ToSql for Select {
         let distinct_sql = if self.distinct { "DISTINCT " } else { "" };
         let mut sql = format!(
             "SELECT {distinct_sql}{columns_sql} FROM {}",
-            dialect.quote_ident(self.table.name())
+            self.table.as_clause_sql(dialect)
         );
 
         for join in &self.joins {
             sql.push(' ');
             sql.push_str(join.kind.as_sql());
             sql.push(' ');
-            sql.push_str(&dialect.quote_ident(join.table.name()));
+            sql.push_str(&join.table.as_clause_sql(dialect));
             sql.push_str(" ON ");
             sql.push_str(&join.on.render(dialect, &mut params));
         }

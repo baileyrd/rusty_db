@@ -167,6 +167,19 @@ let query = Select::from(&orders)
     .filter(users.col("active").eq(true));
 ```
 
+`Table::alias(...)` gives a second, independent reference to the same underlying table — for a self-join, or anywhere the same table needs to appear more than once in one query. `.col(...)` on the alias qualifies with the alias, not the original table name, and `Select`/`join` render `<table> AS <alias>` for it:
+
+```rust
+let employees = Table::new("employees");
+let managers = employees.alias("managers");
+
+let query = Select::from(&employees)
+    .columns([employees.col("name"), managers.col("name")])
+    .join(&managers, employees.col("manager_id").eq_col(&managers.col("id")));
+// SELECT "employees"."name", "managers"."name" FROM "employees"
+// INNER JOIN "employees" AS "managers" ON "employees"."manager_id" = "managers"."id"
+```
+
 ### DISTINCT, BETWEEN, ILIKE, and RETURNING on UPDATE/DELETE
 
 `Select::distinct()` adds `SELECT DISTINCT`; `Column::between(low, high)` builds an inclusive `BETWEEN ... AND ...`; `Column::ilike(pattern)` is a case-insensitive `LIKE` (Postgres's native `ILIKE` keyword — everywhere else it falls back to plain `LIKE`, which is already case-insensitive under SQLite's and MySQL/MariaDB's typical default collations, though not guaranteed if a case-sensitive one is configured); and `.returning(...)` — previously `Insert`-only — is now also available on `Update`/`Delete`, gated the same way (only honored where `Dialect::supports_returning()` is true, currently just Postgres):
@@ -459,7 +472,7 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 
 `tests/pool_stats.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests proving `pool_stats()` against a real network-backed pool, since the pure counting behavior doesn't need re-proving per driver) cover `Engine::pool_stats()`: checking out a connection is reflected immediately (`in_use` up, `total_acquires` up), and releasing it moves it back to `idle` without touching `total_acquires`; the counter keeps accumulating across repeated checkouts rather than just tracking the current one; and `waiters` goes to `1` while a second acquire is genuinely blocked behind a pool of size one, then back to `0` once it unblocks. Discovering the exact numbers to assert here surfaced two things worth knowing about sqlx's own pool: it eagerly opens (and keeps, idle) one connection up front to validate the URL when the pool is first constructed, so a "fresh" pool already reports that one as active/idle even though `total_acquires` correctly stays `0` (that startup connection never went through `Driver::connect`); and releasing a connection back to the pool isn't synchronous inside `drop` — the tests give it a brief moment (`tokio::time::sleep`) before reading the snapshot back, the same pattern already used elsewhere in this suite for other not-quite-synchronous async cleanup. `waiters`/`total_acquires` are the two numbers sqlx doesn't expose on its own, so each driver keeps a small `PoolMetrics` (a couple of atomics behind an `Arc`) alongside its pool for just those two; every other `PoolStats` field is a zero-cost read of the pool itself.
 
-`tests/query_builder_extras.rs` (SQLite) and its `_postgres` counterpart (a reduced version there — just the two things that are actually Postgres-specific, `ILIKE` and `RETURNING` on `UPDATE`/`DELETE`; `DISTINCT`/`BETWEEN` have no dialect-specific behavior and don't need re-proving against a live server) cover the newer query-builder additions against a real SQL engine rather than just checking rendered SQL strings: `Select::distinct()` actually dedupes matching rows; `Column::between` includes both boundaries inclusively; `Column::ilike` matches case-insensitively via its portable `LIKE` fallback on SQLite and via Postgres's native `ILIKE` keyword; and `.returning(...)` on `Update`/`Delete` actually returns the requested columns from a real Postgres server (and is silently ignored on SQLite, whose dialect doesn't support `RETURNING` at all). The pure rendering side of all four — including that `RETURNING` is dialect-gated and `ilike_operator()` picks the right keyword per dialect — is unit-tested directly in `crates/rusty-db-core/src/query/tests.rs`, alongside the rest of the query builder's SQL generation.
+`tests/query_builder_extras.rs` (SQLite) and its `_postgres` counterpart (a reduced version there — just the two things that are actually Postgres-specific, `ILIKE` and `RETURNING` on `UPDATE`/`DELETE`; `DISTINCT`/`BETWEEN`/`Table::alias` have no dialect-specific behavior and don't need re-proving against a live server) cover the newer query-builder additions against a real SQL engine rather than just checking rendered SQL strings: `Select::distinct()` actually dedupes matching rows; `Column::between` includes both boundaries inclusively; `Column::ilike` matches case-insensitively via its portable `LIKE` fallback on SQLite and via Postgres's native `ILIKE` keyword; `.returning(...)` on `Update`/`Delete` actually returns the requested columns from a real Postgres server (and is silently ignored on SQLite, whose dialect doesn't support `RETURNING` at all); and `Table::alias` supports a genuine self-join (an `employees` table joined to itself to pair each employee with their manager's name). The pure rendering side of all of these — including that `RETURNING` is dialect-gated, `ilike_operator()` picks the right keyword per dialect, and an alias renders `<table> AS <alias>` while an unaliased `Table` is unchanged — is unit-tested directly in `crates/rusty-db-core/src/query/tests.rs`, alongside the rest of the query builder's SQL generation.
 
 ## Running tests
 
