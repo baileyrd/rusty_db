@@ -8,8 +8,9 @@
 //! composed into the builder, aggregate functions/expression columns via
 //! `SelectExpr`, `Select::group_by`/`.having`, `Select::union`/
 //! `union_all`/`intersect`/`except`, `Column::lower`/`upper`/`concat`/
-//! `add`/`sub`/`mul`/`div`, `Expr::now`/`coalesce`, `Case`, and
-//! subqueries (`Column::in_subquery`, `Expr::exists`, `Expr::subquery`).
+//! `add`/`sub`/`mul`/`div`, `Expr::now`/`coalesce`, `Case`, subqueries
+//! (`Column::in_subquery`, `Expr::exists`, `Expr::subquery`), and CTEs
+//! (`Select::with`/`.with_recursive` via `Cte`).
 //! `RETURNING` on `UPDATE`/`DELETE` has no SQLite coverage here since
 //! SQLite's dialect doesn't support it (see
 //! `query_builder_extras_postgres.rs`); `Column::concat`'s `CONCAT(...)`
@@ -645,6 +646,118 @@ async fn scalar_subquery_computes_a_per_row_aggregate_and_decodes_null_for_no_ma
         rows[2].get_by_name::<Option<i64>>("total")?,
         None,
         "SUM over zero matching orders is NULL, not 0"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn with_filters_rows_through_a_named_cte() -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    // amounts: Ada/10, ada/50, Grace/50, Grace/200 -- only amount > 40 clears the CTE's filter.
+    let big_orders = Cte::new(
+        "big_orders",
+        Select::from(&orders)
+            .columns([orders.col("id"), orders.col("customer")])
+            .filter(orders.col("amount").gt(40_i64)),
+    );
+
+    let cte_ref = Table::new("big_orders");
+    let rows = engine
+        .fetch_all(
+            &Select::from(&cte_ref)
+                .with([big_orders])
+                .order_by(cte_ref.col("id").asc()),
+        )
+        .await?;
+    assert_eq!(
+        rows.iter()
+            .map(|r| r.get_by_name::<String>("customer"))
+            .collect::<Result<Vec<_>, _>>()?,
+        vec!["ada", "Grace", "Grace"],
+        "Ada's amount=10 order doesn't clear the CTE's own amount > 40 filter"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn with_recursive_walks_a_management_hierarchy() -> rusty_db::Result<()> {
+    let engine = SqliteDriver::engine("sqlite::memory:").await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT NOT NULL, manager_id INTEGER)",
+            &[],
+        )
+        .await?;
+
+    let employees = Table::new("employees");
+    // ada is the root; grace and linus report to ada; zoe reports to grace.
+    for (id, name, manager_id) in [
+        (1_i64, "ada", None::<i64>),
+        (2, "grace", Some(1)),
+        (3, "linus", Some(1)),
+        (4, "zoe", Some(2)),
+    ] {
+        engine
+            .execute(
+                &Insert::into_table(&employees)
+                    .value("id", id)
+                    .value("name", name)
+                    .value("manager_id", manager_id),
+            )
+            .await?;
+    }
+
+    let org_chart = Table::new("org_chart");
+    let anchor = Select::from(&employees)
+        .columns([
+            SelectExpr::from(employees.col("id")),
+            SelectExpr::from(employees.col("name")),
+            SelectExpr::from(Expr::lit(1_i64)).alias("depth"),
+        ])
+        .filter(employees.col("manager_id").is_null());
+    let recursive_term = Select::from(&employees)
+        .columns([
+            SelectExpr::from(employees.col("id")),
+            SelectExpr::from(employees.col("name")),
+            SelectExpr::from(org_chart.col("depth").add(Expr::lit(1_i64))).alias("depth"),
+        ])
+        .join(
+            &org_chart,
+            employees.col("manager_id").eq_col(&org_chart.col("id")),
+        );
+    let cte = Cte::recursive_union_all("org_chart", anchor, recursive_term);
+
+    let rows = engine
+        .fetch_all(
+            &Select::from(&org_chart)
+                .with_recursive([cte])
+                .order_by(org_chart.col("depth").asc())
+                .order_by(org_chart.col("name").asc()),
+        )
+        .await?;
+    let names_and_depths: Vec<(String, i64)> = rows
+        .iter()
+        .map(|r| {
+            Ok((
+                r.get_by_name::<String>("name")?,
+                r.get_by_name::<i64>("depth")?,
+            ))
+        })
+        .collect::<rusty_db::Result<_>>()?;
+    assert_eq!(
+        names_and_depths,
+        vec![
+            ("ada".to_string(), 1),
+            ("grace".to_string(), 2),
+            ("linus".to_string(), 2),
+            ("zoe".to_string(), 3),
+        ]
     );
 
     Ok(())

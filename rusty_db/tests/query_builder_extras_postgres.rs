@@ -5,12 +5,13 @@
 //! `ILIKE` as a native keyword (vs. SQLite's fallback to plain `LIKE`),
 //! `RETURNING` on `UPDATE`/`DELETE` (SQLite's dialect doesn't support
 //! `RETURNING` at all, so there's nothing to prove there), and a
-//! `SetOperation`'s (and a subquery's) bind parameters actually landing
-//! correctly with Postgres's numbered `$1, $2, ...` placeholders
-//! (SQLite/MySQL's `?` placeholders don't encode a position at all, so
-//! this is the one part of set operations/subqueries with any real
-//! per-dialect risk). `DISTINCT`/`BETWEEN` have no dialect-specific
-//! behavior and are already covered against a real SQL engine there.
+//! `SetOperation`'s (a subquery's, and a `WITH` clause's) bind parameters
+//! actually landing correctly with Postgres's numbered `$1, $2, ...`
+//! placeholders (SQLite/MySQL's `?` placeholders don't encode a position
+//! at all, so this is the one part of set operations/subqueries/CTEs with
+//! any real per-dialect risk). `DISTINCT`/`BETWEEN` have no
+//! dialect-specific behavior and are already covered against a real SQL
+//! engine there.
 
 use rusty_db::prelude::*;
 
@@ -269,6 +270,75 @@ async fn in_subquery_bind_parameters_are_numbered_correctly_across_the_outer_and
         .connect()
         .await?
         .execute("DROP TABLE query_extras_pg_subquery", &[])
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn with_bind_parameters_are_numbered_correctly_across_the_cte_and_the_outer_query(
+) -> rusty_db::Result<()> {
+    let Some(engine) = test_engine().await else {
+        return Ok(());
+    };
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE IF EXISTS query_extras_pg_cte", &[])
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE query_extras_pg_cte (id BIGINT PRIMARY KEY, amount BIGINT NOT NULL)",
+            &[],
+        )
+        .await?;
+
+    let orders = Table::new("query_extras_pg_cte");
+    for (id, amount) in [(1_i64, 10_i64), (2, 60), (3, 200)] {
+        engine
+            .execute(
+                &Insert::into_table(&orders)
+                    .value("id", id)
+                    .value("amount", amount),
+            )
+            .await?;
+    }
+
+    // The CTE's own filter binds one placeholder ($1) before the outer
+    // query's filter binds a second ($2) -- if `WITH` instead rendered the
+    // CTE body against a fresh, independent parameter list, Postgres would
+    // see two `$1`s and either reject the statement outright or bind the
+    // wrong value into one of them.
+    let big_orders = Cte::new(
+        "query_extras_pg_cte_big",
+        Select::from(&orders)
+            .columns([orders.col("id")])
+            .filter(orders.col("amount").gt(50_i64)),
+    );
+    let cte_ref = Table::new("query_extras_pg_cte_big");
+    let rows = engine
+        .fetch_all(
+            &Select::from(&cte_ref)
+                .with([big_orders])
+                .filter(cte_ref.col("id").lt(3_i64)),
+        )
+        .await?;
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .map(|r| r.get::<i64>(0))
+        .collect::<rusty_db::Result<_>>()?;
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![2],
+        "only id=2 clears both the CTE's amount > 50 filter and the outer id < 3 filter"
+    );
+
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE query_extras_pg_cte", &[])
         .await?;
     Ok(())
 }
