@@ -6,9 +6,10 @@
 //! fallback to plain `LIKE` on backends without a native `ILIKE` keyword,
 //! `Table::alias` for self-joins, `Expr::text` for raw SQL fragments
 //! composed into the builder, aggregate functions/expression columns via
-//! `SelectExpr`, and `Select::group_by`/`.having`. `RETURNING` on
-//! `UPDATE`/`DELETE` has no SQLite coverage here since SQLite's dialect
-//! doesn't support it (see `query_builder_extras_postgres.rs`).
+//! `SelectExpr`, `Select::group_by`/`.having`, and `Select::union`/
+//! `union_all`/`intersect`/`except`. `RETURNING` on `UPDATE`/`DELETE` has
+//! no SQLite coverage here since SQLite's dialect doesn't support it (see
+//! `query_builder_extras_postgres.rs`).
 
 use rusty_db::prelude::*;
 
@@ -298,6 +299,102 @@ async fn group_by_and_having_execute_and_decode_correctly() -> rusty_db::Result<
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].get_by_name::<String>("customer")?, "Grace");
     assert_eq!(filtered[0].get_by_name::<i64>("total")?, 250);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_operations_execute_and_decode_correctly() -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    // low: Ada/10, ada/50, Grace/50 -- 3 rows, one duplicate value (none).
+    // high: ada/50, Grace/50, Grace/200 -- 3 rows, "Grace" appears twice.
+    let low = Select::from(&orders)
+        .columns([orders.col("customer")])
+        .filter(orders.col("amount").lt(60_i64));
+    let high = Select::from(&orders)
+        .columns([orders.col("customer")])
+        .filter(orders.col("amount").gte(50_i64));
+
+    let mut union_rows: Vec<String> = engine
+        .fetch_all(&low.clone().union(high.clone()))
+        .await?
+        .iter()
+        .map(|r| r.get::<String>(0))
+        .collect::<rusty_db::Result<_>>()?;
+    union_rows.sort();
+    assert_eq!(
+        union_rows,
+        vec!["Ada".to_string(), "Grace".to_string(), "ada".to_string()],
+        "UNION dedupes the repeated \"Grace\"/\"ada\" values"
+    );
+
+    let union_all_rows = engine
+        .fetch_all(&low.clone().union_all(high.clone()))
+        .await?;
+    assert_eq!(
+        union_all_rows.len(),
+        6,
+        "UNION ALL keeps every row from both arms, duplicates included"
+    );
+
+    let mut intersect_rows: Vec<String> = engine
+        .fetch_all(&low.clone().intersect(high.clone()))
+        .await?
+        .iter()
+        .map(|r| r.get::<String>(0))
+        .collect::<rusty_db::Result<_>>()?;
+    intersect_rows.sort();
+    assert_eq!(
+        intersect_rows,
+        vec!["Grace".to_string(), "ada".to_string()],
+        "only values present in both arms survive INTERSECT"
+    );
+
+    let except_rows: Vec<String> = engine
+        .fetch_all(&low.except(high))
+        .await?
+        .iter()
+        .map(|r| r.get::<String>(0))
+        .collect::<rusty_db::Result<_>>()?;
+    assert_eq!(
+        except_rows,
+        vec!["Ada".to_string()],
+        "only values in the first arm but not the second survive EXCEPT"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_operations_chain_to_combine_more_than_two_selects() -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    let ada = Select::from(&orders)
+        .columns([orders.col("customer")])
+        .filter(orders.col("customer").eq("Ada"));
+    let lower_ada = Select::from(&orders)
+        .columns([orders.col("customer")])
+        .filter(orders.col("customer").eq("ada"));
+    let grace = Select::from(&orders)
+        .columns([orders.col("customer")])
+        .filter(orders.col("customer").eq("Grace"));
+
+    let mut rows: Vec<String> = engine
+        .fetch_all(&ada.union(lower_ada).union(grace))
+        .await?
+        .iter()
+        .map(|r| r.get::<String>(0))
+        .collect::<rusty_db::Result<_>>()?;
+    rows.sort();
+    // "Grace" appears twice in the underlying table but only once here,
+    // since each arm (and the UNION combining them) still dedupes.
+    assert_eq!(
+        rows,
+        vec!["Ada".to_string(), "Grace".to_string(), "ada".to_string()]
+    );
 
     Ok(())
 }

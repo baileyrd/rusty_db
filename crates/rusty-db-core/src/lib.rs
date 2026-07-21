@@ -38,8 +38,8 @@ pub use mapping::{Entity, FromRow, Identifiable, Mapped};
 pub use migration::{AppliedMigration, Migration, Migrator};
 pub use pool::{PoolConfig, PoolMetrics, PoolStats};
 pub use query::{
-    AggFunc, BulkInsert, Column, Delete, Expr, Insert, Join, JoinKind, Select, SelectExpr, Table,
-    ToSql, Update,
+    AggFunc, BulkInsert, Column, Delete, Expr, Insert, Join, JoinKind, Select, SelectExpr, SetOp,
+    SetOperation, Table, ToSql, Update,
 };
 pub use replica::ReplicaSet;
 pub use row::Row;

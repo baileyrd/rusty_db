@@ -1,12 +1,16 @@
 #![cfg(feature = "postgres")]
 
 //! A reduced version of `query_builder_extras.rs` (SQLite) against a real
-//! Postgres server — just the two things that are actually
-//! Postgres-specific: `ILIKE` as a native keyword (vs. SQLite's fallback to
-//! plain `LIKE`), and `RETURNING` on `UPDATE`/`DELETE` (SQLite's dialect
-//! doesn't support `RETURNING` at all, so there's nothing to prove there).
-//! `DISTINCT`/`BETWEEN` have no dialect-specific behavior and are already
-//! covered against a real SQL engine there.
+//! Postgres server — just the things that are actually Postgres-specific:
+//! `ILIKE` as a native keyword (vs. SQLite's fallback to plain `LIKE`),
+//! `RETURNING` on `UPDATE`/`DELETE` (SQLite's dialect doesn't support
+//! `RETURNING` at all, so there's nothing to prove there), and a
+//! `SetOperation`'s bind parameters actually landing correctly with
+//! Postgres's numbered `$1, $2, ...` placeholders (SQLite/MySQL's `?`
+//! placeholders don't encode a position at all, so this is the one part of
+//! set operations with any real per-dialect risk). `DISTINCT`/`BETWEEN`
+//! have no dialect-specific behavior and are already covered against a
+//! real SQL engine there.
 
 use rusty_db::prelude::*;
 
@@ -134,6 +138,70 @@ async fn returning_is_honored_on_update_and_delete() -> rusty_db::Result<()> {
         .connect()
         .await?
         .execute("DROP TABLE query_extras_pg_returning", &[])
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn set_operation_bind_parameters_are_numbered_correctly_across_both_arms(
+) -> rusty_db::Result<()> {
+    let Some(engine) = test_engine().await else {
+        return Ok(());
+    };
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE IF EXISTS query_extras_pg_set_ops", &[])
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE query_extras_pg_set_ops (id BIGINT PRIMARY KEY, amount BIGINT NOT NULL)",
+            &[],
+        )
+        .await?;
+
+    let orders = Table::new("query_extras_pg_set_ops");
+    for (id, amount) in [(1_i64, 10_i64), (2, 60), (3, 200)] {
+        engine
+            .execute(
+                &Insert::into_table(&orders)
+                    .value("id", id)
+                    .value("amount", amount),
+            )
+            .await?;
+    }
+
+    // Each arm binds its own literal via a placeholder Postgres numbers
+    // globally across the whole statement ($1 for the first arm, $2 for
+    // the second) -- if SetOperation instead let each arm restart from $1
+    // independently, this would either fail outright (Postgres rejecting
+    // a duplicate/missing parameter position) or silently bind the wrong
+    // value into the second arm's filter.
+    let rows = engine
+        .fetch_all(
+            &Select::from(&orders)
+                .columns([orders.col("id")])
+                .filter(orders.col("amount").eq(10_i64))
+                .union(
+                    Select::from(&orders)
+                        .columns([orders.col("id")])
+                        .filter(orders.col("amount").eq(200_i64)),
+                ),
+        )
+        .await?;
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .map(|r| r.get::<i64>(0))
+        .collect::<rusty_db::Result<_>>()?;
+    ids.sort();
+    assert_eq!(ids, vec![1, 3]);
+
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE query_extras_pg_set_ops", &[])
         .await?;
     Ok(())
 }

@@ -4,6 +4,7 @@ mod expr;
 mod insert;
 mod join;
 mod select;
+mod set_op;
 mod table;
 #[cfg(test)]
 mod tests;
@@ -15,6 +16,7 @@ pub use expr::{AggFunc, BinOp, Expr};
 pub use insert::Insert;
 pub use join::{Join, JoinKind};
 pub use select::{Select, SelectExpr};
+pub use set_op::{SetOp, SetOperation};
 pub use table::{Column, Table};
 pub use update::Update;
 
