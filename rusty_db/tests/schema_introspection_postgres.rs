@@ -191,3 +191,89 @@ async fn table_schema_reports_defaults_unique_and_check_constraints() -> rusty_d
 
     Ok(())
 }
+
+#[tokio::test]
+async fn table_schema_reports_single_column_and_composite_foreign_keys() -> rusty_db::Result<()> {
+    let Some(engine) = test_engine().await else {
+        return Ok(());
+    };
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE IF EXISTS schema_introspection_children", &[])
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE IF EXISTS schema_introspection_parents", &[])
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE schema_introspection_parents (\
+                 id BIGINT PRIMARY KEY, \
+                 code TEXT, \
+                 UNIQUE (id, code)\
+             )",
+            &[],
+        )
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE schema_introspection_children (\
+                 id BIGINT PRIMARY KEY, \
+                 parent_id BIGINT, \
+                 parent_code TEXT, \
+                 FOREIGN KEY (parent_id) REFERENCES schema_introspection_parents (id), \
+                 FOREIGN KEY (parent_id, parent_code) \
+                     REFERENCES schema_introspection_parents (id, code)\
+             )",
+            &[],
+        )
+        .await?;
+
+    let schema = engine
+        .table_schema("schema_introspection_children")
+        .await?
+        .expect("table exists");
+    assert_eq!(schema.foreign_keys.len(), 2);
+
+    let single = schema
+        .foreign_keys
+        .iter()
+        .find(|fk| fk.columns == vec!["parent_id".to_string()])
+        .expect("the single-column foreign key");
+    assert_eq!(single.referenced_table, "schema_introspection_parents");
+    assert_eq!(single.referenced_columns, vec!["id".to_string()]);
+
+    let composite = schema
+        .foreign_keys
+        .iter()
+        .find(|fk| fk.columns.len() == 2)
+        .expect("the composite foreign key");
+    assert_eq!(
+        composite.columns,
+        vec!["parent_id".to_string(), "parent_code".to_string()]
+    );
+    assert_eq!(composite.referenced_table, "schema_introspection_parents");
+    assert_eq!(
+        composite.referenced_columns,
+        vec!["id".to_string(), "code".to_string()]
+    );
+
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE schema_introspection_children", &[])
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE schema_introspection_parents", &[])
+        .await?;
+
+    Ok(())
+}

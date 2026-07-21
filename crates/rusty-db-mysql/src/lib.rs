@@ -10,8 +10,8 @@ use sqlx::{Column as _, MySql, MySqlPool, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::MySqlDialect;
 use rusty_db_core::{
-    CheckConstraint, ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig,
-    PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
+    CheckConstraint, ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, ForeignKey,
+    PoolConfig, PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
 };
 
 static DIALECT: MySqlDialect = MySqlDialect;
@@ -168,7 +168,7 @@ impl Driver for MySqlDriver {
                  WHERE tc.constraint_type = 'CHECK' \
                    AND tc.table_schema = DATABASE() \
                    AND tc.table_name = ?",
-                &[table_value],
+                std::slice::from_ref(&table_value),
             )
             .await?;
         let check_constraints = check_rows
@@ -181,11 +181,30 @@ impl Driver for MySqlDriver {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // MySQL's `key_column_usage` already pairs each local column with
+        // its referenced column on the very same row (`referenced_table_name`/
+        // `referenced_column_name`, a MySQL-specific extension beyond
+        // standard `information_schema`), so composite foreign keys don't
+        // need the extra care Postgres's reflection does.
+        let fk_rows = conn
+            .fetch_all(
+                "SELECT constraint_name, column_name, referenced_table_name, referenced_column_name \
+                 FROM information_schema.key_column_usage \
+                 WHERE table_schema = DATABASE() \
+                   AND table_name = ? \
+                   AND referenced_table_name IS NOT NULL \
+                 ORDER BY constraint_name, ordinal_position",
+                &[table_value],
+            )
+            .await?;
+        let foreign_keys = group_foreign_keys(&fk_rows)?;
+
         Ok(Some(TableSchema {
             name: table.to_string(),
             columns,
             unique_constraints,
             check_constraints,
+            foreign_keys,
         }))
     }
 }
@@ -203,6 +222,31 @@ fn group_unique_constraints(rows: &[Row]) -> Result<Vec<UniqueConstraint>> {
             _ => result.push(UniqueConstraint {
                 name,
                 columns: vec![column],
+            }),
+        }
+    }
+    Ok(result)
+}
+
+/// Groups rows of `(constraint_name, column_name, referenced_table_name,
+/// referenced_column_name)` — ordered by `constraint_name` then ordinal
+/// position — into one `ForeignKey` per distinct name.
+fn group_foreign_keys(rows: &[Row]) -> Result<Vec<ForeignKey>> {
+    let mut result: Vec<ForeignKey> = Vec::new();
+    for row in rows {
+        let name = row.get_by_name::<String>("constraint_name")?;
+        let column = row.get_by_name::<String>("column_name")?;
+        let referenced_column = row.get_by_name::<String>("referenced_column_name")?;
+        match result.last_mut() {
+            Some(last) if last.name == name => {
+                last.columns.push(column);
+                last.referenced_columns.push(referenced_column);
+            }
+            _ => result.push(ForeignKey {
+                name,
+                columns: vec![column],
+                referenced_table: row.get_by_name::<String>("referenced_table_name")?,
+                referenced_columns: vec![referenced_column],
             }),
         }
     }

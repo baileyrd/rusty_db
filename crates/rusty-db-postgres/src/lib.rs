@@ -11,8 +11,8 @@ use sqlx::{Column as _, Postgres, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::NumberedDialect;
 use rusty_db_core::{
-    CheckConstraint, ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig,
-    PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
+    CheckConstraint, ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, ForeignKey,
+    PoolConfig, PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
 };
 
 static DIALECT: NumberedDialect = NumberedDialect;
@@ -196,7 +196,7 @@ impl Driver for PostgresDriver {
                  WHERE con.contype = 'c' \
                    AND ns.nspname = 'public' \
                    AND rel.relname = $1",
-                &[table_value],
+                std::slice::from_ref(&table_value),
             )
             .await?;
         let check_constraints = check_rows
@@ -209,11 +209,66 @@ impl Driver for PostgresDriver {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // Composite foreign keys can't be correctly reconstructed from
+        // `information_schema` alone (joining `key_column_usage` to
+        // `constraint_column_usage` by constraint name, with no shared
+        // ordinal, cross-joins every local column with every referenced
+        // one) — `pg_catalog.pg_constraint`'s own `conkey`/`confkey` arrays
+        // are already correctly ordered pairs, so `unnest(...) WITH
+        // ORDINALITY` pairs them up correctly regardless of how many
+        // columns are involved. `string_agg` (not `array_agg`) so the
+        // result comes back as plain text `Value`s — there's no dedicated
+        // array `Value` variant.
+        let fk_rows = conn
+            .fetch_all(
+                "SELECT con.conname AS constraint_name, \
+                        string_agg(att.attname, ',' ORDER BY u.ord) AS columns, \
+                        frel.relname AS referenced_table, \
+                        string_agg(fatt.attname, ',' ORDER BY u.ord) AS referenced_columns \
+                 FROM pg_catalog.pg_constraint con \
+                 JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid \
+                 JOIN pg_catalog.pg_namespace ns ON ns.oid = rel.relnamespace \
+                 JOIN pg_catalog.pg_class frel ON frel.oid = con.confrelid \
+                 JOIN LATERAL unnest(con.conkey, con.confkey) \
+                   WITH ORDINALITY AS u(local_attnum, foreign_attnum, ord) ON true \
+                 JOIN pg_catalog.pg_attribute att \
+                   ON att.attrelid = con.conrelid AND att.attnum = u.local_attnum \
+                 JOIN pg_catalog.pg_attribute fatt \
+                   ON fatt.attrelid = con.confrelid AND fatt.attnum = u.foreign_attnum \
+                 WHERE con.contype = 'f' \
+                   AND ns.nspname = 'public' \
+                   AND rel.relname = $1 \
+                 GROUP BY con.conname, frel.relname \
+                 ORDER BY con.conname",
+                &[table_value],
+            )
+            .await?;
+        let foreign_keys = fk_rows
+            .iter()
+            .map(|row| {
+                Ok(ForeignKey {
+                    name: row.get_by_name::<String>("constraint_name")?,
+                    columns: row
+                        .get_by_name::<String>("columns")?
+                        .split(',')
+                        .map(str::to_string)
+                        .collect(),
+                    referenced_table: row.get_by_name::<String>("referenced_table")?,
+                    referenced_columns: row
+                        .get_by_name::<String>("referenced_columns")?
+                        .split(',')
+                        .map(str::to_string)
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         Ok(Some(TableSchema {
             name: table.to_string(),
             columns,
             unique_constraints,
             check_constraints,
+            foreign_keys,
         }))
     }
 }
