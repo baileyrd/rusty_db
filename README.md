@@ -167,6 +167,30 @@ let query = Select::from(&orders)
     .filter(users.col("active").eq(true));
 ```
 
+### DISTINCT, BETWEEN, ILIKE, and RETURNING on UPDATE/DELETE
+
+`Select::distinct()` adds `SELECT DISTINCT`; `Column::between(low, high)` builds an inclusive `BETWEEN ... AND ...`; `Column::ilike(pattern)` is a case-insensitive `LIKE` (Postgres's native `ILIKE` keyword — everywhere else it falls back to plain `LIKE`, which is already case-insensitive under SQLite's and MySQL/MariaDB's typical default collations, though not guaranteed if a case-sensitive one is configured); and `.returning(...)` — previously `Insert`-only — is now also available on `Update`/`Delete`, gated the same way (only honored where `Dialect::supports_returning()` is true, currently just Postgres):
+
+```rust
+let orders = Table::new("orders");
+
+let query = Select::from(&orders)
+    .columns([orders.col("customer")])
+    .distinct()
+    .filter(orders.col("amount").between(10_i64, 100_i64))
+    .filter(orders.col("customer").ilike("%ada%"));
+
+// Postgres only (RETURNING is ignored elsewhere, per Dialect::supports_returning()):
+let updated = engine
+    .fetch_one(
+        &Update::table(&orders)
+            .set("status", "shipped")
+            .filter(orders.col("id").eq(1_i64))
+            .returning(["id", "status"]),
+    )
+    .await?;
+```
+
 ### Struct-to-table mapping (`#[derive(Mapped)]`)
 
 Enable the `derive` feature to map a struct onto a table:
@@ -434,6 +458,8 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 `tests/soft_delete.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests that most directly exercise the feature end to end, since the query-builder-level `not_deleted_filter`/`load_active` coverage and the plain-type-is-unaffected case don't need re-proving per driver) cover `#[table(soft_delete)]`: `Session::delete` marks the row (`SET <column> = true`) instead of removing it; `Session::get` treats an already-marked row the same as one that was never there, including from a fresh `Session` with no identity-map cache from before the delete; `Mapped::not_deleted_filter()` and `Session::load_active` both exclude marked rows from query results; calling an entity's own `delete_query()` directly still issues a real, unmarked `DELETE`; and a type with no `#[table(soft_delete)]` field keeps `Session::delete`'s pre-existing behavior of a genuine hard delete, proving the feature is fully opt-in.
 
 `tests/pool_stats.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests proving `pool_stats()` against a real network-backed pool, since the pure counting behavior doesn't need re-proving per driver) cover `Engine::pool_stats()`: checking out a connection is reflected immediately (`in_use` up, `total_acquires` up), and releasing it moves it back to `idle` without touching `total_acquires`; the counter keeps accumulating across repeated checkouts rather than just tracking the current one; and `waiters` goes to `1` while a second acquire is genuinely blocked behind a pool of size one, then back to `0` once it unblocks. Discovering the exact numbers to assert here surfaced two things worth knowing about sqlx's own pool: it eagerly opens (and keeps, idle) one connection up front to validate the URL when the pool is first constructed, so a "fresh" pool already reports that one as active/idle even though `total_acquires` correctly stays `0` (that startup connection never went through `Driver::connect`); and releasing a connection back to the pool isn't synchronous inside `drop` — the tests give it a brief moment (`tokio::time::sleep`) before reading the snapshot back, the same pattern already used elsewhere in this suite for other not-quite-synchronous async cleanup. `waiters`/`total_acquires` are the two numbers sqlx doesn't expose on its own, so each driver keeps a small `PoolMetrics` (a couple of atomics behind an `Arc`) alongside its pool for just those two; every other `PoolStats` field is a zero-cost read of the pool itself.
+
+`tests/query_builder_extras.rs` (SQLite) and its `_postgres` counterpart (a reduced version there — just the two things that are actually Postgres-specific, `ILIKE` and `RETURNING` on `UPDATE`/`DELETE`; `DISTINCT`/`BETWEEN` have no dialect-specific behavior and don't need re-proving against a live server) cover the newer query-builder additions against a real SQL engine rather than just checking rendered SQL strings: `Select::distinct()` actually dedupes matching rows; `Column::between` includes both boundaries inclusively; `Column::ilike` matches case-insensitively via its portable `LIKE` fallback on SQLite and via Postgres's native `ILIKE` keyword; and `.returning(...)` on `Update`/`Delete` actually returns the requested columns from a real Postgres server (and is silently ignored on SQLite, whose dialect doesn't support `RETURNING` at all). The pure rendering side of all four — including that `RETURNING` is dialect-gated and `ilike_operator()` picks the right keyword per dialect — is unit-tested directly in `crates/rusty-db-core/src/query/tests.rs`, alongside the rest of the query builder's SQL generation.
 
 ## Running tests
 

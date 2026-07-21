@@ -11,10 +11,13 @@ pub enum BinOp {
     Gt,
     GtEq,
     Like,
+    /// Case-insensitive `LIKE` — see `Dialect::ilike_operator` for how it
+    /// renders per backend.
+    ILike,
 }
 
 impl BinOp {
-    fn as_sql(self) -> &'static str {
+    fn as_sql(self, dialect: &dyn Dialect) -> &'static str {
         match self {
             BinOp::Eq => "=",
             BinOp::NotEq => "<>",
@@ -23,6 +26,7 @@ impl BinOp {
             BinOp::Gt => ">",
             BinOp::GtEq => ">=",
             BinOp::Like => "LIKE",
+            BinOp::ILike => dialect.ilike_operator(),
         }
     }
 }
@@ -40,6 +44,8 @@ pub enum Expr {
     IsNull(Box<Expr>),
     IsNotNull(Box<Expr>),
     In(Box<Expr>, Vec<Expr>),
+    /// `expr BETWEEN low AND high` (inclusive of both bounds).
+    Between(Box<Expr>, Box<Expr>, Box<Expr>),
 }
 
 impl Expr {
@@ -91,6 +97,15 @@ impl Expr {
         )
     }
 
+    /// `self BETWEEN low AND high` (inclusive of both bounds).
+    pub fn between(self, low: impl Into<Value>, high: impl Into<Value>) -> Self {
+        Expr::Between(
+            Box::new(self),
+            Box::new(Expr::Literal(low.into())),
+            Box::new(Expr::Literal(high.into())),
+        )
+    }
+
     /// Render this expression to SQL, pushing any literal values into
     /// `params` in the order their placeholders appear.
     pub fn render(&self, dialect: &dyn Dialect, params: &mut Vec<Value>) -> String {
@@ -104,7 +119,7 @@ impl Expr {
                 format!(
                     "{} {} {}",
                     lhs.render(dialect, params),
-                    op.as_sql(),
+                    op.as_sql(dialect),
                     rhs.render(dialect, params)
                 )
             }
@@ -122,6 +137,14 @@ impl Expr {
                 let rendered: Vec<String> =
                     values.iter().map(|v| v.render(dialect, params)).collect();
                 format!("{lhs} IN ({})", rendered.join(", "))
+            }
+            Expr::Between(target, low, high) => {
+                format!(
+                    "{} BETWEEN {} AND {}",
+                    target.render(dialect, params),
+                    low.render(dialect, params),
+                    high.render(dialect, params)
+                )
             }
         }
     }

@@ -20,6 +20,16 @@ pub trait Dialect: Send + Sync {
     fn supports_returning(&self) -> bool {
         false
     }
+
+    /// The operator `Column::ilike`/`Expr`'s case-insensitive `LIKE` renders
+    /// as. Postgres has a native `ILIKE` keyword; everywhere else this falls
+    /// back to plain `LIKE`, which is already case-insensitive for common
+    /// default collations/encodings on SQLite and MySQL/MariaDB (though not
+    /// guaranteed if a case-sensitive collation is configured) — a portable
+    /// approximation rather than a guaranteed-identical match everywhere.
+    fn ilike_operator(&self) -> &'static str {
+        "LIKE"
+    }
 }
 
 /// `$1`, `$2`, ... style placeholders (PostgreSQL).
@@ -37,6 +47,10 @@ impl Dialect for NumberedDialect {
 
     fn supports_returning(&self) -> bool {
         true
+    }
+
+    fn ilike_operator(&self) -> &'static str {
+        "ILIKE"
     }
 }
 
