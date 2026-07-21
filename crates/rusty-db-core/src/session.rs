@@ -8,7 +8,7 @@ use crate::engine::{Engine, Transaction};
 use crate::error::{Error, Result};
 use crate::mapping::{Entity, FromRow, Identifiable, Mapped};
 use crate::migration::{self, Migration};
-use crate::query::{BulkInsert, Insert, Select, Table, ToSql};
+use crate::query::{BulkInsert, Insert, Select, Table, ToSql, Update};
 use crate::value::Value;
 
 /// One write queued by `add`/`update`/`delete`, tagged with what it's for
@@ -158,6 +158,11 @@ impl Session {
     /// evict it from the identity map immediately, so `get`/`load_all`
     /// can't hand back a stale cached instance for its primary key.
     ///
+    /// With a `#[table(soft_delete)]` column, this marks the row (`SET
+    /// <column> = true`) instead of actually removing it — `entity`'s own
+    /// `delete_query()` (a real `DELETE`) is bypassed entirely; use it
+    /// directly if you ever need a hard delete on a soft-deletable type.
+    ///
     /// Same optimistic-locking behavior as `update`: with a
     /// `#[table(version)]` field, a delete that matches no row (version
     /// mismatch, or already gone) errors with `Error::Conflict` rather
@@ -165,10 +170,27 @@ impl Session {
     pub fn delete<T: Identifiable + 'static>(&mut self, entity: &T) {
         let key = (TypeId::of::<T>(), entity.primary_key_value().to_string());
         self.identity_map.remove(&key);
+
+        let query: Box<dyn ToSql + Send> = match T::SOFT_DELETE_COLUMN {
+            Some(soft_delete_column) => {
+                let pk_column = T::PRIMARY_KEY.expect(
+                    "#[table(soft_delete)] requires a #[table(primary_key)] field too \
+                     (enforced when #[derive(Mapped)] expands)",
+                );
+                let table = Table::new(T::TABLE_NAME);
+                Box::new(
+                    Update::table(&table)
+                        .set(soft_delete_column, true)
+                        .filter(table.col(pk_column).eq(entity.primary_key_value())),
+                )
+            }
+            None => Box::new(entity.delete_query()),
+        };
+
         self.pending.push(PendingWrite {
             table: T::TABLE_NAME,
             operation: AuditOperation::Delete,
-            query: Box::new(entity.delete_query()),
+            query,
             requires_row_affected: T::VERSION_COLUMN.is_some(),
         });
     }
@@ -385,6 +407,9 @@ impl Session {
     /// writes (autoflush) and queries for it — through this session's
     /// transaction if one is open, so it sees those writes — caches the
     /// result, and returns it. Returns `Ok(None)` if no matching row exists.
+    ///
+    /// With a `#[table(soft_delete)]` column, a row already marked deleted
+    /// is treated the same as one that was never there: `Ok(None)`.
     pub async fn get<T>(&mut self, primary_key: impl Into<Value>) -> Result<Option<Rc<RefCell<T>>>>
     where
         T: Mapped + FromRow + 'static,
@@ -401,7 +426,10 @@ impl Session {
         let pk_column =
             T::PRIMARY_KEY.expect("Session::get requires T to have a #[table(primary_key)] field");
         let table = Table::new(T::TABLE_NAME);
-        let query = Select::from(&table).filter(table.col(pk_column).eq(primary_key));
+        let mut query = Select::from(&table).filter(table.col(pk_column).eq(primary_key));
+        if let Some(not_deleted) = T::not_deleted_filter() {
+            query = query.filter(not_deleted);
+        }
 
         let dialect = self.engine.dialect();
         let row_opt = match self.txn.as_mut() {
@@ -451,6 +479,22 @@ impl Session {
             handles.push(handle);
         }
         Ok(handles)
+    }
+
+    /// Like `load_all`, but every row of `T`'s table — excluding
+    /// soft-deleted ones, for a `#[table(soft_delete)]` type (see
+    /// `Mapped::not_deleted_filter`). For a type with no soft-delete
+    /// column, this is simply every row.
+    pub async fn load_active<T>(&mut self) -> Result<Vec<Rc<RefCell<T>>>>
+    where
+        T: Identifiable + FromRow + 'static,
+    {
+        let table = Table::new(T::TABLE_NAME);
+        let mut query = Select::from(&table);
+        if let Some(not_deleted) = T::not_deleted_filter() {
+            query = query.filter(not_deleted);
+        }
+        self.load_all(&query).await
     }
 
     /// How many distinct `(type, primary key)` entries are currently cached.

@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::query::{Delete, Insert, Update};
+use crate::query::{Delete, Expr, Insert, Table, Update};
 use crate::row::Row;
 use crate::value::Value;
 
@@ -21,6 +21,24 @@ pub trait Mapped {
     /// last loaded with) — see `Session::update`/`delete`, which turn a
     /// zero-rows-affected result into `Error::Conflict` when this is set.
     const VERSION_COLUMN: Option<&'static str> = None;
+
+    /// The (boolean) column marked `#[table(soft_delete)]`, if any. When
+    /// present, `Session::delete` marks the row (`SET <column> = true`)
+    /// instead of actually removing it, and `Session::get` treats an
+    /// already-marked row as not found. See `not_deleted_filter` for
+    /// building the same "still active" condition into your own queries.
+    const SOFT_DELETE_COLUMN: Option<&'static str> = None;
+
+    /// A `<column> = false` filter excluding soft-deleted rows, or `None`
+    /// for a type with no `#[table(soft_delete)]` column. Needs no
+    /// per-type code generation — built entirely from `TABLE_NAME` and
+    /// `SOFT_DELETE_COLUMN` — so every `Mapped` type gets it for free.
+    fn not_deleted_filter() -> Option<Expr>
+    where
+        Self: Sized,
+    {
+        Self::SOFT_DELETE_COLUMN.map(|column| Table::new(Self::TABLE_NAME).col(column).eq(false))
+    }
 }
 
 /// Decodes a `Row` into a concrete type. Implemented by `#[derive(Mapped)]`.
