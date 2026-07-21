@@ -3,12 +3,22 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::audit::{self, AuditEntry, AuditOperation};
 use crate::engine::{Engine, Transaction};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::mapping::{Entity, FromRow, Identifiable, Mapped};
 use crate::migration::{self, Migration};
-use crate::query::{Select, Table, ToSql};
+use crate::query::{Insert, Select, Table, ToSql};
 use crate::value::Value;
+
+/// One write queued by `add`/`update`/`delete`, tagged with what it's
+/// for (used only when audit logging is enabled) alongside the rendered
+/// `Insert`/`Update`/`Delete` itself.
+struct PendingWrite {
+    table: &'static str,
+    operation: AuditOperation,
+    query: Box<dyn ToSql + Send>,
+}
 
 /// A unit of work: queues writes made through `add`/`update`/`delete`, and
 /// autoflushes them — sends them to the database, inside one ongoing
@@ -45,8 +55,10 @@ use crate::value::Value;
 pub struct Session {
     engine: Engine,
     txn: Option<Transaction>,
-    pending: Vec<Box<dyn ToSql + Send>>,
+    pending: Vec<PendingWrite>,
     identity_map: HashMap<(TypeId, String), Rc<dyn Any>>,
+    audit_enabled: bool,
+    audit_table: &'static str,
 }
 
 impl Session {
@@ -56,7 +68,26 @@ impl Session {
             txn: None,
             pending: Vec::new(),
             identity_map: HashMap::new(),
+            audit_enabled: false,
+            audit_table: "_rusty_db_audit_log",
         }
+    }
+
+    /// Record every write this session flushes into an append-only audit
+    /// log (table `_rusty_db_audit_log` by default — see
+    /// `with_audit_log_table` to use another), inside the same
+    /// transaction as the write itself. See `audit_log` to read it back.
+    pub fn with_audit_log(mut self) -> Self {
+        self.audit_enabled = true;
+        self
+    }
+
+    /// Like `with_audit_log`, using an audit table name other than the
+    /// default `_rusty_db_audit_log` (matching `Migrator::with_table`).
+    pub fn with_audit_log_table(mut self, table: &'static str) -> Self {
+        self.audit_enabled = true;
+        self.audit_table = table;
+        self
     }
 
     /// The `Engine` this session commits through, for reads or raw access
@@ -74,12 +105,20 @@ impl Session {
     /// next flush (an explicit `flush()`/`commit()`, or the autoflush
     /// before a `get`/`load_all` call).
     pub fn add<T: Entity>(&mut self, entity: &T) {
-        self.pending.push(Box::new(entity.insert()));
+        self.pending.push(PendingWrite {
+            table: T::TABLE_NAME,
+            operation: AuditOperation::Insert,
+            query: Box::new(entity.insert()),
+        });
     }
 
     /// Queue an update for `entity`; not sent until the next flush.
     pub fn update<T: Identifiable>(&mut self, entity: &T) {
-        self.pending.push(Box::new(entity.update()));
+        self.pending.push(PendingWrite {
+            table: T::TABLE_NAME,
+            operation: AuditOperation::Update,
+            query: Box::new(entity.update()),
+        });
     }
 
     /// Queue a delete for `entity` (not sent until the next flush), and
@@ -88,7 +127,11 @@ impl Session {
     pub fn delete<T: Identifiable + 'static>(&mut self, entity: &T) {
         let key = (TypeId::of::<T>(), entity.primary_key_value().to_string());
         self.identity_map.remove(&key);
-        self.pending.push(Box::new(entity.delete_query()));
+        self.pending.push(PendingWrite {
+            table: T::TABLE_NAME,
+            operation: AuditOperation::Delete,
+            query: Box::new(entity.delete_query()),
+        });
     }
 
     /// Send every currently-queued write to the database, inside this
@@ -107,27 +150,105 @@ impl Session {
             return Ok(());
         }
 
-        let rendered: Vec<(String, Vec<Value>)> = {
+        let rendered: Vec<(&'static str, AuditOperation, String, Vec<Value>)> = {
             let dialect = self.engine.dialect();
-            self.pending.iter().map(|op| op.to_sql(dialect)).collect()
+            self.pending
+                .iter()
+                .map(|write| {
+                    let (sql, params) = write.query.to_sql(dialect);
+                    (write.table, write.operation, sql, params)
+                })
+                .collect()
         };
 
         if self.txn.is_none() {
             self.txn = Some(self.engine.begin().await?);
         }
-        let txn = self.txn.as_mut().expect("just set");
 
-        for (sql, params) in &rendered {
-            if let Err(err) = txn.execute(sql, params).await {
-                if let Some(txn) = self.txn.take() {
-                    let _ = txn.rollback().await;
-                }
-                return Err(err);
+        if self.audit_enabled {
+            self.ensure_audit_table().await?;
+        }
+
+        for (table, operation, sql, params) in &rendered {
+            self.execute_or_rollback(sql, params).await?;
+
+            if self.audit_enabled {
+                let audit_table = Table::new(self.audit_table);
+                let record = Insert::into_table(&audit_table)
+                    .value("table_name", *table)
+                    .value("operation", operation.as_str())
+                    .value("sql_text", sql.clone())
+                    .value("params_text", audit::params_to_text(params));
+                let dialect = self.engine.dialect();
+                let (audit_sql, audit_params) = record.to_sql(dialect);
+                self.execute_or_rollback(&audit_sql, &audit_params).await?;
             }
         }
 
         self.pending.clear();
         Ok(())
+    }
+
+    /// Runs one statement through the open transaction, rolling the whole
+    /// transaction back and returning the error if it fails — the shared
+    /// all-or-nothing behavior every write in `flush` (the real write and,
+    /// when enabled, its audit-log entry) has.
+    async fn execute_or_rollback(&mut self, sql: &str, params: &[Value]) -> Result<()> {
+        let result = self
+            .txn
+            .as_mut()
+            .expect("transaction just opened by flush")
+            .execute(sql, params)
+            .await;
+        if let Err(err) = result {
+            if let Some(txn) = self.txn.take() {
+                let _ = txn.rollback().await;
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    async fn ensure_audit_table(&mut self) -> Result<()> {
+        if self.txn.is_none() {
+            self.txn = Some(self.engine.begin().await?);
+        }
+        let quoted = self.engine.dialect().quote_ident(self.audit_table);
+        self.execute_or_rollback(&audit::table_ddl(&quoted), &[])
+            .await
+    }
+
+    /// Reads back this session's audit log (autoflushing first, and
+    /// reading through this session's transaction if one is open — the
+    /// same "see your own writes" behavior `get`/`load_all` have), oldest
+    /// entry first. Only meaningful when this session was built with
+    /// `with_audit_log`/`with_audit_log_table`.
+    pub async fn audit_log(&mut self) -> Result<Vec<AuditEntry>> {
+        self.flush().await?;
+        self.ensure_audit_table().await?;
+
+        let table = Table::new(self.audit_table);
+        let query = Select::from(&table);
+        let dialect = self.engine.dialect();
+        let rows = match self.txn.as_mut() {
+            Some(txn) => txn.fetch_all(&query, dialect).await?,
+            None => self.engine.fetch_all(&query).await?,
+        };
+
+        rows.iter()
+            .map(|row| {
+                let operation_text = row.get_by_name::<String>("operation")?;
+                let operation = AuditOperation::parse(&operation_text).ok_or_else(|| {
+                    Error::Database(format!("unrecognized audit operation {operation_text:?}"))
+                })?;
+                Ok(AuditEntry {
+                    table: row.get_by_name("table_name")?,
+                    operation,
+                    sql: row.get_by_name("sql_text")?,
+                    params_text: row.get_by_name("params_text")?,
+                })
+            })
+            .collect()
     }
 
     /// Apply every migration in `migrations` not already recorded as

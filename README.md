@@ -206,6 +206,23 @@ A session's writes actually run inside one ongoing transaction that begins lazil
 
 If a flush fails partway through a batch, the whole transaction (including anything flushed earlier in its lifetime) rolls back and the queue is left untouched, so fixing the problem and calling `commit()`/flushing again starts over cleanly.
 
+### Audit logging / change tracking
+
+`session.with_audit_log()` records every write the session flushes into an append-only audit table (`_rusty_db_audit_log` by default — `with_audit_log_table` picks another), inside the *same transaction* as the write itself: an audit entry only ever exists for a change that actually took effect, and if the transaction rolls back, any audit entries flushed into it roll back right along with it. Opt-in — a plain `session()` never creates or touches an audit table at all.
+
+```rust
+let mut session = engine.session().with_audit_log();
+
+session.add(&User { id: 1, name: "ada".into(), active: true });
+session.commit().await?;
+
+for entry in session.audit_log().await? {
+    println!("{:?} on {} — {} [{}]", entry.operation, entry.table, entry.sql, entry.params_text);
+}
+```
+
+This records the rendered SQL statement and its bound parameters (formatted to text) for each write — a lightweight write-ahead trail of *which statement ran, on which table, when*, not a structured before/after diff of column values. `audit_log()` autoflushes and reads through the session's own transaction first (the same "see your own writes" behavior `get`/`load_all` have), so it reflects writes this session has flushed but not yet committed too.
+
 ### Identity map
 
 `Session::get`/`load_all` cache decoded rows by `(type, primary key)`: loading the same row twice through the same session returns the exact same `Rc<RefCell<T>>` handle rather than two independently-decoded copies, and mutations made through one handle are visible through any other handle to that row — including handles you fetch *after* the mutation, since the identity map wins over what's actually in the database:
@@ -330,6 +347,8 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 `tests/backup_restore.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `backup`/`restore`: a backup captures every row of every table; restoring returns the database to exactly its backed-up state after rows are deleted, updated, and added; a dump backed up from one `Engine` restores correctly into a completely different one; a failing restore (a corrupted dump with a duplicate primary key partway through) rolls back the *entire* transaction rather than leaving the table partially wiped; and backing up an empty table round-trips correctly. The Postgres/MySQL versions scope every backup/restore to their own table via `backup_tables`, since a whole-database `restore()` would otherwise risk wiping tables that other tests running concurrently against the same shared live server still need.
 
 `tests/tls_postgres.rs`/`tests/tls_mysql.rs` cover encrypted connections (no SQLite equivalent — it has no network/TLS concept at all): the default `sslmode`/`ssl-mode` (`prefer`/`PREFERRED`) already opportunistically encrypts against a server that supports it, verified against the server's own bookkeeping (`pg_stat_ssl`, `SHOW STATUS LIKE 'Ssl_cipher'`) rather than just assuming the connection attempt succeeding means it's encrypted; `disable`/`DISABLED` produces a genuinely plain connection; `require`/`REQUIRED` encrypts without verifying the certificate; and `verify-full`/`verify-ca`/`VERIFY_CA` succeed with the server's actual CA (and, for `verify-full`, matching hostname) but fail closed against a CA that doesn't match — proving certificate verification actually verifies something rather than silently accepting any well-formed root. This environment's Postgres already has TLS enabled by default (a self-signed cert the Debian/Ubuntu package generates automatically); MariaDB needed a one-time setup of a self-signed CA/server certificate (`ssl-ca`/`ssl-cert`/`ssl-key` in `/etc/mysql/mariadb.conf.d/50-server.cnf`) to have any TLS support to test against at all.
+
+`tests/audit_log.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests that most directly exercise change tracking, since the identity-map/uncommitted-write-visibility behavior is already covered by the SQLite version and doesn't need re-proving per driver) cover `Session`'s opt-in audit logging: a plain session never creates an audit table at all; insert/update/delete each get recorded with the right table, operation, and rendered SQL/params; a failed write's audit entry rolls back right along with the write itself (proving the audit trail shares the write's own transaction rather than being an independent, potentially-inconsistent side effect); the session's own `audit_log()` sees its not-yet-committed entries (autoflush + read-through-transaction, same as `get`/`load_all`); and a custom audit table name is honored. The Postgres/MySQL versions use their own audit table name per test (`with_audit_log_table`) to avoid colliding with other tests running concurrently against the same shared live server, and are careful to `commit()` (closing the transaction `audit_log()` itself opens) before any cleanup `DROP TABLE` from a separate connection — otherwise the cleanup deadlocks waiting on a lock the still-open session transaction is holding.
 
 ## Running tests
 
