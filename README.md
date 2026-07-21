@@ -115,7 +115,30 @@ session.delete(&some_other_user);
 session.commit().await?; // update + delete, atomically
 ```
 
-If any statement in the batch fails, `commit()` rolls back the whole transaction and leaves the queue untouched, so you can fix the problem and call `commit()` again. This is a unit-of-work, not a full ORM session: there's no identity map and no autoflush, so reads (`engine.fetch_all_as`, etc.) never see writes that are queued but not yet committed — always `commit()` before reading anything you just wrote through a `Session`.
+If any statement in the batch fails, `commit()` rolls back the whole transaction and leaves the queue untouched, so you can fix the problem and call `commit()` again. There's no autoflush, so reads (`engine.fetch_all_as`, `session.get`/`load_all` below, etc.) never see writes that are queued but not yet committed — always `commit()` before reading anything you just wrote through a `Session`.
+
+### Identity map
+
+`Session::get`/`load_all` cache decoded rows by `(type, primary key)`: loading the same row twice through the same session returns the exact same `Rc<RefCell<T>>` handle rather than two independently-decoded copies, and mutations made through one handle are visible through any other handle to that row — including handles you fetch *after* the mutation, since the identity map wins over what's actually in the database:
+
+```rust
+let mut session = engine.session();
+
+let ada = session.get::<User>(1_i64).await?.unwrap();
+ada.borrow_mut().active = false; // in-memory only, not yet written anywhere
+
+let ada_again = session.get::<User>(1_i64).await?.unwrap();
+assert!(Rc::ptr_eq(&ada, &ada_again));       // same object
+assert_eq!(ada_again.borrow().active, false); // sees the in-memory change
+
+let users = session.load_all::<User>(&Select::from(&User::table())).await?; // Vec<Rc<RefCell<User>>>
+// users[0] is `ada` again if its primary key was already cached, not a fresh decode.
+
+session.update(&*ada.borrow()); // queue the change; identity map doesn't auto-flush
+session.commit().await?;
+```
+
+`get::<T>` requires a `#[table(primary_key)]` field (it looks up by that column); `load_all::<T>` requires `T: Identifiable` for the same reason, since it needs each row's own primary key to key the cache. This is why `Session` isn't `Send` — it hands out `Rc`s, matching how SQLAlchemy's own `Session` is documented as single-thread/task use only. Deleting an entity doesn't evict it from the identity map; call `session.clear_identity_map()` (or start a new `Session`) for a clean slate.
 
 ### Relationships and eager loading
 
@@ -181,7 +204,7 @@ Each migration runs in its own transaction (its `up`/`down` statements plus the 
 
 ## Status
 
-This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), a unit-of-work `Session`, and versioned migrations. Still missing: an identity map/autoflush. Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), a unit-of-work `Session` with an identity map, and versioned migrations. Still missing: autoflush (the identity map doesn't see uncommitted writes, and deleting an entity doesn't evict it from the cache). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 ## Running tests
 
