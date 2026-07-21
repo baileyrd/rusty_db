@@ -8,11 +8,13 @@ description = "A database-agnostic query builder and connection abstraction, in 
 
 [dependencies]
 rusty-db-core.workspace = true
+rusty-db-derive = { workspace = true, optional = true }
 rusty-db-sqlite = { workspace = true, optional = true }
 rusty-db-postgres = { workspace = true, optional = true }
 
 [features]
 default = []
+derive = ["dep:rusty-db-derive"]
 sqlite = ["dep:rusty-db-sqlite"]
 postgres = ["dep:rusty-db-postgres"]
 

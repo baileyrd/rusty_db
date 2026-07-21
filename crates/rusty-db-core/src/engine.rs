@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::connection::{Connection, Driver};
 use crate::dialect::Dialect;
 use crate::error::Result;
+use crate::mapping::FromRow;
 use crate::query::ToSql;
 use crate::row::Row;
 use crate::value::Value;
@@ -54,6 +55,29 @@ impl Engine {
         let (sql, params) = query.to_sql(self.dialect());
         let mut conn = self.connect().await?;
         conn.execute(&sql, &params).await
+    }
+
+    /// Like `fetch_all`, decoding each row into a `#[derive(Mapped)]` type.
+    pub async fn fetch_all_as<T: FromRow>(&self, query: &dyn ToSql) -> Result<Vec<T>> {
+        self.fetch_all(query)
+            .await?
+            .iter()
+            .map(T::from_row)
+            .collect()
+    }
+
+    /// Like `fetch_optional`, decoding the row into a `#[derive(Mapped)]` type.
+    pub async fn fetch_optional_as<T: FromRow>(&self, query: &dyn ToSql) -> Result<Option<T>> {
+        self.fetch_optional(query)
+            .await?
+            .as_ref()
+            .map(T::from_row)
+            .transpose()
+    }
+
+    /// Like `fetch_one`, decoding the row into a `#[derive(Mapped)]` type.
+    pub async fn fetch_one_as<T: FromRow>(&self, query: &dyn ToSql) -> Result<T> {
+        T::from_row(&self.fetch_one(query).await?)
     }
 
     /// Check out a connection and issue `BEGIN` on it. Run statements

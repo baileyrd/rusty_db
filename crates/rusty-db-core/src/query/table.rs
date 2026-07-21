@@ -58,8 +58,22 @@ impl Column {
         )
     }
 
+    fn binop_col(&self, op: BinOp, other: &Column) -> Expr {
+        Expr::BinOp(
+            Box::new(Expr::Column(self.clone())),
+            op,
+            Box::new(Expr::Column(other.clone())),
+        )
+    }
+
     pub fn eq(&self, value: impl Into<Value>) -> Expr {
         self.binop(BinOp::Eq, value)
+    }
+
+    /// Compare this column against another column (e.g. a join condition:
+    /// `orders.col("user_id").eq_col(&users.col("id"))`).
+    pub fn eq_col(&self, other: &Column) -> Expr {
+        self.binop_col(BinOp::Eq, other)
     }
 
     pub fn ne(&self, value: impl Into<Value>) -> Expr {
