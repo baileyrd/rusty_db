@@ -575,6 +575,9 @@ macro_rules! bind_params {
                 // SQLite has no native NUMERIC/DECIMAL type either; bind
                 // its decimal text form, same as any other text value.
                 Value::Decimal(d) => query.bind(d.to_string()),
+                // SQLite has no native JSON type either; bind its text
+                // form, same as any other text value.
+                Value::Json(j) => query.bind(j.to_string()),
             };
         }
         query

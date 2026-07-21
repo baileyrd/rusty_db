@@ -285,7 +285,7 @@ engine.execute(&user.update()).await?;   // only generated when a field is #[tab
 engine.execute(&user.delete_query()).await?;
 ```
 
-Field types are limited to whatever `Value` already converts from (`bool`, `i64`, `i32`, `f64`, `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, and `Option<_>` of those) — there's no arbitrary custom-type support yet. A field additionally marked `#[table(version)]` (requires `#[table(primary_key)]` too) turns on optimistic locking — see below.
+Field types are limited to whatever `Value` already converts from (`bool`, `i64`, `i32`, `f64`, `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, `Json`, and `Option<_>` of those) — there's no arbitrary custom-type support yet. A field additionally marked `#[table(version)]` (requires `#[table(primary_key)]` too) turns on optimistic locking — see below.
 
 ### UUID values
 
@@ -330,6 +330,32 @@ engine.execute(&invoice.insert()).await?;
 ```
 
 Same split as `Uuid`: Postgres has a native `NUMERIC` type and round-trips this variant directly over its binary wire format (a `NUMERIC` column decodes as `Value::Decimal`, not `Value::Text`). MySQL/MariaDB sends `DECIMAL` as text on its own wire protocol, and SQLite has no such type at all (a `NUMERIC`-affinity column there decodes as whatever runtime type the stored value actually has) — `FromValue for BigDecimal` accepts `Value::Text`/`Value::I64`/`Value::F64` too (parsing or converting as needed), so a mapped struct's `BigDecimal` field round-trips correctly on every backend, just without Postgres's native wire format (and, via the `f64` fallback specifically, without arbitrary precision beyond what an `f64` itself preserves).
+
+### JSON values
+
+`Value::Json` (re-exported as `rusty_db::Json` — `serde_json`'s own `Value` type, renamed on the way out since `rusty_db` already has its own `Value`) rounds out the same treatment for `JSON`/`JSONB` columns:
+
+```rust
+#[derive(Mapped)]
+#[table(name = "events")]
+struct Event {
+    #[table(primary_key)]
+    id: i64,
+    name: String,
+    payload: Json,
+    metadata: Option<Json>,
+}
+
+let event = Event {
+    id: 1,
+    name: "signup".into(),
+    payload: serde_json::json!({"user_id": 42, "plan": "pro"}),
+    metadata: None,
+};
+engine.execute(&event.insert()).await?;
+```
+
+Postgres has native `JSON`/`JSONB` types and round-trips this variant directly over its binary wire format. SQLite has no JSON type at all (a JSON column there is really just `TEXT`), so it decodes a JSON column back as plain `Value::Text`. MySQL/MariaDB's own `JSON` type is a stranger case: it reports as one of MySQL's `BLOB`-family types at the wire-protocol level even though the bytes themselves are plain UTF-8 JSON text, so it decodes back as `Value::Bytes` instead of `Value::Text`. `FromValue for Json` parses both of those forms, so a mapped struct's `Json` field round-trips correctly on every backend, just without Postgres's native wire format on the other two.
 
 ### Session / unit of work
 
@@ -734,7 +760,7 @@ Unlike `Migrator::up`, which commits each migration independently, `session.migr
 
 ## Status
 
-This covers Core (query builder, connections, first-class `Uuid`/`BigDecimal` value types), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder, connections, first-class `Uuid`/`BigDecimal`/`Json` value types), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 `tests/concurrent_sessions.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover multiple `Session`s sharing one `Engine`/connection pool at the same time — `Session` is intentionally `!Send` (it hands out `Rc`s for the identity map), so these run via `tokio::task::LocalSet`/`spawn_local` rather than `tokio::spawn`, which is the standard way to get genuinely concurrent, interleaved execution of `!Send` futures on one thread. They cover independent commits landing correctly under a burst of concurrent sessions, one session's flushed-but-uncommitted write staying invisible to a concurrent reader on a separate connection (deterministically ordered via a `oneshot` channel, not timing), and two sessions never sharing identity-map state for the same row. Same skip-if-unreachable behavior as the Postgres/MySQL smoke tests; each test uses its own table to avoid colliding with other tests running concurrently against the same live server.
 
@@ -755,6 +781,8 @@ It also covers cascade rules (`delete_cascading`): deleting a user with `cascade
 `tests/uuid_value.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `Value::Uuid`/`Uuid`: a mapped struct's `Uuid` field (including an `Option<Uuid>` one) round-trips correctly on every backend, and — Postgres-only — a native `UUID` column decodes as `Value::Uuid` directly rather than `Value::Text`. Getting a `NULL` into a nullable `Uuid` column on Postgres surfaced a real, pre-existing bug unrelated to UUIDs specifically: binding a `NULL` parameter always declared it as an `int8` (`query.bind(None::<i64>)`), which Postgres's strict per-parameter type checking then rejected for a target column of any type without an implicit/assignment cast from `int8` (`UUID`, `BOOLEAN`, and `JSON` all reproduce it) — a bug that had simply never been hit yet, since no earlier test happened to insert an explicit `NULL` into one of those column types. Fixed at the query-builder level, not the driver: `Insert`/`Update`/`BulkInsert` now render a `Value::Null` assignment as the bare SQL literal `NULL` instead of a bound placeholder, sidestepping the type-declaration conflict entirely (and doing so for every dialect, not just Postgres, since a literal `NULL` has no type to conflict with anywhere).
 
 `tests/decimal_value.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `Value::Decimal`/`BigDecimal`: a mapped struct's `BigDecimal` field (including an `Option<BigDecimal>` one) round-trips correctly on every backend, and — Postgres-only — a native `NUMERIC` column decodes as `Value::Decimal` directly rather than `Value::Text`.
+
+`tests/json_value.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `Value::Json`/`Json`: a mapped struct's `Json` field (including an `Option<Json>` one) round-trips correctly on every backend, and — Postgres-only — a native `JSONB` column decodes as `Value::Json` directly rather than `Value::Text`. Getting this working on MySQL/MariaDB surfaced a real quirk: its `JSON` columns report as one of MySQL's own `BLOB`-family types at the wire-protocol level, so they decode as `Value::Bytes`, not `Value::Text` the way `DECIMAL`/`UUID`-as-text columns do elsewhere on that backend — `FromValue for Json` accepts that form too (via UTF-8 first, then JSON parsing), so a `Json` field round-trips there without the caller ever needing to know about the difference.
 
 `tests/query_timeout.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `with_timeout`: an operation finishing inside its timeout succeeds normally; a genuinely slow/blocked operation is cancelled and returns `Error::Timeout` instead of hanging; a cancelled operation leaves the pool usable afterward rather than stuck; a timeout on one call has no lingering effect on later calls; and aborting a task running a slow operation (`JoinHandle::abort`, the other standard way to cancel a Rust future) cancels it the same way a timeout would. The SQLite version gets a genuinely blocked (not simulated) query via real lock contention — holding SQLite's write lock on one connection while a second connection attempts a conflicting write, which sqlx's SQLite driver retries against its own 5-second `busy_timeout` rather than erroring immediately. The Postgres/MySQL versions use their real, built-in `pg_sleep()`/`SLEEP()` functions for a genuinely slow query instead.
 

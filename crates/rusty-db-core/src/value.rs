@@ -2,6 +2,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use bigdecimal::BigDecimal;
+use serde_json::Value as Json;
 use uuid::Uuid;
 
 /// A dynamically-typed value that can be bound as a query parameter or
@@ -39,6 +40,19 @@ pub enum Value {
     /// Postgres's native wire format (and, on SQLite/via `f64`, without
     /// arbitrary precision — only as much as an `f64` itself preserves).
     Decimal(BigDecimal),
+    /// A JSON value (a `JSON`/`JSONB` column), backed by `serde_json`'s own
+    /// `Value` type (re-exported as `rusty_db::Json` to avoid colliding
+    /// with this very type's name). Postgres has native `JSON`/`JSONB`
+    /// types and round-trips this variant directly. SQLite has no JSON
+    /// type at all (a JSON column there is really just `TEXT`), so it
+    /// decodes a JSON column back as `Value::Text`; MySQL/MariaDB's own
+    /// `JSON` type reports as one of its `BLOB`-family types at the
+    /// wire-protocol level (even though the bytes themselves are plain
+    /// UTF-8 JSON text), so it decodes back as `Value::Bytes` instead —
+    /// `FromValue for Json` parses both of those forms too, so a mapped
+    /// struct's `Json` field still round-trips correctly everywhere, just
+    /// without Postgres's native wire format.
+    Json(Json),
 }
 
 impl fmt::Display for Value {
@@ -52,6 +66,7 @@ impl fmt::Display for Value {
             Value::Bytes(b) => write!(f, "<{} bytes>", b.len()),
             Value::Uuid(u) => write!(f, "{u}"),
             Value::Decimal(d) => write!(f, "{d}"),
+            Value::Json(j) => write!(f, "{j}"),
         }
     }
 }
@@ -74,6 +89,7 @@ impl_from!(String, Text);
 impl_from!(Vec<u8>, Bytes);
 impl_from!(Uuid, Uuid);
 impl_from!(BigDecimal, Decimal);
+impl_from!(Json, Json);
 
 impl From<&str> for Value {
     fn from(v: &str) -> Self {
@@ -189,6 +205,32 @@ impl FromValue for BigDecimal {
                 BigDecimal::try_from(*f).map_err(|e| format!("invalid decimal from {f}: {e}"))
             }
             other => Err(format!("expected decimal, got {other}")),
+        }
+    }
+}
+
+impl FromValue for Json {
+    fn from_value(value: &Value) -> Result<Self, String> {
+        match value {
+            Value::Json(j) => Ok(j.clone()),
+            // SQLite has no JSON type of its own at all, so a JSON column
+            // there decodes as plain text; parse it rather than requiring
+            // the native `Value::Json` form only Postgres ever actually
+            // produces.
+            Value::Text(s) => {
+                serde_json::from_str(s).map_err(|e| format!("invalid JSON {s:?}: {e}"))
+            }
+            // MySQL/MariaDB's JSON columns report as one of its BLOB-family
+            // types at the wire-protocol level (despite the bytes
+            // themselves being plain UTF-8 JSON text), so they decode as
+            // `Value::Bytes` rather than `Value::Text` — parse the same
+            // way, just via UTF-8 first.
+            Value::Bytes(b) => std::str::from_utf8(b)
+                .map_err(|e| format!("invalid UTF-8 in JSON bytes: {e}"))
+                .and_then(|s| {
+                    serde_json::from_str(s).map_err(|e| format!("invalid JSON {s:?}: {e}"))
+                }),
+            other => Err(format!("expected json, got {other}")),
         }
     }
 }

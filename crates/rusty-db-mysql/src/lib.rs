@@ -428,6 +428,9 @@ macro_rules! bind_params {
                 // MySQL/MariaDB sends DECIMAL as text on its own wire
                 // protocol; bind its decimal text form directly.
                 Value::Decimal(d) => query.bind(d.to_string()),
+                // MySQL/MariaDB sends JSON as text on its own wire
+                // protocol; bind its text form directly.
+                Value::Json(j) => query.bind(j.to_string()),
             };
         }
         query

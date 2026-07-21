@@ -73,9 +73,9 @@
 //!
 //! Field types must implement `Into<Value>` on an owned clone (i.e. the set
 //! of types `Value` already converts from: `bool`, `i64`, `i32`, `f64`,
-//! `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, and `Option<_>` of those). A
-//! `#[table(version)]` field's type must also support `+ 1` (in practice,
-//! `i64`/`i32`).
+//! `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, `Json`, and `Option<_>` of
+//! those). A `#[table(version)]` field's type must also support `+ 1` (in
+//! practice, `i64`/`i32`).
 
 use heck::ToSnakeCase;
 use proc_macro::TokenStream;

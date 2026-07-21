@@ -393,8 +393,8 @@ fn row_from_postgres(row: &PgRow) -> Result<Row> {
             // These are all sent in Postgres's own binary wire formats, not
             // text (sqlx always requests binary result format), so each
             // needs its own typed decode; formatted to text afterward,
-            // since `Value` has no dedicated temporal/JSON variant (unlike
-            // `UUID`/`NUMERIC` below, which do).
+            // since `Value` has no dedicated temporal variant (unlike
+            // `UUID`/`NUMERIC`/`JSON` below, which do).
             "NUMERIC" => row
                 .try_get::<Option<BigDecimal>, _>(i)
                 .map_err(to_core_err)?
@@ -428,7 +428,7 @@ fn row_from_postgres(row: &PgRow) -> Result<Row> {
             "JSON" | "JSONB" => row
                 .try_get::<Option<JsonValue>, _>(i)
                 .map_err(to_core_err)?
-                .map(|v| Value::Text(v.to_string()))
+                .map(Value::Json)
                 .unwrap_or(Value::Null),
             // TEXT, VARCHAR, CHAR(N)/BPCHAR, NAME, citext, etc. all decode
             // fine as strings (these genuinely are sent as text).
@@ -457,6 +457,7 @@ macro_rules! bind_params {
                 Value::Bytes(b) => query.bind(b.clone()),
                 Value::Uuid(u) => query.bind(*u),
                 Value::Decimal(d) => query.bind(d.clone()),
+                Value::Json(j) => query.bind(j.clone()),
             };
         }
         query
