@@ -36,9 +36,9 @@ raw SQL into an otherwise builder-constructed query, `COUNT`/`SUM`/`AVG`/
 `MIN`/`MAX`/arbitrary expression `SELECT` columns via `SelectExpr`,
 `GROUP BY`/`HAVING`, `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` via
 `SetOperation`, `LOWER`/`UPPER`/concatenation/arithmetic/`CASE`/
-`COALESCE`/`CURRENT_TIMESTAMP`, and subqueries — `IN (subquery)`,
+`COALESCE`/`CURRENT_TIMESTAMP`, subqueries — `IN (subquery)`,
 correlated `EXISTS`, and scalar subqueries, though not yet a subquery in a
-`FROM` clause); first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
+`FROM` clause — and CTEs via `Cte`, including `WITH RECURSIVE`); first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
 `chrono`'s `NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`, and
 `Vec<T>` arrays (native on Postgres, JSON-flattened on MySQL/MariaDB and
 SQLite); `#[derive(Mapped)]` with one primary key, one version column, one
@@ -59,8 +59,6 @@ observability. See `README.md` for the full tour with examples.
 
 ## Query builder (Core-equivalent)
 
-- **CTEs (`WITH`, `WITH RECURSIVE`)** — no support; recursive CTEs in
-  particular have no workaround at all today. **L**
 - **Window functions** (`OVER (PARTITION BY ... ORDER BY ...)`, `ROW_NUMBER`,
   `RANK`, running totals) — absent. **L**
 
