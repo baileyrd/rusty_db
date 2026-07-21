@@ -42,7 +42,7 @@ pub mod prelude {
         with_timeout, AuditEntry, AuditOperation, BulkInsert, Column, ColumnInfo, DatabaseDump,
         Delete, Engine, Entity, Expr, FromRow, Identifiable, Insert, Join, JoinKind, Mapped,
         Migration, Migrator, PoolConfig, PoolStats, ReplicaSet, Row, Savepoint, Select, Session,
-        SessionQuery, Table, TableDump, TableSchema, ToSql, Update, Value,
+        SessionQuery, Table, TableDump, TableSchema, ToSql, Transaction, Update, Value,
     };
 
     // `Mapped` above is the trait (type namespace); this is the derive

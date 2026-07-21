@@ -428,6 +428,44 @@ impl Executor for MySqlConnection {
             .map_err(to_core_err)?;
         row.as_ref().map(row_from_mysql).transpose()
     }
+
+    // MariaDB/MySQL's `XA COMMIT`/`XA ROLLBACK` don't reliably resolve a
+    // transaction another connection prepared when sent through the
+    // prepared-statement (`COM_STMT_PREPARE`/`COM_STMT_EXECUTE`) protocol
+    // that `sqlx::query` always uses — observed directly against a real
+    // server: the exact same statement text fails with `XAE04: Unknown
+    // XID` over that protocol but succeeds immediately over plain text
+    // SQL. `sqlx::raw_sql` sends statements as plain text (the same wire
+    // format a `mysql` CLI session uses) and sidesteps it.
+    async fn execute_unprepared(&mut self, sql: &str) -> Result<u64> {
+        raw_execute(&mut self.conn, sql).await
+    }
 }
 
-impl Connection for MySqlConnection {}
+// A free function (rather than inlined into the `execute_unprepared` body
+// above) sidesteps a higher-ranked-lifetime inference issue that otherwise
+// shows up combining `#[async_trait]`'s boxed-future desugaring with
+// `sqlx::raw_sql(..).execute(..)`'s own generic-over-`Executor` signature
+// ("implementation of `sqlx::Executor` is not general enough").
+async fn raw_execute(conn: &mut sqlx::MySqlConnection, sql: &str) -> Result<u64> {
+    use sqlx::Executor as _;
+    let result = conn
+        .execute(sqlx::raw_sql(sql))
+        .await
+        .map_err(to_core_err)?;
+    Ok(result.rows_affected())
+}
+
+#[async_trait]
+impl Connection for MySqlConnection {
+    // After `XA PREPARE`, MariaDB/MySQL leaves the preparing session stuck
+    // — unable to run any further statement, even an unrelated one from an
+    // unrelated caller — until it resolves its own prepared transaction.
+    // Letting a connection in that state go back to the pool for reuse
+    // would break whoever gets it next, so `Transaction::prepare` closes
+    // the connection outright instead of just dropping it.
+    async fn close(self: Box<Self>) -> Result<()> {
+        let MySqlConnection { conn } = *self;
+        conn.close().await.map_err(to_core_err)
+    }
+}

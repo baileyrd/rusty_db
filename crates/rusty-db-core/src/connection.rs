@@ -29,12 +29,41 @@ pub trait Executor: Send {
             None => Err(crate::error::Error::RowNotFound),
         }
     }
+
+    /// Like `execute` with no parameters, but explicitly bypassing
+    /// whatever prepared-statement machinery the driver would otherwise
+    /// use — some administrative statements (MySQL/MariaDB's `XA ...`
+    /// transaction-control commands, specifically) don't reliably resolve
+    /// a transaction prepared on a different connection when sent through
+    /// a driver's binary/prepared-statement protocol, even though the
+    /// exact same statement text works when sent as plain text SQL.
+    ///
+    /// Defaults to `execute`, which is correct for every driver that
+    /// doesn't have this quirk; MySQL overrides it.
+    async fn execute_unprepared(&mut self, sql: &str) -> Result<u64> {
+        self.execute(sql, &[]).await
+    }
 }
 
 /// A single, live connection to a database. Driver crates implement this
 /// over their underlying client (e.g. an `sqlx::PoolConnection`).
 #[async_trait]
-pub trait Connection: Executor {}
+pub trait Connection: Executor {
+    /// Closes this connection outright instead of letting it be reused
+    /// (e.g. returned to a driver's connection pool on drop). Needed after
+    /// an operation that can leave the underlying session unusable for
+    /// anything else — currently: MySQL/MariaDB's `XA PREPARE`, after
+    /// which that session refuses any further statement at all (even an
+    /// unrelated one, from an unrelated caller who happens to be handed
+    /// the same connection back out of the pool) until it resolves its
+    /// own prepared transaction itself — exactly the resolution
+    /// two-phase commit defers to a possibly-different connection or
+    /// process. Defaults to a plain no-op (just drop the connection as
+    /// usual), which is correct for every driver without this quirk.
+    async fn close(self: Box<Self>) -> Result<()> {
+        Ok(())
+    }
+}
 
 /// A source of `Connection`s for one database plus the `Dialect` needed to
 /// render portable SQL for it. This is the trait object that lets rusty_db
