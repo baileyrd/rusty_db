@@ -10,8 +10,8 @@ use sqlx::{Column as _, MySql, MySqlPool, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::MySqlDialect;
 use rusty_db_core::{
-    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, Result, Row,
-    TableSchema, Value,
+    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, PoolMetrics,
+    PoolStats, Result, Row, TableSchema, Value,
 };
 
 static DIALECT: MySqlDialect = MySqlDialect;
@@ -19,6 +19,7 @@ static DIALECT: MySqlDialect = MySqlDialect;
 /// A `Driver` backed by a pooled MySQL/MariaDB connection (via `sqlx::MySqlPool`).
 pub struct MySqlDriver {
     pool: MySqlPool,
+    metrics: Arc<PoolMetrics>,
 }
 
 impl MySqlDriver {
@@ -28,7 +29,10 @@ impl MySqlDriver {
             .connect(url)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            metrics: Arc::new(PoolMetrics::new()),
+        })
     }
 
     /// Connect with explicit pool tuning (e.g. a constrained
@@ -43,7 +47,10 @@ impl MySqlDriver {
             .connect(url)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            metrics: Arc::new(PoolMetrics::new()),
+        })
     }
 
     /// Convenience: connect and wrap directly in an `Engine`.
@@ -62,16 +69,31 @@ impl MySqlDriver {
 #[async_trait]
 impl Driver for MySqlDriver {
     async fn connect(&self) -> Result<Box<dyn Connection>> {
+        let guard = self.metrics.track_acquire();
         let conn = self
             .pool
             .acquire()
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
+        guard.succeeded();
         Ok(Box::new(MySqlConnection { conn }))
     }
 
     fn dialect(&self) -> &dyn Dialect {
         &DIALECT
+    }
+
+    fn pool_stats(&self) -> PoolStats {
+        let idle = self.pool.num_idle() as u32;
+        let active = self.pool.size();
+        PoolStats {
+            max_connections: self.pool.options().get_max_connections(),
+            active,
+            idle,
+            in_use: active.saturating_sub(idle),
+            waiters: self.metrics.waiters(),
+            total_acquires: self.metrics.total_acquires(),
+        }
     }
 
     async fn list_tables(&self) -> Result<Vec<String>> {

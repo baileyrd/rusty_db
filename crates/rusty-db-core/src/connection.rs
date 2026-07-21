@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 
 use crate::error::{Error, Result};
+use crate::pool::PoolStats;
 use crate::row::Row;
 use crate::schema::TableSchema;
 use crate::value::Value;
@@ -65,5 +66,16 @@ pub trait Driver: Send + Sync {
         Err(Error::Unsupported(
             "schema introspection is not implemented for this driver".to_string(),
         ))
+    }
+
+    /// A snapshot of this driver's connection pool (see `PoolStats`).
+    ///
+    /// The default implementation reports all zeros, for a driver with no
+    /// real pool concept (e.g. a test double) rather than requiring every
+    /// `Driver` to implement it just to satisfy the trait. The real driver
+    /// crates (SQLite/Postgres/MySQL) override this using their own
+    /// `sqlx::Pool` plus a small amount of their own bookkeeping.
+    fn pool_stats(&self) -> PoolStats {
+        PoolStats::default()
     }
 }

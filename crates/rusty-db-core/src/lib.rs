@@ -36,7 +36,7 @@ pub use engine::{Engine, Transaction};
 pub use error::{Error, Result};
 pub use mapping::{Entity, FromRow, Identifiable, Mapped};
 pub use migration::{AppliedMigration, Migration, Migrator};
-pub use pool::PoolConfig;
+pub use pool::{PoolConfig, PoolMetrics, PoolStats};
 pub use query::{
     BulkInsert, Column, Delete, Expr, Insert, Join, JoinKind, Select, Table, ToSql, Update,
 };

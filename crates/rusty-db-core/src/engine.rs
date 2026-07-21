@@ -6,6 +6,7 @@ use crate::dialect::Dialect;
 use crate::error::Result;
 use crate::mapping::FromRow;
 use crate::migration::Migrator;
+use crate::pool::PoolStats;
 use crate::query::{Delete, Insert, Select, Table, ToSql};
 use crate::row::Row;
 use crate::schema::TableSchema;
@@ -116,6 +117,14 @@ impl Engine {
     /// implement this.
     pub async fn table_schema(&self, table: &str) -> Result<Option<TableSchema>> {
         self.driver.table_schema(table).await
+    }
+
+    /// A snapshot of the underlying connection pool: how many connections
+    /// are open, idle, and in use against `max_connections`, how many
+    /// callers are waiting on one right now, and how many acquires have
+    /// ever succeeded. See `PoolStats`.
+    pub fn pool_stats(&self) -> PoolStats {
+        self.driver.pool_stats()
     }
 
     /// A logical backup: every row of every table this database has

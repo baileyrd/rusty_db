@@ -68,6 +68,18 @@ let engine = SqliteDriver::engine_with("sqlite://app.db?mode=rwc", config).await
 
 Once `max_connections` connections are checked out, a further `engine.connect()` (or anything that needs a connection, like `Session::flush`) just waits for one to free up — or, with `acquire_timeout` set, gives up and returns an error after that long instead of waiting indefinitely.
 
+`engine.pool_stats()` gives a live snapshot instead of inferring saturation from `acquire_timeout` errors after the fact — how many connections are open against `max_connections`, how many are idle vs. actually in use, how many callers are blocked waiting for one right now, and how many acquires have ever succeeded:
+
+```rust
+let stats = engine.pool_stats();
+println!(
+    "{}/{} connections in use, {} waiting",
+    stats.in_use, stats.max_connections, stats.waiters
+);
+```
+
+This is a read-only view of the underlying pool — `active`/`idle`/`in_use` and `max_connections` cost nothing extra to compute (they're already tracked by the pool itself); `waiters` and `total_acquires` are the two things it doesn't expose on its own, so each driver keeps a small `PoolMetrics` counter alongside its pool for those.
+
 ### Encrypted connections (TLS)
 
 Postgres and MySQL/MariaDB connections can be encrypted; there's no `rusty_db`-specific API for this — `connect`/`engine`/`connect_with` all just hand the connection URL straight through to `sqlx`, and TLS is controlled entirely by standard URL query parameters `sqlx`'s own Postgres/MySQL drivers already understand (backed by `tls-rustls`):
@@ -420,6 +432,8 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 `tests/bulk_insert.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — the round-trip and rollback tests, since `BulkInsert::combine`'s own rendering/validation is pure query-builder logic that doesn't need a live server to re-prove per driver) cover `BulkInsert`/`Session::add_all`: combining several `Insert`s renders one statement with one `VALUES` group per row; combining zero inserts yields `None` rather than an invalid empty statement; combining `Insert`s from different tables is rejected; `add_all` queues exactly one pending write for the whole slice (not one per entity) and an empty slice is a no-op; a failing bulk insert (a duplicate primary key partway through) rolls back the entire batch, including rows that would've inserted fine on their own; and a `BulkInsert` works standalone through `engine.execute()`, without a `Session` at all.
 
 `tests/soft_delete.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests that most directly exercise the feature end to end, since the query-builder-level `not_deleted_filter`/`load_active` coverage and the plain-type-is-unaffected case don't need re-proving per driver) cover `#[table(soft_delete)]`: `Session::delete` marks the row (`SET <column> = true`) instead of removing it; `Session::get` treats an already-marked row the same as one that was never there, including from a fresh `Session` with no identity-map cache from before the delete; `Mapped::not_deleted_filter()` and `Session::load_active` both exclude marked rows from query results; calling an entity's own `delete_query()` directly still issues a real, unmarked `DELETE`; and a type with no `#[table(soft_delete)]` field keeps `Session::delete`'s pre-existing behavior of a genuine hard delete, proving the feature is fully opt-in.
+
+`tests/pool_stats.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests proving `pool_stats()` against a real network-backed pool, since the pure counting behavior doesn't need re-proving per driver) cover `Engine::pool_stats()`: checking out a connection is reflected immediately (`in_use` up, `total_acquires` up), and releasing it moves it back to `idle` without touching `total_acquires`; the counter keeps accumulating across repeated checkouts rather than just tracking the current one; and `waiters` goes to `1` while a second acquire is genuinely blocked behind a pool of size one, then back to `0` once it unblocks. Discovering the exact numbers to assert here surfaced two things worth knowing about sqlx's own pool: it eagerly opens (and keeps, idle) one connection up front to validate the URL when the pool is first constructed, so a "fresh" pool already reports that one as active/idle even though `total_acquires` correctly stays `0` (that startup connection never went through `Driver::connect`); and releasing a connection back to the pool isn't synchronous inside `drop` — the tests give it a brief moment (`tokio::time::sleep`) before reading the snapshot back, the same pattern already used elsewhere in this suite for other not-quite-synchronous async cleanup. `waiters`/`total_acquires` are the two numbers sqlx doesn't expose on its own, so each driver keeps a small `PoolMetrics` (a couple of atomics behind an `Arc`) alongside its pool for just those two; every other `PoolStats` field is a zero-cost read of the pool itself.
 
 ## Running tests
 
