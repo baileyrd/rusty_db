@@ -23,7 +23,7 @@
 //! ```
 //!
 //! generates:
-//! - `impl Mapped for User` (`TABLE_NAME`, `COLUMNS`, `PRIMARY_KEY`)
+//! - `impl Mapped for User` (`TABLE_NAME`, `COLUMNS`, `PRIMARY_KEY`, `VERSION_COLUMN`)
 //! - `impl FromRow for User` (decodes a `Row` by column name)
 //! - `impl Entity for User` (so `Session::add` can queue it generically)
 //! - `User::table() -> Table`
@@ -39,9 +39,19 @@
 //!   = "...")]` attribute, batch-loading the referenced `Parent` rows for a
 //!   slice of `Self` (see `rusty_db_core::relations::load_one`)
 //!
+//! A field additionally marked `#[table(version)]` (requires
+//! `#[table(primary_key)]` too) turns on optimistic locking: `update`'s
+//! `WHERE` clause also requires that column to still match this struct's
+//! own value (and its `SET` clause increments it), and the same column is
+//! added to `delete_query`'s `WHERE` clause unchanged. See
+//! `Session::update`/`delete`, which turn a resulting zero-rows-affected
+//! outcome into `Error::Conflict` — someone else changed or deleted the
+//! row since this struct was loaded.
+//!
 //! Field types must implement `Into<Value>` on an owned clone (i.e. the set
 //! of types `Value` already converts from: `bool`, `i64`, `i32`, `f64`,
-//! `String`, `Vec<u8>`, and `Option<_>` of those).
+//! `String`, `Vec<u8>`, and `Option<_>` of those). A `#[table(version)]`
+//! field's type must also support `+ 1` (in practice, `i64`/`i32`).
 
 use heck::ToSnakeCase;
 use proc_macro::TokenStream;
@@ -63,6 +73,7 @@ struct FieldInfo {
     ty: syn::Type,
     column: String,
     primary_key: bool,
+    version: bool,
 }
 
 /// The shared shape of `#[has_many(Target, foreign_key = "...")]` and
@@ -136,6 +147,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         let ident = field.ident.clone().expect("named field");
         let mut column = ident.to_string();
         let mut primary_key = false;
+        let mut version = false;
 
         for attr in &field.attrs {
             if !attr.path().is_ident("table") {
@@ -149,9 +161,12 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 } else if meta.path.is_ident("primary_key") {
                     primary_key = true;
                     Ok(())
+                } else if meta.path.is_ident("version") {
+                    version = true;
+                    Ok(())
                 } else {
                     Err(meta.error(
-                        "unsupported #[table(...)] field attribute; expected `column = \"...\"` or `primary_key`",
+                        "unsupported #[table(...)] field attribute; expected `column = \"...\"`, `primary_key`, or `version`",
                     ))
                 }
             })?;
@@ -162,6 +177,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             ty: field.ty.clone(),
             column,
             primary_key,
+            version,
         });
     }
 
@@ -173,6 +189,21 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         ));
     }
     let primary_key = primary_keys.into_iter().next();
+
+    let version_fields: Vec<&FieldInfo> = fields.iter().filter(|f| f.version).collect();
+    if version_fields.len() > 1 {
+        return Err(syn::Error::new_spanned(
+            struct_ident,
+            "at most one field may be marked #[table(version)]",
+        ));
+    }
+    let version_field = version_fields.into_iter().next();
+    if version_field.is_some() && primary_key.is_none() {
+        return Err(syn::Error::new_spanned(
+            struct_ident,
+            "#[table(version)] requires a #[table(primary_key)] field too",
+        ));
+    }
 
     let core = core_crate_path();
 
@@ -196,6 +227,14 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         None => quote! { ::std::option::Option::None },
     };
 
+    let version_column_const = match version_field {
+        Some(f) => {
+            let column = &f.column;
+            quote! { ::std::option::Option::Some(#column) }
+        }
+        None => quote! { ::std::option::Option::None },
+    };
+
     let update_and_delete = match primary_key {
         Some(pk) => {
             let pk_ident = &pk.ident;
@@ -203,21 +242,48 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             let set_calls = fields.iter().filter(|f| !f.primary_key).map(|f| {
                 let ident = &f.ident;
                 let column = &f.column;
-                quote! { .set(#column, ::std::clone::Clone::clone(&self.#ident)) }
+                if f.version {
+                    // The stored value becomes one more than what this
+                    // struct was loaded with — the `WHERE` clause below
+                    // makes that a no-op unless the row still has the old
+                    // version, i.e. nobody else has changed it since.
+                    quote! { .set(#column, ::std::clone::Clone::clone(&self.#ident) + 1) }
+                } else {
+                    quote! { .set(#column, ::std::clone::Clone::clone(&self.#ident)) }
+                }
             });
+
+            let filter_expr = match version_field {
+                Some(vf) => {
+                    let v_ident = &vf.ident;
+                    let v_column = &vf.column;
+                    quote! {
+                        Self::table().col(#pk_column).eq(::std::clone::Clone::clone(&self.#pk_ident))
+                            .and(Self::table().col(#v_column).eq(::std::clone::Clone::clone(&self.#v_ident)))
+                    }
+                }
+                None => quote! {
+                    Self::table().col(#pk_column).eq(::std::clone::Clone::clone(&self.#pk_ident))
+                },
+            };
+
             quote! {
                 impl #struct_ident {
-                    /// `UPDATE <table> SET <every non-primary-key field> WHERE <primary key> = self.<primary key>`.
+                    /// `UPDATE <table> SET <every non-primary-key field> WHERE <primary key> = self.<primary key>`
+                    /// (and, with `#[table(version)]`, `AND <version> = self.<version>`, incrementing the
+                    /// stored version — see `Session::update`, which turns a resulting zero-rows-affected
+                    /// into `Error::Conflict`).
                     pub fn update(&self) -> #core::Update {
                         #core::Update::table(&Self::table())
                             #(#set_calls)*
-                            .filter(Self::table().col(#pk_column).eq(::std::clone::Clone::clone(&self.#pk_ident)))
+                            .filter(#filter_expr)
                     }
 
-                    /// `DELETE FROM <table> WHERE <primary key> = self.<primary key>`.
+                    /// `DELETE FROM <table> WHERE <primary key> = self.<primary key>`
+                    /// (and, with `#[table(version)]`, `AND <version> = self.<version>`).
                     pub fn delete_query(&self) -> #core::Delete {
                         #core::Delete::from(&Self::table())
-                            .filter(Self::table().col(#pk_column).eq(::std::clone::Clone::clone(&self.#pk_ident)))
+                            .filter(#filter_expr)
                     }
 
                     /// The value of the `#[table(primary_key)]` field.
@@ -259,6 +325,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             const TABLE_NAME: &'static str = #table_name;
             const COLUMNS: &'static [&'static str] = &[#(#column_lits),*];
             const PRIMARY_KEY: ::std::option::Option<&'static str> = #primary_key_const;
+            const VERSION_COLUMN: ::std::option::Option<&'static str> = #version_column_const;
         }
 
         impl #core::FromRow for #struct_ident {

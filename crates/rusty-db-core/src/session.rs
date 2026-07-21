@@ -11,13 +11,19 @@ use crate::migration::{self, Migration};
 use crate::query::{Insert, Select, Table, ToSql};
 use crate::value::Value;
 
-/// One write queued by `add`/`update`/`delete`, tagged with what it's
-/// for (used only when audit logging is enabled) alongside the rendered
-/// `Insert`/`Update`/`Delete` itself.
+/// One write queued by `add`/`update`/`delete`, tagged with what it's for
+/// (used when audit logging is enabled) alongside the rendered
+/// `Insert`/`Update`/`Delete` itself. `requires_row_affected` is set for
+/// an optimistic-locked `update`/`delete` (a type with
+/// `Mapped::VERSION_COLUMN`), whose `WHERE` clause already encodes "only
+/// if the version still matches" — `flush` turns a resulting
+/// zero-rows-affected outcome into `Error::Conflict` instead of treating
+/// it as a silent no-op.
 struct PendingWrite {
     table: &'static str,
     operation: AuditOperation,
     query: Box<dyn ToSql + Send>,
+    requires_row_affected: bool,
 }
 
 /// A unit of work: queues writes made through `add`/`update`/`delete`, and
@@ -109,21 +115,35 @@ impl Session {
             table: T::TABLE_NAME,
             operation: AuditOperation::Insert,
             query: Box::new(entity.insert()),
+            requires_row_affected: false,
         });
     }
 
     /// Queue an update for `entity`; not sent until the next flush.
+    ///
+    /// If `T` has a `#[table(version)]` field (optimistic locking),
+    /// `flush` errors with `Error::Conflict` instead of silently doing
+    /// nothing when this update's `WHERE <primary key> = ... AND
+    /// <version> = ...` matches no row — meaning either the row is gone
+    /// or, more likely, someone else has already changed it since `entity`
+    /// was loaded.
     pub fn update<T: Identifiable>(&mut self, entity: &T) {
         self.pending.push(PendingWrite {
             table: T::TABLE_NAME,
             operation: AuditOperation::Update,
             query: Box::new(entity.update()),
+            requires_row_affected: T::VERSION_COLUMN.is_some(),
         });
     }
 
     /// Queue a delete for `entity` (not sent until the next flush), and
     /// evict it from the identity map immediately, so `get`/`load_all`
     /// can't hand back a stale cached instance for its primary key.
+    ///
+    /// Same optimistic-locking behavior as `update`: with a
+    /// `#[table(version)]` field, a delete that matches no row (version
+    /// mismatch, or already gone) errors with `Error::Conflict` rather
+    /// than succeeding silently.
     pub fn delete<T: Identifiable + 'static>(&mut self, entity: &T) {
         let key = (TypeId::of::<T>(), entity.primary_key_value().to_string());
         self.identity_map.remove(&key);
@@ -131,6 +151,7 @@ impl Session {
             table: T::TABLE_NAME,
             operation: AuditOperation::Delete,
             query: Box::new(entity.delete_query()),
+            requires_row_affected: T::VERSION_COLUMN.is_some(),
         });
     }
 
@@ -150,13 +171,19 @@ impl Session {
             return Ok(());
         }
 
-        let rendered: Vec<(&'static str, AuditOperation, String, Vec<Value>)> = {
+        let rendered: Vec<(&'static str, AuditOperation, String, Vec<Value>, bool)> = {
             let dialect = self.engine.dialect();
             self.pending
                 .iter()
                 .map(|write| {
                     let (sql, params) = write.query.to_sql(dialect);
-                    (write.table, write.operation, sql, params)
+                    (
+                        write.table,
+                        write.operation,
+                        sql,
+                        params,
+                        write.requires_row_affected,
+                    )
                 })
                 .collect()
         };
@@ -169,8 +196,17 @@ impl Session {
             self.ensure_audit_table().await?;
         }
 
-        for (table, operation, sql, params) in &rendered {
-            self.execute_or_rollback(sql, params).await?;
+        for (table, operation, sql, params, requires_row_affected) in &rendered {
+            let affected = self.execute_or_rollback(sql, params).await?;
+            if *requires_row_affected && affected == 0 {
+                if let Some(txn) = self.txn.take() {
+                    let _ = txn.rollback().await;
+                }
+                return Err(Error::Conflict(format!(
+                    "no row in {table:?} matched the expected primary key and version — \
+                     it was likely changed or deleted since this instance was loaded"
+                )));
+            }
 
             if self.audit_enabled {
                 let audit_table = Table::new(self.audit_table);
@@ -192,21 +228,25 @@ impl Session {
     /// Runs one statement through the open transaction, rolling the whole
     /// transaction back and returning the error if it fails — the shared
     /// all-or-nothing behavior every write in `flush` (the real write and,
-    /// when enabled, its audit-log entry) has.
-    async fn execute_or_rollback(&mut self, sql: &str, params: &[Value]) -> Result<()> {
+    /// when enabled, its audit-log entry) has. Returns the number of rows
+    /// affected, so callers can detect e.g. an optimistic-locked update
+    /// that matched no row.
+    async fn execute_or_rollback(&mut self, sql: &str, params: &[Value]) -> Result<u64> {
         let result = self
             .txn
             .as_mut()
             .expect("transaction just opened by flush")
             .execute(sql, params)
             .await;
-        if let Err(err) = result {
-            if let Some(txn) = self.txn.take() {
-                let _ = txn.rollback().await;
+        match result {
+            Ok(affected) => Ok(affected),
+            Err(err) => {
+                if let Some(txn) = self.txn.take() {
+                    let _ = txn.rollback().await;
+                }
+                Err(err)
             }
-            return Err(err);
         }
-        Ok(())
     }
 
     async fn ensure_audit_table(&mut self) -> Result<()> {
@@ -215,7 +255,8 @@ impl Session {
         }
         let quoted = self.engine.dialect().quote_ident(self.audit_table);
         self.execute_or_rollback(&audit::table_ddl(&quoted), &[])
-            .await
+            .await?;
+        Ok(())
     }
 
     /// Reads back this session's audit log (autoflushing first, and
