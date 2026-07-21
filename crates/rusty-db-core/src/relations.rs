@@ -87,6 +87,64 @@ where
     Ok(by_key)
 }
 
+/// Many-to-many eager load: given the primary keys of a batch of
+/// already-fetched parents, fetch every `Target` row joined to one of them
+/// through `through_table` (a join table with `local_key_column`
+/// referencing the parent and `foreign_key_column` referencing
+/// `target_key_column` on `Target`) in a single query, grouped by the
+/// parent key.
+///
+/// Only `local_key_column` and `Target`'s own columns are ever selected —
+/// nothing else from `through_table` — so the two can't collide unless
+/// `Target` happens to have its own column named the same as
+/// `local_key_column`.
+pub async fn load_many_to_many<Target, PK>(
+    engine: &Engine,
+    parent_keys: impl IntoIterator<Item = PK>,
+    through_table: &str,
+    local_key_column: &str,
+    foreign_key_column: &str,
+    target_key_column: &str,
+) -> Result<HashMap<PK, Vec<Target>>>
+where
+    Target: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash,
+{
+    let keys: Vec<PK> = parent_keys.into_iter().collect();
+    let mut grouped: HashMap<PK, Vec<Target>> = HashMap::new();
+    if keys.is_empty() {
+        return Ok(grouped);
+    }
+
+    let target = Table::new(Target::TABLE_NAME);
+    let through = Table::new(through_table);
+
+    let mut select_columns = vec![through.col(local_key_column)];
+    select_columns.extend(Target::COLUMNS.iter().map(|c| target.col(*c)));
+
+    let query = Select::from(&target)
+        .join(
+            &through,
+            target
+                .col(target_key_column)
+                .eq_col(&through.col(foreign_key_column)),
+        )
+        .columns(select_columns)
+        .filter(
+            through
+                .col(local_key_column)
+                .is_in(keys.into_iter().map(Into::into)),
+        );
+
+    for row in engine.fetch_all(&query).await? {
+        let key: PK = row.get_by_name(local_key_column)?;
+        let target_row = Target::from_row(&row)?;
+        grouped.entry(key).or_default().push(target_row);
+    }
+
+    Ok(grouped)
+}
+
 /// Belongs-to (many-to-one) eager load: given the foreign key values of a
 /// batch of already-fetched children, fetch every distinct `Parent` row
 /// they reference in a single query, keyed by `parent_key_column`.
