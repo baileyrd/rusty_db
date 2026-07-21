@@ -1,5 +1,7 @@
 use std::fmt;
+use std::str::FromStr;
 
+use bigdecimal::BigDecimal;
 use uuid::Uuid;
 
 /// A dynamically-typed value that can be bound as a query parameter or
@@ -26,6 +28,17 @@ pub enum Value {
     /// text form too, so a mapped struct's `Uuid` field still round-trips
     /// correctly everywhere, just without Postgres's native wire format.
     Uuid(Uuid),
+    /// An arbitrary-precision decimal (a `NUMERIC`/`DECIMAL` column).
+    /// Postgres has a native `NUMERIC` type and round-trips this variant
+    /// directly; MySQL/MariaDB sends `DECIMAL` as text on its own wire
+    /// protocol, and SQLite has no such type at all (a `NUMERIC`-affinity
+    /// column there decodes as whatever runtime type the stored value
+    /// actually has) — `FromValue for BigDecimal` accepts `Value::Text`/
+    /// `Value::I64`/`Value::F64` too, so a mapped struct's `BigDecimal`
+    /// field still round-trips correctly everywhere, just without
+    /// Postgres's native wire format (and, on SQLite/via `f64`, without
+    /// arbitrary precision — only as much as an `f64` itself preserves).
+    Decimal(BigDecimal),
 }
 
 impl fmt::Display for Value {
@@ -38,6 +51,7 @@ impl fmt::Display for Value {
             Value::Text(s) => write!(f, "{s:?}"),
             Value::Bytes(b) => write!(f, "<{} bytes>", b.len()),
             Value::Uuid(u) => write!(f, "{u}"),
+            Value::Decimal(d) => write!(f, "{d}"),
         }
     }
 }
@@ -59,6 +73,7 @@ impl_from!(f64, F64);
 impl_from!(String, Text);
 impl_from!(Vec<u8>, Bytes);
 impl_from!(Uuid, Uuid);
+impl_from!(BigDecimal, Decimal);
 
 impl From<&str> for Value {
     fn from(v: &str) -> Self {
@@ -152,6 +167,28 @@ impl FromValue for Uuid {
             // ever actually produces.
             Value::Text(s) => Uuid::parse_str(s).map_err(|e| format!("invalid UUID {s:?}: {e}")),
             other => Err(format!("expected uuid, got {other}")),
+        }
+    }
+}
+
+impl FromValue for BigDecimal {
+    fn from_value(value: &Value) -> Result<Self, String> {
+        match value {
+            Value::Decimal(d) => Ok(d.clone()),
+            // MySQL/MariaDB sends DECIMAL as text, and SQLite has no
+            // NUMERIC type of its own at all, so a decimal column on
+            // either can decode as text or as a plain number depending on
+            // how the value was actually stored — accept all three rather
+            // than requiring the native `Value::Decimal` form only
+            // Postgres ever actually produces.
+            Value::Text(s) => {
+                BigDecimal::from_str(s).map_err(|e| format!("invalid decimal {s:?}: {e}"))
+            }
+            Value::I64(i) => Ok(BigDecimal::from(*i)),
+            Value::F64(f) => {
+                BigDecimal::try_from(*f).map_err(|e| format!("invalid decimal from {f}: {e}"))
+            }
+            other => Err(format!("expected decimal, got {other}")),
         }
     }
 }

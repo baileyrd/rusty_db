@@ -32,3 +32,4 @@ proc-macro2 = "1"
 heck = "0.5"
 proc-macro-crate = "3"
 uuid = { version = "1", features = ["v4"] }
+bigdecimal = "0.4"

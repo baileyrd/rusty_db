@@ -53,3 +53,8 @@ pub use value::{FromValue, Value};
 /// depending on the `uuid` crate directly — this is exactly the type
 /// `Value::Uuid` wraps, so the versions can never mismatch.
 pub use uuid::Uuid;
+
+/// Re-exported so a `#[derive(Mapped)]` field can be typed `BigDecimal`
+/// without depending on the `bigdecimal` crate directly — this is exactly
+/// the type `Value::Decimal` wraps, so the versions can never mismatch.
+pub use bigdecimal::BigDecimal;
