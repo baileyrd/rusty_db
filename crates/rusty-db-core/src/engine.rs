@@ -6,6 +6,7 @@ use crate::error::Result;
 use crate::mapping::FromRow;
 use crate::query::ToSql;
 use crate::row::Row;
+use crate::session::Session;
 use crate::value::Value;
 
 /// The single entry point applications use: wraps a `Driver` (Postgres,
@@ -87,6 +88,11 @@ impl Engine {
         let mut conn = self.connect().await?;
         conn.execute("BEGIN", &[]).await?;
         Ok(Transaction { conn: Some(conn) })
+    }
+
+    /// A unit-of-work session backed by this engine (see `Session`).
+    pub fn session(&self) -> Session {
+        Session::new(self.clone())
     }
 }
 

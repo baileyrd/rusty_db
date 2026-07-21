@@ -94,9 +94,29 @@ engine.execute(&user.delete_query()).await?;
 
 Field types are limited to whatever `Value` already converts from (`bool`, `i64`, `i32`, `f64`, `String`, `Vec<u8>`, and `Option<_>` of those) — there's no arbitrary custom-type support yet.
 
+### Session / unit of work
+
+`Engine::session()` (or `Session::new(engine)`) gives you a unit of work: queue writes with `add`/`update`/`delete` (available for any `#[derive(Mapped)]` type — `add` needs the `Entity` impl every mapped type gets, `update`/`delete` need `Identifiable`, which requires a `#[table(primary_key)]` field), then flush them all in a single transaction with `commit()`:
+
+```rust
+let mut session = engine.session();
+
+session.add(&User { id: 1, name: "ada".into(), active: true });
+session.add(&User { id: 2, name: "grace".into(), active: true });
+session.commit().await?; // both inserts run in one transaction
+
+let mut ada = /* ...fetched via engine.fetch_one_as::<User>(...)... */;
+ada.active = false;
+session.update(&ada);
+session.delete(&some_other_user);
+session.commit().await?; // update + delete, atomically
+```
+
+If any statement in the batch fails, `commit()` rolls back the whole transaction and leaves the queue untouched, so you can fix the problem and call `commit()` again. This is a unit-of-work, not a full ORM session: there's no identity map and no autoflush, so reads (`engine.fetch_all_as`, etc.) never see writes that are queued but not yet committed — always `commit()` before reading anything you just wrote through a `Session`.
+
 ## Status
 
-This covers Core (query builder, connections) plus a thin mapping layer (`#[derive(Mapped)]`, joins). Still missing: a real session/unit-of-work layer, relationships/eager-loading, and migrations. Postgres and SQLite are the only drivers; both are implemented but only SQLite is exercised by the test suite in this environment (no live Postgres server available here).
+This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins), and a unit-of-work `Session`. Still missing: an identity map/autoflush, relationships/eager-loading, and migrations. Postgres and SQLite are the only drivers; both are implemented but only SQLite is exercised by the test suite in this environment (no live Postgres server available here).
 
 ## Running tests
 

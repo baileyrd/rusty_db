@@ -36,8 +36,8 @@ pub use rusty_db_postgres as postgres;
 /// Re-exports the pieces most programs need in scope.
 pub mod prelude {
     pub use rusty_db_core::{
-        Column, Delete, Engine, Expr, FromRow, Insert, Join, JoinKind, Mapped, Row, Select, Table,
-        ToSql, Update, Value,
+        Column, Delete, Engine, Entity, Expr, FromRow, Identifiable, Insert, Join, JoinKind,
+        Mapped, Row, Select, Session, Table, ToSql, Update, Value,
     };
 
     // `Mapped` above is the trait (type namespace); this is the derive
