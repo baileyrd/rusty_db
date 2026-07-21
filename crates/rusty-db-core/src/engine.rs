@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
+use crate::backup::{DatabaseDump, TableDump};
 use crate::connection::{Connection, Driver};
 use crate::dialect::Dialect;
 use crate::error::Result;
 use crate::mapping::FromRow;
 use crate::migration::Migrator;
-use crate::query::ToSql;
+use crate::query::{Delete, Insert, Select, Table, ToSql};
 use crate::row::Row;
 use crate::schema::TableSchema;
 use crate::session::Session;
@@ -115,6 +116,87 @@ impl Engine {
     /// implement this.
     pub async fn table_schema(&self, table: &str) -> Result<Option<TableSchema>> {
         self.driver.table_schema(table).await
+    }
+
+    /// A logical backup: every row of every table this database has
+    /// (per `list_tables`), captured as plain data. See `DatabaseDump`
+    /// for what this can and can't do.
+    pub async fn backup(&self) -> Result<DatabaseDump> {
+        let tables = self.list_tables().await?;
+        let table_refs: Vec<&str> = tables.iter().map(String::as_str).collect();
+        self.backup_tables(&table_refs).await
+    }
+
+    /// Like `backup`, but only for the named tables — useful when you
+    /// don't want (or, e.g. in a test sharing a live server with other
+    /// work, can't safely risk) a `restore` touching every table in the
+    /// database.
+    pub async fn backup_tables(&self, tables: &[&str]) -> Result<DatabaseDump> {
+        let mut dumped = Vec::with_capacity(tables.len());
+
+        for &name in tables {
+            let schema = self.table_schema(name).await?.ok_or_else(|| {
+                crate::error::Error::Database(format!("table {name:?} does not exist"))
+            })?;
+            let columns: Vec<String> = schema.columns.into_iter().map(|c| c.name).collect();
+
+            let table = Table::new(name);
+            let raw_rows = self.fetch_all(&Select::from(&table)).await?;
+            let rows = raw_rows
+                .iter()
+                .map(|row| {
+                    (0..columns.len())
+                        .map(|i| row.value(i).cloned().unwrap_or(Value::Null))
+                        .collect()
+                })
+                .collect();
+
+            dumped.push(TableDump {
+                table: name.to_string(),
+                columns,
+                rows,
+            });
+        }
+
+        Ok(DatabaseDump { tables: dumped })
+    }
+
+    /// Restores a `DatabaseDump`, replacing whatever is currently in each
+    /// dumped table: every row is deleted, then every dumped row is
+    /// re-inserted, all inside one transaction — a failure partway
+    /// through rolls the whole restore back, leaving the database exactly
+    /// as it was before `restore` was called.
+    pub async fn restore(&self, dump: &DatabaseDump) -> Result<()> {
+        let mut txn = self.begin().await?;
+
+        for table_dump in &dump.tables {
+            let table = Table::new(&table_dump.table);
+
+            if let Err(err) = txn
+                .execute_query(&Delete::from(&table), self.dialect())
+                .await
+            {
+                txn.rollback().await?;
+                return Err(err);
+            }
+
+            for row in &table_dump.rows {
+                let insert = table_dump
+                    .columns
+                    .iter()
+                    .zip(row.iter())
+                    .fold(Insert::into_table(&table), |insert, (column, value)| {
+                        insert.value(column.clone(), value.clone())
+                    });
+
+                if let Err(err) = txn.execute_query(&insert, self.dialect()).await {
+                    txn.rollback().await?;
+                    return Err(err);
+                }
+            }
+        }
+
+        txn.commit().await
     }
 }
 
