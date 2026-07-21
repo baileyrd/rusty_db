@@ -3,11 +3,22 @@
 //! ```ignore
 //! #[derive(Mapped)]
 //! #[table(name = "users")]
+//! #[has_many(Order, foreign_key = "user_id")]
 //! struct User {
 //!     #[table(primary_key)]
 //!     id: i64,
 //!     name: String,
 //!     active: bool,
+//! }
+//!
+//! #[derive(Mapped)]
+//! #[table(name = "orders")]
+//! #[belongs_to(User, foreign_key = "user_id")]
+//! struct Order {
+//!     #[table(primary_key)]
+//!     id: i64,
+//!     user_id: i64,
+//!     amount: i64,
 //! }
 //! ```
 //!
@@ -21,6 +32,12 @@
 //!   and `impl Identifiable for User` (so `Session::update`/`delete` can
 //!   queue it generically), only when a field is marked
 //!   `#[table(primary_key)]`
+//! - one `load_<child>s` async method per `#[has_many(Child, foreign_key =
+//!   "...")]` attribute, batch-loading `Child` rows for a slice of `Self`
+//!   (see `rusty_db_core::relations::load_many`)
+//! - one `load_<parent>` async method per `#[belongs_to(Parent, foreign_key
+//!   = "...")]` attribute, batch-loading the referenced `Parent` rows for a
+//!   slice of `Self` (see `rusty_db_core::relations::load_one`)
 //!
 //! Field types must implement `Into<Value>` on an owned clone (i.e. the set
 //! of types `Value` already converts from: `bool`, `i64`, `i32`, `f64`,
@@ -29,10 +46,11 @@
 use heck::ToSnakeCase;
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
-use quote::quote;
-use syn::{parse_macro_input, Data, DeriveInput, Fields};
+use quote::{format_ident, quote};
+use syn::parse::{Parse, ParseStream};
+use syn::{parse_macro_input, Data, DeriveInput, Fields, Token};
 
-#[proc_macro_derive(Mapped, attributes(table))]
+#[proc_macro_derive(Mapped, attributes(table, has_many, belongs_to))]
 pub fn derive_mapped(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(input)
@@ -42,8 +60,36 @@ pub fn derive_mapped(input: TokenStream) -> TokenStream {
 
 struct FieldInfo {
     ident: syn::Ident,
+    ty: syn::Type,
     column: String,
     primary_key: bool,
+}
+
+/// The shared shape of `#[has_many(Target, foreign_key = "...")]` and
+/// `#[belongs_to(Target, foreign_key = "...")]`.
+struct RelationSpec {
+    target: syn::Path,
+    foreign_key: syn::LitStr,
+}
+
+impl Parse for RelationSpec {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let target: syn::Path = input.parse()?;
+        input.parse::<Token![,]>()?;
+        let key: syn::Ident = input.parse()?;
+        if key != "foreign_key" {
+            return Err(syn::Error::new_spanned(
+                &key,
+                "expected `foreign_key = \"...\"`",
+            ));
+        }
+        input.parse::<Token![=]>()?;
+        let foreign_key: syn::LitStr = input.parse()?;
+        Ok(RelationSpec {
+            target,
+            foreign_key,
+        })
+    }
 }
 
 fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
@@ -63,19 +109,25 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     };
 
     let mut table_name: Option<String> = None;
+    let mut has_many: Vec<RelationSpec> = Vec::new();
+    let mut belongs_to: Vec<RelationSpec> = Vec::new();
     for attr in &input.attrs {
-        if !attr.path().is_ident("table") {
-            continue;
+        if attr.path().is_ident("table") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("name") {
+                    let lit: syn::LitStr = meta.value()?.parse()?;
+                    table_name = Some(lit.value());
+                    Ok(())
+                } else {
+                    Err(meta
+                        .error("unsupported #[table(...)] attribute; expected `name = \"...\"`"))
+                }
+            })?;
+        } else if attr.path().is_ident("has_many") {
+            has_many.push(attr.parse_args::<RelationSpec>()?);
+        } else if attr.path().is_ident("belongs_to") {
+            belongs_to.push(attr.parse_args::<RelationSpec>()?);
         }
-        attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("name") {
-                let lit: syn::LitStr = meta.value()?.parse()?;
-                table_name = Some(lit.value());
-                Ok(())
-            } else {
-                Err(meta.error("unsupported #[table(...)] attribute; expected `name = \"...\"`"))
-            }
-        })?;
     }
     let table_name = table_name.unwrap_or_else(|| struct_ident.to_string().to_snake_case());
 
@@ -107,6 +159,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
         fields.push(FieldInfo {
             ident,
+            ty: field.ty.clone(),
             column,
             primary_key,
         });
@@ -182,6 +235,16 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         None => quote! {},
     };
 
+    let has_many_impls = has_many
+        .iter()
+        .map(|spec| expand_has_many(struct_ident, &core, primary_key, spec))
+        .collect::<syn::Result<Vec<_>>>()?;
+
+    let belongs_to_impls = belongs_to
+        .iter()
+        .map(|spec| expand_belongs_to(struct_ident, &core, &fields, spec))
+        .collect::<syn::Result<Vec<_>>>()?;
+
     Ok(quote! {
         impl #core::Mapped for #struct_ident {
             const TABLE_NAME: &'static str = #table_name;
@@ -217,6 +280,103 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
 
         #update_and_delete
+        #(#has_many_impls)*
+        #(#belongs_to_impls)*
+    })
+}
+
+/// `#[has_many(Child, foreign_key = "...")]` generates a batched loader
+/// keyed by `Self`'s own primary key (which the children's `foreign_key`
+/// column references).
+fn expand_has_many(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[has_many(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_ident = &pk.ident;
+    let pk_ty = &pk.ty;
+    let child = &spec.target;
+    let fk_column = &spec.foreign_key;
+
+    let child_name = child
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}s", child_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// Batched ("select-in") eager load of the `#child` rows
+            /// referencing these `#struct_ident`s, in a single extra query.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                parents: &[#struct_ident],
+            ) -> #core::Result<::std::collections::HashMap<#pk_ty, ::std::vec::Vec<#child>>> {
+                #core::relations::load_many::<#child, #pk_ty>(
+                    engine,
+                    parents.iter().map(|p| ::std::clone::Clone::clone(&p.#pk_ident)),
+                    #fk_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// `#[belongs_to(Parent, foreign_key = "...")]` generates a batched loader
+/// keyed by the `Parent`'s primary key, using `Self`'s own `foreign_key`
+/// field as the value to look up.
+fn expand_belongs_to(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    fields: &[FieldInfo],
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let fk_column_value = spec.foreign_key.value();
+    let fk_field = fields.iter().find(|f| f.column == fk_column_value).ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.foreign_key,
+            format!("no field maps to column {fk_column_value:?}; #[belongs_to(...)]'s foreign_key must name a column on this struct"),
+        )
+    })?;
+    let fk_ident = &fk_field.ident;
+    let fk_ty = &fk_field.ty;
+    let parent = &spec.target;
+
+    let parent_name = parent
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}", parent_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// Batched eager load of the `#parent` rows these
+            /// `#struct_ident`s reference, in a single extra query.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                children: &[#struct_ident],
+            ) -> #core::Result<::std::collections::HashMap<#fk_ty, #parent>> {
+                let parent_key_column = <#parent as #core::Mapped>::PRIMARY_KEY.expect(
+                    "#[belongs_to(...)] target must have a #[table(primary_key)] field",
+                );
+                #core::relations::load_one::<#parent, #fk_ty>(
+                    engine,
+                    children.iter().map(|c| ::std::clone::Clone::clone(&c.#fk_ident)),
+                    parent_key_column,
+                )
+                .await
+            }
+        }
     })
 }
 

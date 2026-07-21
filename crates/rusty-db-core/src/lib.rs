@@ -16,6 +16,7 @@ pub mod engine;
 pub mod error;
 pub mod mapping;
 pub mod query;
+pub mod relations;
 pub mod row;
 pub mod session;
 pub mod value;
