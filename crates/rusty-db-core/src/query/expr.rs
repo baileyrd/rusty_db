@@ -82,6 +82,12 @@ pub enum Expr {
     Agg(AggFunc, Box<Expr>),
 }
 
+impl From<Column> for Expr {
+    fn from(column: Column) -> Self {
+        Expr::Column(column)
+    }
+}
+
 impl Expr {
     pub fn col(column: Column) -> Self {
         Expr::Column(column)
@@ -117,6 +123,50 @@ impl Expr {
     /// ```
     pub fn text(sql: impl Into<String>, params: impl IntoIterator<Item = Value>) -> Self {
         Expr::Raw(sql.into(), params.into_iter().collect())
+    }
+
+    fn binop(self, op: BinOp, value: impl Into<Value>) -> Self {
+        Expr::BinOp(Box::new(self), op, Box::new(Expr::Literal(value.into())))
+    }
+
+    /// `self = value`. `Column`'s own `.eq`/etc. build the same `Expr` for
+    /// the common case of comparing a column directly; these exist on
+    /// `Expr` itself too so an arbitrary expression — an aggregate for a
+    /// `HAVING` clause (`orders.col("amount").sum().gt(100)`), an
+    /// `Expr::text(...)` fragment, or anything else — can be compared the
+    /// same way.
+    pub fn eq(self, value: impl Into<Value>) -> Self {
+        self.binop(BinOp::Eq, value)
+    }
+
+    pub fn ne(self, value: impl Into<Value>) -> Self {
+        self.binop(BinOp::NotEq, value)
+    }
+
+    pub fn lt(self, value: impl Into<Value>) -> Self {
+        self.binop(BinOp::Lt, value)
+    }
+
+    pub fn lte(self, value: impl Into<Value>) -> Self {
+        self.binop(BinOp::LtEq, value)
+    }
+
+    pub fn gt(self, value: impl Into<Value>) -> Self {
+        self.binop(BinOp::Gt, value)
+    }
+
+    pub fn gte(self, value: impl Into<Value>) -> Self {
+        self.binop(BinOp::GtEq, value)
+    }
+
+    pub fn like(self, pattern: impl Into<Value>) -> Self {
+        self.binop(BinOp::Like, pattern)
+    }
+
+    /// Case-insensitive `LIKE` — see `Dialect::ilike_operator` for how it
+    /// renders per backend.
+    pub fn ilike(self, pattern: impl Into<Value>) -> Self {
+        self.binop(BinOp::ILike, pattern)
     }
 
     pub fn and(self, other: Expr) -> Self {

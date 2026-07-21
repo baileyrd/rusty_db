@@ -5,10 +5,10 @@
 //! `Select::distinct`, `Column::between`, `Column::ilike`'s portable
 //! fallback to plain `LIKE` on backends without a native `ILIKE` keyword,
 //! `Table::alias` for self-joins, `Expr::text` for raw SQL fragments
-//! composed into the builder, and aggregate functions/expression columns
-//! via `SelectExpr`. `RETURNING` on `UPDATE`/`DELETE` has no SQLite
-//! coverage here since SQLite's dialect doesn't support it (see
-//! `query_builder_extras_postgres.rs`).
+//! composed into the builder, aggregate functions/expression columns via
+//! `SelectExpr`, and `Select::group_by`/`.having`. `RETURNING` on
+//! `UPDATE`/`DELETE` has no SQLite coverage here since SQLite's dialect
+//! doesn't support it (see `query_builder_extras_postgres.rs`).
 
 use rusty_db::prelude::*;
 
@@ -253,6 +253,51 @@ async fn plain_and_aggregate_columns_compose_and_an_expression_column_is_aliased
         )
         .await?;
     assert_eq!(row.get_by_name::<i64>("doubled")?, 20);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn group_by_and_having_execute_and_decode_correctly() -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    // Ada: 10; ada: 50; Grace: 50 + 200 = 250 ("Ada"/"ada" are distinct,
+    // case-sensitive groups).
+    let rows = engine
+        .fetch_all(
+            &Select::from(&orders)
+                .columns([
+                    SelectExpr::from(orders.col("customer")),
+                    SelectExpr::from(orders.col("amount").sum()).alias("total"),
+                ])
+                .group_by([orders.col("customer")])
+                .order_by(orders.col("customer").asc()),
+        )
+        .await?;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get_by_name::<String>("customer")?, "Ada");
+    assert_eq!(rows[0].get_by_name::<i64>("total")?, 10);
+    assert_eq!(rows[1].get_by_name::<String>("customer")?, "Grace");
+    assert_eq!(rows[1].get_by_name::<i64>("total")?, 250);
+    assert_eq!(rows[2].get_by_name::<String>("customer")?, "ada");
+    assert_eq!(rows[2].get_by_name::<i64>("total")?, 50);
+
+    // HAVING narrows to groups whose total exceeds 100 -- only Grace's.
+    let filtered = engine
+        .fetch_all(
+            &Select::from(&orders)
+                .columns([
+                    SelectExpr::from(orders.col("customer")),
+                    SelectExpr::from(orders.col("amount").sum()).alias("total"),
+                ])
+                .group_by([orders.col("customer")])
+                .having(orders.col("amount").sum().gt(100_i64)),
+        )
+        .await?;
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].get_by_name::<String>("customer")?, "Grace");
+    assert_eq!(filtered[0].get_by_name::<i64>("total")?, 250);
 
     Ok(())
 }
