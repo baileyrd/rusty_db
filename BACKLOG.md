@@ -55,9 +55,10 @@ loading with cascade delete/orphan rules; hand-written versioned
 migrations; schema introspection (columns/types/nullability/PK/foreign
 keys/indexes/unique constraints/check constraints/column defaults);
 logical backup/restore; read replicas; TLS; query timeouts; connection-pool
-observability; and connection-level event hooks (`PoolConfig::with_on_connect`/
-`.with_before_acquire`/`.with_after_release`). See `README.md` for the full
-tour with examples.
+observability; connection-level event hooks (`PoolConfig::with_on_connect`/
+`.with_before_acquire`/`.with_after_release`); and a tunable per-connection
+statement-cache capacity (`PoolConfig::with_statement_cache_capacity`).
+See `README.md` for the full tour with examples.
 
 ---
 
@@ -115,12 +116,6 @@ tour with examples.
   always collecting a full `Vec<Row>`) — every fetch path
   (`fetch_all`/`fetch_all_as`) materializes the entire result set today,
   which is a real ceiling for large exports/reports. **L**
-- **Compiled-statement / query-result caching** (a `baked query`-equivalent
-  — cache a rendered `(sql, params-shape)` for a repeatedly-run query
-  shape) — nothing at the rusty_db layer controls or exposes this; sqlx
-  may do some of its own prepared-statement caching underneath, but it
-  isn't surfaced or tunable here. **M**
-
 ## Topology / deployment
 
 - **Sharding / multi-tenant routing** beyond the existing single-primary +
