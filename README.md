@@ -54,6 +54,20 @@ txn.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", &[100.into
 txn.commit().await?; // or txn.rollback().await?
 ```
 
+### Connection pooling
+
+Every driver's `connect`/`engine` use that driver's default pool settings. To tune them explicitly — a smaller `max_connections` for a resource-constrained deployment, or an `acquire_timeout` so a starved pool errors out instead of hanging a request forever — use `connect_with`/`engine_with` with a `PoolConfig`:
+
+```rust
+use std::time::Duration;
+
+let config = PoolConfig::new(10).with_acquire_timeout(Duration::from_secs(5));
+let engine = SqliteDriver::engine_with("sqlite://app.db?mode=rwc", config).await?;
+// same shape on PostgresDriver/MySqlDriver
+```
+
+Once `max_connections` connections are checked out, a further `engine.connect()` (or anything that needs a connection, like `Session::flush`) just waits for one to free up — or, with `acquire_timeout` set, gives up and returns an error after that long instead of waiting indefinitely.
+
 ### Joins
 
 `Select` supports `join`/`left_join`/`right_join`/`full_join`, and `Column::eq_col` builds a column-to-column condition (as opposed to `Column::eq`, which compares against a literal):
@@ -231,6 +245,8 @@ Unlike `Migrator::up`, which commits each migration independently, `session.migr
 This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 `tests/concurrent_sessions.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover multiple `Session`s sharing one `Engine`/connection pool at the same time — `Session` is intentionally `!Send` (it hands out `Rc`s for the identity map), so these run via `tokio::task::LocalSet`/`spawn_local` rather than `tokio::spawn`, which is the standard way to get genuinely concurrent, interleaved execution of `!Send` futures on one thread. They cover independent commits landing correctly under a burst of concurrent sessions, one session's flushed-but-uncommitted write staying invisible to a concurrent reader on a separate connection (deterministically ordered via a `oneshot` channel, not timing), and two sessions never sharing identity-map state for the same row. Same skip-if-unreachable behavior as the Postgres/MySQL smoke tests; each test uses its own table to avoid colliding with other tests running concurrently against the same live server.
+
+`tests/pool_exhaustion.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `PoolConfig` itself: a `connect()` beyond a pool's `max_connections` blocks rather than erroring or handing out a duplicate connection, and succeeds once an outstanding connection is dropped back to the pool (proven with `tokio::time::timeout` rather than assumptions about scheduling order); a higher `max_connections` is honored before the pool starts blocking; a configured `acquire_timeout` errors out promptly instead of blocking forever; and a burst of `Session`s serializes correctly (no lost or corrupted writes) when they're all forced to take turns on a single-connection pool.
 
 ## Running tests
 

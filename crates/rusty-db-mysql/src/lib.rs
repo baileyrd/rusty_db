@@ -9,7 +9,9 @@ use sqlx::types::chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use sqlx::{Column as _, MySql, MySqlPool, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::MySqlDialect;
-use rusty_db_core::{Connection, Dialect, Driver, Engine, Error, Executor, Result, Row, Value};
+use rusty_db_core::{
+    Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, Result, Row, Value,
+};
 
 static DIALECT: MySqlDialect = MySqlDialect;
 
@@ -28,9 +30,31 @@ impl MySqlDriver {
         Ok(Self { pool })
     }
 
+    /// Connect with explicit pool tuning (e.g. a constrained
+    /// `max_connections` and/or `acquire_timeout`) instead of the
+    /// underlying driver's defaults.
+    pub async fn connect_with(url: &str, config: PoolConfig) -> Result<Self> {
+        let mut options = MySqlPoolOptions::new().max_connections(config.max_connections);
+        if let Some(timeout) = config.acquire_timeout {
+            options = options.acquire_timeout(timeout);
+        }
+        let pool = options
+            .connect(url)
+            .await
+            .map_err(|e| Error::Connection(e.to_string()))?;
+        Ok(Self { pool })
+    }
+
     /// Convenience: connect and wrap directly in an `Engine`.
     pub async fn engine(url: &str) -> Result<Engine> {
         Ok(Engine::new(Arc::new(Self::connect(url).await?)))
+    }
+
+    /// Convenience: `connect_with` and wrap directly in an `Engine`.
+    pub async fn engine_with(url: &str, config: PoolConfig) -> Result<Engine> {
+        Ok(Engine::new(Arc::new(
+            Self::connect_with(url, config).await?,
+        )))
     }
 }
 
