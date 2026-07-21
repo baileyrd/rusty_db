@@ -41,8 +41,8 @@ pub mod prelude {
     pub use rusty_db_core::{
         with_timeout, AuditEntry, AuditOperation, BulkInsert, Column, ColumnInfo, DatabaseDump,
         Delete, Engine, Entity, Expr, FromRow, Identifiable, Insert, Join, JoinKind, Mapped,
-        Migration, Migrator, PoolConfig, PoolStats, ReplicaSet, Row, Select, Session, Table,
-        TableDump, TableSchema, ToSql, Update, Value,
+        Migration, Migrator, PoolConfig, PoolStats, ReplicaSet, Row, Savepoint, Select, Session,
+        Table, TableDump, TableSchema, ToSql, Update, Value,
     };
 
     // `Mapped` above is the trait (type namespace); this is the derive
