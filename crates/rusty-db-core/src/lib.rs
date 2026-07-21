@@ -17,13 +17,15 @@ pub mod error;
 pub mod mapping;
 pub mod query;
 pub mod row;
+pub mod session;
 pub mod value;
 
 pub use connection::{Connection, Driver, Executor};
 pub use dialect::Dialect;
 pub use engine::{Engine, Transaction};
 pub use error::{Error, Result};
-pub use mapping::{FromRow, Mapped};
+pub use mapping::{Entity, FromRow, Identifiable, Mapped};
 pub use query::{Column, Delete, Expr, Insert, Join, JoinKind, Select, Table, ToSql, Update};
 pub use row::Row;
+pub use session::Session;
 pub use value::{FromValue, Value};

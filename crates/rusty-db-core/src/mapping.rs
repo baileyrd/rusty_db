@@ -1,4 +1,5 @@
 use crate::error::Result;
+use crate::query::{Delete, Insert, Update};
 use crate::row::Row;
 
 /// Describes the table a struct maps to. Implemented by `#[derive(Mapped)]`
@@ -17,4 +18,19 @@ pub trait Mapped {
 /// Decodes a `Row` into a concrete type. Implemented by `#[derive(Mapped)]`.
 pub trait FromRow: Sized {
     fn from_row(row: &Row) -> Result<Self>;
+}
+
+/// Produces the `Insert` for `self`. Implemented by every
+/// `#[derive(Mapped)]` type; lets `Session` queue writes for heterogeneous
+/// entity types behind one trait object.
+pub trait Entity: Mapped {
+    fn insert(&self) -> Insert;
+}
+
+/// Produces `Update`/`Delete` statements identified by `self`'s primary key.
+/// Implemented by `#[derive(Mapped)]` types that have a
+/// `#[table(primary_key)]` field.
+pub trait Identifiable: Entity {
+    fn update(&self) -> Update;
+    fn delete_query(&self) -> Delete;
 }

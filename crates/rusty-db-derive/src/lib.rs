@@ -14,10 +14,13 @@
 //! generates:
 //! - `impl Mapped for User` (`TABLE_NAME`, `COLUMNS`, `PRIMARY_KEY`)
 //! - `impl FromRow for User` (decodes a `Row` by column name)
+//! - `impl Entity for User` (so `Session::add` can queue it generically)
 //! - `User::table() -> Table`
 //! - `User::insert(&self) -> Insert`
-//! - `User::update(&self) -> Update` and `User::delete_query(&self) -> Delete`,
-//!   only when a field is marked `#[table(primary_key)]`
+//! - `User::update(&self) -> Update`, `User::delete_query(&self) -> Delete`,
+//!   and `impl Identifiable for User` (so `Session::update`/`delete` can
+//!   queue it generically), only when a field is marked
+//!   `#[table(primary_key)]`
 //!
 //! Field types must implement `Into<Value>` on an owned clone (i.e. the set
 //! of types `Value` already converts from: `bool`, `i64`, `i32`, `f64`,
@@ -164,6 +167,16 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                             .filter(Self::table().col(#pk_column).eq(::std::clone::Clone::clone(&self.#pk_ident)))
                     }
                 }
+
+                impl #core::Identifiable for #struct_ident {
+                    fn update(&self) -> #core::Update {
+                        Self::update(self)
+                    }
+
+                    fn delete_query(&self) -> #core::Delete {
+                        Self::delete_query(self)
+                    }
+                }
             }
         }
         None => quote! {},
@@ -194,6 +207,12 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             pub fn insert(&self) -> #core::Insert {
                 #core::Insert::into_table(&Self::table())
                     #(#insert_calls)*
+            }
+        }
+
+        impl #core::Entity for #struct_ident {
+            fn insert(&self) -> #core::Insert {
+                Self::insert(self)
             }
         }
 
