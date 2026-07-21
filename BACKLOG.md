@@ -32,8 +32,9 @@ As of the most recently merged work: a query builder (`Select`/`Insert`/
 `>`/`>=`/`LIKE`/`ILIKE`/`BETWEEN`/`IN`/`IS [NOT] NULL`/`AND`/`OR`/`NOT`,
 `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`, `RETURNING` on `INSERT`/`UPDATE`/
 `DELETE`, table aliasing/self-joins, a `text()` escape hatch for dropping
-raw SQL into an otherwise builder-constructed query); first-class `Value`
-variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
+raw SQL into an otherwise builder-constructed query, `COUNT`/`SUM`/`AVG`/
+`MIN`/`MAX`/arbitrary expression `SELECT` columns via `SelectExpr`);
+first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
 `chrono`'s `NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`, and
 `Vec<T>` arrays (native on Postgres, JSON-flattened on MySQL/MariaDB and
 SQLite); `#[derive(Mapped)]` with one primary key, one version column, one
@@ -54,11 +55,10 @@ observability. See `README.md` for the full tour with examples.
 
 ## Query builder (Core-equivalent)
 
-- **Aggregate functions & expression columns** (`COUNT`/`SUM`/`AVG`/`MIN`/
-  `MAX`, arbitrary `SELECT <expr> AS alias`) — `Select` only takes plain
-  `Column`s today; there's no expression-column type at all. Blocks
-  anything but the simplest reporting queries. **L**
-- **`GROUP BY` / `HAVING`** — no aggregation grouping exists. **M**
+- **`GROUP BY` / `HAVING`** — no aggregation grouping exists; aggregate
+  functions themselves (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` via `SelectExpr`)
+  are already in, so this is the natural next step for anything beyond a
+  single running total. **M**
 - **Subqueries** — no way to nest a `Select` inside another query's `FROM`,
   column list, or a filter (`IN (subquery)`, scalar subquery, correlated
   `EXISTS`). Currently the only composition is fetching once and filtering
