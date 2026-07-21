@@ -1,4 +1,5 @@
 use super::expr::{BinOp, Expr};
+use super::select::Select;
 use crate::dialect::Dialect;
 use crate::value::Value;
 
@@ -164,6 +165,11 @@ impl Column {
 
     pub fn is_in(&self, values: impl IntoIterator<Item = Value>) -> Expr {
         Expr::Column(self.clone()).is_in(values)
+    }
+
+    /// `self IN (<subquery>)` — see `Expr::in_subquery`.
+    pub fn in_subquery(&self, subquery: Select) -> Expr {
+        Expr::Column(self.clone()).in_subquery(subquery)
     }
 
     /// `COUNT(self)`.
