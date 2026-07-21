@@ -68,6 +68,20 @@ let engine = SqliteDriver::engine_with("sqlite://app.db?mode=rwc", config).await
 
 Once `max_connections` connections are checked out, a further `engine.connect()` (or anything that needs a connection, like `Session::flush`) just waits for one to free up — or, with `acquire_timeout` set, gives up and returns an error after that long instead of waiting indefinitely.
 
+### Encrypted connections (TLS)
+
+Postgres and MySQL/MariaDB connections can be encrypted; there's no `rusty_db`-specific API for this — `connect`/`engine`/`connect_with` all just hand the connection URL straight through to `sqlx`, and TLS is controlled entirely by standard URL query parameters `sqlx`'s own Postgres/MySQL drivers already understand (backed by `tls-rustls`):
+
+```rust
+// Postgres: sslmode = disable | prefer (default) | require | verify-ca | verify-full
+let engine = PostgresDriver::engine("postgres://user:pass@host/db?sslmode=verify-full&sslrootcert=/path/to/ca.pem").await?;
+
+// MySQL/MariaDB: ssl-mode = DISABLED | PREFERRED (default) | REQUIRED | VERIFY_CA | VERIFY_IDENTITY
+let engine = MySqlDriver::engine("mysql://user:pass@host/db?ssl-mode=VERIFY_CA&ssl-ca=/path/to/ca.pem").await?;
+```
+
+Both drivers default to opportunistically using TLS already (`prefer`/`PREFERRED`) if the server supports it, without requiring anything from the caller. `require`/`REQUIRED` encrypts without verifying the server's certificate at all (vulnerable to a MITM that presents any certificate); `verify-ca`/`VERIFY_CA` and `verify-full`/`VERIFY_IDENTITY` additionally check the certificate against a trusted root (`verify-full`/`VERIFY_IDENTITY` also checks the hostname matches). SQLite has no network/TLS concept at all — it's a local file, not a network protocol.
+
 ### Read replicas and failover
 
 `ReplicaSet` routes reads round-robin across a set of replica `Engine`s and sends writes to a single primary — the common "one writer, many readers" topology most databases scale reads with. It doesn't (and can't) replicate any data itself — that's the database server's own feature (Postgres streaming replication, MySQL/MariaDB replication, etc); `ReplicaSet` just pairs an already-replicated set of `Engine`s, one per server, into a router:
@@ -314,6 +328,8 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 `tests/schema_introspection.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `list_tables`/`table_schema`: created tables are reported (and, for SQLite, internal `sqlite_*` tables never are); a table's columns come back with the right type names, nullability, and primary-key flags; and a table that doesn't exist reports `Ok(None)` rather than an error. Chasing down why the SQLite version's PRAGMA-based columns were coming back entirely `Null` uncovered a real bug in the SQLite driver's row decoder: it was keying off each column's *declared* type (`"NULL"` when SQLite can't infer one statically — true for `PRAGMA` output and other non-plain-table results, not just when the value itself is null) instead of that value's actual *runtime* type, so it silently decoded every column as `Value::Null` whenever SQLite left the static type undeclared. Fixed by falling back to the per-value runtime type (via `try_get_raw`) exactly when the declared type is `"NULL"`, leaving the existing behavior for ordinary table queries (which do have a meaningful declared type) unchanged — confirmed by the rest of the suite still passing unmodified.
 
 `tests/backup_restore.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `backup`/`restore`: a backup captures every row of every table; restoring returns the database to exactly its backed-up state after rows are deleted, updated, and added; a dump backed up from one `Engine` restores correctly into a completely different one; a failing restore (a corrupted dump with a duplicate primary key partway through) rolls back the *entire* transaction rather than leaving the table partially wiped; and backing up an empty table round-trips correctly. The Postgres/MySQL versions scope every backup/restore to their own table via `backup_tables`, since a whole-database `restore()` would otherwise risk wiping tables that other tests running concurrently against the same shared live server still need.
+
+`tests/tls_postgres.rs`/`tests/tls_mysql.rs` cover encrypted connections (no SQLite equivalent — it has no network/TLS concept at all): the default `sslmode`/`ssl-mode` (`prefer`/`PREFERRED`) already opportunistically encrypts against a server that supports it, verified against the server's own bookkeeping (`pg_stat_ssl`, `SHOW STATUS LIKE 'Ssl_cipher'`) rather than just assuming the connection attempt succeeding means it's encrypted; `disable`/`DISABLED` produces a genuinely plain connection; `require`/`REQUIRED` encrypts without verifying the certificate; and `verify-full`/`verify-ca`/`VERIFY_CA` succeed with the server's actual CA (and, for `verify-full`, matching hostname) but fail closed against a CA that doesn't match — proving certificate verification actually verifies something rather than silently accepting any well-formed root. This environment's Postgres already has TLS enabled by default (a self-signed cert the Debian/Ubuntu package generates automatically); MariaDB needed a one-time setup of a self-signed CA/server certificate (`ssl-ca`/`ssl-cert`/`ssl-key` in `/etc/mysql/mariadb.conf.d/50-server.cnf`) to have any TLS support to test against at all.
 
 ## Running tests
 
