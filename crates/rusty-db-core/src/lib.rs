@@ -37,7 +37,9 @@ pub use error::{Error, Result};
 pub use mapping::{Entity, FromRow, Identifiable, Mapped};
 pub use migration::{AppliedMigration, Migration, Migrator};
 pub use pool::PoolConfig;
-pub use query::{Column, Delete, Expr, Insert, Join, JoinKind, Select, Table, ToSql, Update};
+pub use query::{
+    BulkInsert, Column, Delete, Expr, Insert, Join, JoinKind, Select, Table, ToSql, Update,
+};
 pub use replica::ReplicaSet;
 pub use row::Row;
 pub use schema::{ColumnInfo, TableSchema};

@@ -206,6 +206,22 @@ A session's writes actually run inside one ongoing transaction that begins lazil
 
 If a flush fails partway through a batch, the whole transaction (including anything flushed earlier in its lifetime) rolls back and the queue is left untouched, so fixing the problem and calling `commit()`/flushing again starts over cleanly.
 
+### Bulk insert
+
+`session.add_all(&entities)` queues every entity in a slice as one multi-row `INSERT` (`BulkInsert`) — one statement, and one round trip at flush time, instead of one per row the way repeated `add` calls would:
+
+```rust
+let users = vec![
+    User { id: 1, name: "ada".into(), active: true },
+    User { id: 2, name: "grace".into(), active: true },
+    User { id: 3, name: "linus".into(), active: true },
+];
+session.add_all(&users);
+session.commit().await?; // one INSERT with three rows of VALUES
+```
+
+`BulkInsert::combine` builds this directly from ordinary `Insert`s — the same ones `Entity::insert()` (and so any `#[derive(Mapped)]` type) already produces — rather than a separate row-building API, so nothing about describing a single row changes: `BulkInsert::combine(entities.iter().map(Entity::insert))` works standalone too (e.g. to run with `engine.execute(...)` directly, outside a `Session`). It's a single statement, so a failure partway through (e.g. one row's primary key collides) rolls back *all* of it, same as any other `Session` write — there's no partial success to reason about. An empty slice is a no-op.
+
 ### Audit logging / change tracking
 
 `session.with_audit_log()` records every write the session flushes into an append-only audit table (`_rusty_db_audit_log` by default — `with_audit_log_table` picks another), inside the *same transaction* as the write itself: an audit entry only ever exists for a change that actually took effect, and if the transaction rolls back, any audit entries flushed into it roll back right along with it. Opt-in — a plain `session()` never creates or touches an audit table at all.
@@ -376,6 +392,8 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 `tests/audit_log.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests that most directly exercise change tracking, since the identity-map/uncommitted-write-visibility behavior is already covered by the SQLite version and doesn't need re-proving per driver) cover `Session`'s opt-in audit logging: a plain session never creates an audit table at all; insert/update/delete each get recorded with the right table, operation, and rendered SQL/params; a failed write's audit entry rolls back right along with the write itself (proving the audit trail shares the write's own transaction rather than being an independent, potentially-inconsistent side effect); the session's own `audit_log()` sees its not-yet-committed entries (autoflush + read-through-transaction, same as `get`/`load_all`); and a custom audit table name is honored. The Postgres/MySQL versions use their own audit table name per test (`with_audit_log_table`) to avoid colliding with other tests running concurrently against the same shared live server, and are careful to `commit()` (closing the transaction `audit_log()` itself opens) before any cleanup `DROP TABLE` from a separate connection — otherwise the cleanup deadlocks waiting on a lock the still-open session transaction is holding.
 
 `tests/optimistic_locking.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — the two conflict-detection tests, since the identity/no-op-without-`#[table(version)]` cases don't need re-proving per driver) cover `#[table(version)]`: updating with the current version succeeds and increments the stored version; updating with a stale version (superseded by someone else's edit) fails with `Error::Conflict` and leaves the other edit intact; updating a row someone else already deleted also conflicts; the same two cases for `delete`; and a type with no `#[table(version)]` field keeps its pre-existing behavior of a silent no-op on a stale/missing-row write — proving the feature is fully opt-in.
+
+`tests/bulk_insert.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — the round-trip and rollback tests, since `BulkInsert::combine`'s own rendering/validation is pure query-builder logic that doesn't need a live server to re-prove per driver) cover `BulkInsert`/`Session::add_all`: combining several `Insert`s renders one statement with one `VALUES` group per row; combining zero inserts yields `None` rather than an invalid empty statement; combining `Insert`s from different tables is rejected; `add_all` queues exactly one pending write for the whole slice (not one per entity) and an empty slice is a no-op; a failing bulk insert (a duplicate primary key partway through) rolls back the entire batch, including rows that would've inserted fine on their own; and a `BulkInsert` works standalone through `engine.execute()`, without a `Session` at all.
 
 ## Running tests
 

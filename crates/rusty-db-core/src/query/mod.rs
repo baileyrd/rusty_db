@@ -1,3 +1,4 @@
+mod bulk_insert;
 mod delete;
 mod expr;
 mod insert;
@@ -8,6 +9,7 @@ mod table;
 mod tests;
 mod update;
 
+pub use bulk_insert::BulkInsert;
 pub use delete::Delete;
 pub use expr::{BinOp, Expr};
 pub use insert::Insert;
