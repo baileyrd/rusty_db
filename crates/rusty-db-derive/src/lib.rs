@@ -35,6 +35,12 @@
 //! - one `load_<child>s` async method per `#[has_many(Child, foreign_key =
 //!   "...")]` attribute, batch-loading `Child` rows for a slice of `Self`
 //!   (see `rusty_db_core::relations::load_many`)
+//! - one `load_<child>` async method per `#[has_one(Child, foreign_key =
+//!   "...")]` attribute — same direction as `#[has_many(...)]`, but for a
+//!   relationship expected to have at most one matching row per parent:
+//!   `Child` directly rather than a `Vec<Child>`, and a runtime
+//!   `Error::Conflict` if a second row for the same parent ever turns up
+//!   (see `rusty_db_core::relations::load_has_one`)
 //! - one `load_<parent>` async method per `#[belongs_to(Parent, foreign_key
 //!   = "...")]` attribute, batch-loading the referenced `Parent` rows for a
 //!   slice of `Self` (see `rusty_db_core::relations::load_one`)
@@ -68,7 +74,7 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Token};
 
-#[proc_macro_derive(Mapped, attributes(table, has_many, belongs_to))]
+#[proc_macro_derive(Mapped, attributes(table, has_many, has_one, belongs_to))]
 pub fn derive_mapped(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(input)
@@ -130,6 +136,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let mut table_name: Option<String> = None;
     let mut has_many: Vec<RelationSpec> = Vec::new();
+    let mut has_one: Vec<RelationSpec> = Vec::new();
     let mut belongs_to: Vec<RelationSpec> = Vec::new();
     for attr in &input.attrs {
         if attr.path().is_ident("table") {
@@ -145,6 +152,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             })?;
         } else if attr.path().is_ident("has_many") {
             has_many.push(attr.parse_args::<RelationSpec>()?);
+        } else if attr.path().is_ident("has_one") {
+            has_one.push(attr.parse_args::<RelationSpec>()?);
         } else if attr.path().is_ident("belongs_to") {
             belongs_to.push(attr.parse_args::<RelationSpec>()?);
         }
@@ -352,6 +361,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         .map(|spec| expand_has_many(struct_ident, &core, primary_key, spec))
         .collect::<syn::Result<Vec<_>>>()?;
 
+    let has_one_impls = has_one
+        .iter()
+        .map(|spec| expand_has_one(struct_ident, &core, primary_key, spec))
+        .collect::<syn::Result<Vec<_>>>()?;
+
     let belongs_to_impls = belongs_to
         .iter()
         .map(|spec| expand_belongs_to(struct_ident, &core, &fields, spec))
@@ -395,6 +409,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
         #update_and_delete
         #(#has_many_impls)*
+        #(#has_one_impls)*
         #(#belongs_to_impls)*
     })
 }
@@ -435,6 +450,60 @@ fn expand_has_many(
                 parents: &[#struct_ident],
             ) -> #core::Result<::std::collections::HashMap<#pk_ty, ::std::vec::Vec<#child>>> {
                 #core::relations::load_many::<#child, #pk_ty>(
+                    engine,
+                    parents.iter().map(|p| ::std::clone::Clone::clone(&p.#pk_ident)),
+                    #fk_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// `#[has_one(Child, foreign_key = "...")]` generates a batched loader keyed
+/// by `Self`'s own primary key (which the child's `foreign_key` column
+/// references) — the same direction as `#[has_many(...)]`, but for a
+/// relationship expected to have at most one matching row per parent:
+/// `Child` is returned directly rather than wrapped in a `Vec`, and a second
+/// matching row for the same parent is a runtime `Error::Conflict` (see
+/// `rusty_db_core::relations::load_has_one`) rather than something either
+/// silently kept or silently dropped.
+fn expand_has_one(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[has_one(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_ident = &pk.ident;
+    let pk_ty = &pk.ty;
+    let child = &spec.target;
+    let fk_column = &spec.foreign_key;
+
+    let child_name = child
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}", child_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// Batched ("select-in") eager load of the single `#child` row
+            /// (if any) referencing each of these `#struct_ident`s, in one
+            /// extra query. `Err(Error::Conflict)` if more than one `#child`
+            /// row references the same parent — this relationship is
+            /// supposed to be one-to-one.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                parents: &[#struct_ident],
+            ) -> #core::Result<::std::collections::HashMap<#pk_ty, #child>> {
+                #core::relations::load_has_one::<#child, #pk_ty>(
                     engine,
                     parents.iter().map(|p| ::std::clone::Clone::clone(&p.#pk_ident)),
                     #fk_column,

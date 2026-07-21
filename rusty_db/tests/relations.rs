@@ -7,6 +7,7 @@ use rusty_db::prelude::*;
 #[derive(Debug, Clone, PartialEq, Mapped)]
 #[table(name = "users")]
 #[has_many(Order, foreign_key = "user_id")]
+#[has_one(Profile, foreign_key = "user_id")]
 struct User {
     #[table(primary_key)]
     id: i64,
@@ -21,6 +22,15 @@ struct Order {
     id: i64,
     user_id: i64,
     amount: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Mapped)]
+#[table(name = "profiles")]
+struct Profile {
+    #[table(primary_key)]
+    id: i64,
+    user_id: i64,
+    bio: String,
 }
 
 async fn engine_with_schema() -> rusty_db::Result<Engine> {
@@ -38,6 +48,14 @@ async fn engine_with_schema() -> rusty_db::Result<Engine> {
         .await?
         .execute(
             "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL)",
+            &[],
+        )
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE profiles (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, bio TEXT NOT NULL)",
             &[],
         )
         .await?;
@@ -187,6 +205,89 @@ async fn eager_load_helpers_return_empty_maps_for_empty_input() -> rusty_db::Res
     let no_orders: Vec<Order> = Vec::new();
     let users_by_id: HashMap<i64, User> = Order::load_user(&engine, &no_orders).await?;
     assert!(users_by_id.is_empty());
+
+    let no_profile_users: Vec<User> = Vec::new();
+    let profiles_by_user: HashMap<i64, Profile> =
+        User::load_profile(&engine, &no_profile_users).await?;
+    assert!(profiles_by_user.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn has_one_batches_at_most_one_child_per_parent() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    // A third user with no profile at all, to prove the map just has no entry for it.
+    let linus = User {
+        id: 3,
+        name: "linus".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+    engine.execute(&linus.insert()).await?;
+
+    let ada_profile = Profile {
+        id: 1,
+        user_id: 1,
+        bio: "mathematician".to_string(),
+    };
+    engine.execute(&ada_profile.insert()).await?;
+
+    let users = vec![ada.clone(), grace.clone(), linus.clone()];
+    let profiles_by_user: HashMap<i64, Profile> = User::load_profile(&engine, &users).await?;
+
+    assert_eq!(profiles_by_user.len(), 1); // grace and linus have no entry at all
+    assert_eq!(profiles_by_user.get(&ada.id).unwrap(), &ada_profile);
+    assert!(!profiles_by_user.contains_key(&grace.id));
+    assert!(!profiles_by_user.contains_key(&linus.id));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn has_one_reports_a_conflict_when_a_parent_has_more_than_one_matching_row(
+) -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+
+    // Two profiles for the same user: not actually a one-to-one relationship.
+    engine
+        .execute(
+            &(Profile {
+                id: 1,
+                user_id: 1,
+                bio: "mathematician".to_string(),
+            })
+            .insert(),
+        )
+        .await?;
+    engine
+        .execute(
+            &(Profile {
+                id: 2,
+                user_id: 1,
+                bio: "also a mathematician".to_string(),
+            })
+            .insert(),
+        )
+        .await?;
+
+    let result = User::load_profile(&engine, std::slice::from_ref(&ada)).await;
+    assert!(matches!(result, Err(rusty_db::Error::Conflict(_))));
 
     Ok(())
 }
