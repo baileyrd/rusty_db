@@ -93,18 +93,21 @@ async fn table_schema_reports_columns_nullability_and_primary_key() -> rusty_db:
                 type_name: "bigint(20)".to_string(),
                 nullable: false,
                 primary_key: true,
+                default: None,
             },
             ColumnInfo {
                 name: "name".to_string(),
                 type_name: "text".to_string(),
                 nullable: false,
                 primary_key: false,
+                default: None,
             },
             ColumnInfo {
                 name: "nickname".to_string(),
                 type_name: "text".to_string(),
                 nullable: true,
                 primary_key: false,
+                default: None,
             },
         ]
     );
@@ -129,5 +132,63 @@ async fn table_schema_returns_none_for_a_table_that_does_not_exist() -> rusty_db
             .await?,
         None
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn table_schema_reports_defaults_unique_and_check_constraints() -> rusty_db::Result<()> {
+    let Some(engine) = test_engine().await else {
+        return Ok(());
+    };
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE IF EXISTS schema_introspection_accounts", &[])
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE schema_introspection_accounts (\
+                 id BIGINT PRIMARY KEY, \
+                 email VARCHAR(255) NOT NULL, \
+                 balance BIGINT NOT NULL DEFAULT 0, \
+                 CONSTRAINT email_unique UNIQUE (email), \
+                 CONSTRAINT balance_check CHECK (balance >= 0)\
+             )",
+            &[],
+        )
+        .await?;
+
+    let schema = engine
+        .table_schema("schema_introspection_accounts")
+        .await?
+        .expect("table exists");
+
+    let balance = schema.columns.iter().find(|c| c.name == "balance").unwrap();
+    assert_eq!(balance.default.as_deref(), Some("0"));
+    let email = schema.columns.iter().find(|c| c.name == "email").unwrap();
+    assert_eq!(
+        email.default, None,
+        "a column with no DEFAULT reflects None"
+    );
+
+    assert_eq!(schema.unique_constraints.len(), 1);
+    assert_eq!(schema.unique_constraints[0].name, "email_unique");
+    assert_eq!(
+        schema.unique_constraints[0].columns,
+        vec!["email".to_string()]
+    );
+
+    assert_eq!(schema.check_constraints.len(), 1);
+    assert_eq!(schema.check_constraints[0].name, "balance_check");
+    assert_eq!(schema.check_constraints[0].expression, "`balance` >= 0");
+
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE schema_introspection_accounts", &[])
+        .await?;
+
     Ok(())
 }

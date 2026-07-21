@@ -10,8 +10,8 @@ use sqlx::{Column as _, MySql, MySqlPool, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::MySqlDialect;
 use rusty_db_core::{
-    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, PoolMetrics,
-    PoolStats, Result, Row, TableSchema, Value,
+    CheckConstraint, ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig,
+    PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
 };
 
 static DIALECT: MySqlDialect = MySqlDialect;
@@ -113,13 +113,15 @@ impl Driver for MySqlDriver {
 
     async fn table_schema(&self, table: &str) -> Result<Option<TableSchema>> {
         let mut conn = self.connect().await?;
+        let table_value = Value::Text(table.to_string());
+
         let rows = conn
             .fetch_all(
-                "SELECT column_name, column_type, is_nullable, column_key \
+                "SELECT column_name, column_type, is_nullable, column_key, column_default \
                  FROM information_schema.columns \
                  WHERE table_schema = DATABASE() AND table_name = ? \
                  ORDER BY ordinal_position",
-                &[Value::Text(table.to_string())],
+                std::slice::from_ref(&table_value),
             )
             .await?;
         if rows.is_empty() {
@@ -134,6 +136,47 @@ impl Driver for MySqlDriver {
                     type_name: row.get_by_name::<String>("column_type")?,
                     nullable: row.get_by_name::<String>("is_nullable")? == "YES",
                     primary_key: row.get_by_name::<String>("column_key")? == "PRI",
+                    default: row.get_by_name::<Option<String>>("column_default")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let unique_rows = conn
+            .fetch_all(
+                "SELECT tc.constraint_name, kcu.column_name \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu \
+                   ON tc.constraint_name = kcu.constraint_name \
+                   AND tc.table_schema = kcu.table_schema \
+                   AND tc.table_name = kcu.table_name \
+                 WHERE tc.constraint_type = 'UNIQUE' \
+                   AND tc.table_schema = DATABASE() \
+                   AND tc.table_name = ? \
+                 ORDER BY tc.constraint_name, kcu.ordinal_position",
+                std::slice::from_ref(&table_value),
+            )
+            .await?;
+        let unique_constraints = group_unique_constraints(&unique_rows)?;
+
+        let check_rows = conn
+            .fetch_all(
+                "SELECT tc.constraint_name, cc.check_clause \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.check_constraints cc \
+                   ON tc.constraint_schema = cc.constraint_schema \
+                   AND tc.constraint_name = cc.constraint_name \
+                 WHERE tc.constraint_type = 'CHECK' \
+                   AND tc.table_schema = DATABASE() \
+                   AND tc.table_name = ?",
+                &[table_value],
+            )
+            .await?;
+        let check_constraints = check_rows
+            .iter()
+            .map(|row| {
+                Ok(CheckConstraint {
+                    name: row.get_by_name::<String>("constraint_name")?,
+                    expression: row.get_by_name::<String>("check_clause")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -141,8 +184,29 @@ impl Driver for MySqlDriver {
         Ok(Some(TableSchema {
             name: table.to_string(),
             columns,
+            unique_constraints,
+            check_constraints,
         }))
     }
+}
+
+/// Groups rows of `(constraint_name, column_name)` — ordered by
+/// `constraint_name` then column position — into one `UniqueConstraint`
+/// per distinct name.
+fn group_unique_constraints(rows: &[Row]) -> Result<Vec<UniqueConstraint>> {
+    let mut result: Vec<UniqueConstraint> = Vec::new();
+    for row in rows {
+        let name = row.get_by_name::<String>("constraint_name")?;
+        let column = row.get_by_name::<String>("column_name")?;
+        match result.last_mut() {
+            Some(last) if last.name == name => last.columns.push(column),
+            _ => result.push(UniqueConstraint {
+                name,
+                columns: vec![column],
+            }),
+        }
+    }
+    Ok(result)
 }
 
 pub struct MySqlConnection {

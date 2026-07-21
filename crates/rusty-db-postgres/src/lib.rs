@@ -11,8 +11,8 @@ use sqlx::{Column as _, Postgres, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::NumberedDialect;
 use rusty_db_core::{
-    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, PoolMetrics,
-    PoolStats, Result, Row, TableSchema, Value,
+    CheckConstraint, ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig,
+    PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
 };
 
 static DIALECT: NumberedDialect = NumberedDialect;
@@ -118,7 +118,8 @@ impl Driver for PostgresDriver {
 
         let rows = conn
             .fetch_all(
-                "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
+                "SELECT column_name, data_type, is_nullable, column_default \
+                 FROM information_schema.columns \
                  WHERE table_schema = 'public' AND table_name = $1 \
                  ORDER BY ordinal_position",
                 std::slice::from_ref(&table_value),
@@ -138,7 +139,7 @@ impl Driver for PostgresDriver {
                  WHERE tc.constraint_type = 'PRIMARY KEY' \
                    AND tc.table_schema = 'public' \
                    AND tc.table_name = $1",
-                &[table_value],
+                std::slice::from_ref(&table_value),
             )
             .await?;
         let primary_keys = pk_rows
@@ -155,6 +156,55 @@ impl Driver for PostgresDriver {
                     name,
                     type_name: row.get_by_name::<String>("data_type")?,
                     nullable: row.get_by_name::<String>("is_nullable")? == "YES",
+                    default: row.get_by_name::<Option<String>>("column_default")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let unique_rows = conn
+            .fetch_all(
+                "SELECT tc.constraint_name, kcu.column_name \
+                 FROM information_schema.table_constraints tc \
+                 JOIN information_schema.key_column_usage kcu \
+                   ON tc.constraint_name = kcu.constraint_name \
+                   AND tc.table_schema = kcu.table_schema \
+                 WHERE tc.constraint_type = 'UNIQUE' \
+                   AND tc.table_schema = 'public' \
+                   AND tc.table_name = $1 \
+                 ORDER BY tc.constraint_name, kcu.ordinal_position",
+                std::slice::from_ref(&table_value),
+            )
+            .await?;
+        let unique_constraints = group_unique_constraints(&unique_rows)?;
+
+        // `information_schema.check_constraints` also includes a synthetic
+        // entry per `NOT NULL` column (Postgres's catalog-level way of
+        // representing `NOT NULL`, already captured by `ColumnInfo::
+        // nullable`) — `pg_catalog.pg_constraint.contype = 'c'` is the
+        // reliable way to get only genuine, user-written `CHECK`
+        // constraints (`contype = 'n'` is where those synthetic entries
+        // actually live). `pg_get_expr` reconstructs just the boolean
+        // expression, with none of `CHECK`'s own keyword or the extra
+        // parens `information_schema` adds around it.
+        let check_rows = conn
+            .fetch_all(
+                "SELECT con.conname AS constraint_name, \
+                        pg_get_expr(con.conbin, con.conrelid) AS expression \
+                 FROM pg_catalog.pg_constraint con \
+                 JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid \
+                 JOIN pg_catalog.pg_namespace ns ON ns.oid = rel.relnamespace \
+                 WHERE con.contype = 'c' \
+                   AND ns.nspname = 'public' \
+                   AND rel.relname = $1",
+                &[table_value],
+            )
+            .await?;
+        let check_constraints = check_rows
+            .iter()
+            .map(|row| {
+                Ok(CheckConstraint {
+                    name: row.get_by_name::<String>("constraint_name")?,
+                    expression: row.get_by_name::<String>("expression")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -162,8 +212,29 @@ impl Driver for PostgresDriver {
         Ok(Some(TableSchema {
             name: table.to_string(),
             columns,
+            unique_constraints,
+            check_constraints,
         }))
     }
+}
+
+/// Groups rows of `(constraint_name, column_name)` — ordered by
+/// `constraint_name` then column position — into one `UniqueConstraint`
+/// per distinct name.
+fn group_unique_constraints(rows: &[Row]) -> Result<Vec<UniqueConstraint>> {
+    let mut result: Vec<UniqueConstraint> = Vec::new();
+    for row in rows {
+        let name = row.get_by_name::<String>("constraint_name")?;
+        let column = row.get_by_name::<String>("column_name")?;
+        match result.last_mut() {
+            Some(last) if last.name == name => last.columns.push(column),
+            _ => result.push(UniqueConstraint {
+                name,
+                columns: vec![column],
+            }),
+        }
+    }
+    Ok(result)
 }
 
 pub struct PostgresConnection {
