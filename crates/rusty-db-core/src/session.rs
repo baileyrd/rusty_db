@@ -72,6 +72,7 @@ pub struct Session {
     before_commit_hooks: Vec<Hook>,
     after_commit_hooks: Vec<Hook>,
     after_rollback_hooks: Vec<Hook>,
+    expire_on_commit: bool,
 }
 
 /// A callback registered with `on_before_flush`/`on_after_flush`/
@@ -106,7 +107,36 @@ impl Session {
             before_commit_hooks: Vec::new(),
             after_commit_hooks: Vec::new(),
             after_rollback_hooks: Vec::new(),
+            expire_on_commit: false,
         }
+    }
+
+    /// After every successful `commit()`, clear the identity map — the
+    /// same effect as calling `clear_identity_map()` yourself right after
+    /// each commit — so the next `get`/`load_all`/`query` for a given row
+    /// re-fetches it fresh from the database instead of returning a
+    /// cached, possibly-stale in-memory handle (e.g. one a database-side
+    /// trigger or column default changed during the write).
+    ///
+    /// This is a coarser tool than SQLAlchemy's own `expire_on_commit`,
+    /// which lazily re-fetches each *attribute* on next access rather than
+    /// the whole object — rusty_db's mapped types are plain structs with
+    /// no attribute-access proxy to hook into, so there's no lazy
+    /// per-field equivalent to offer. What this does give you: a
+    /// guarantee that anything you fetch *after* a commit reflects the
+    /// database's actual post-commit state, not just whatever was in
+    /// memory going in. Handles you already hold keep working exactly
+    /// like `clear_identity_map()` describes — this doesn't touch them,
+    /// only what a *future* `get`/`load_all`/`query` call returns.
+    ///
+    /// Off by default (unlike SQLAlchemy's own `Session`, where
+    /// `expire_on_commit=True` is the default) — every feature in this
+    /// crate that changes existing behavior is opt-in, and clearing the
+    /// identity map on every commit is a real behavior change from the
+    /// caching this crate does otherwise.
+    pub fn with_expire_on_commit(mut self) -> Self {
+        self.expire_on_commit = true;
+        self
     }
 
     /// Registers a callback to run immediately before this session sends
@@ -511,9 +541,10 @@ impl Session {
 
     /// Flush any remaining queued writes, then commit this session's
     /// transaction (a no-op if nothing was ever flushed or read, so no
-    /// transaction is open). Runs `on_before_commit` hooks first (always)
-    /// and `on_after_commit` hooks last (only if a transaction actually
-    /// existed to commit) — see those for details.
+    /// transaction is open). Runs `on_before_commit` hooks first (always);
+    /// once an actual commit happens, clears the identity map if
+    /// `with_expire_on_commit` was set, then runs `on_after_commit` hooks
+    /// last — see those for details.
     pub async fn commit(&mut self) -> Result<()> {
         for hook in &mut self.before_commit_hooks {
             hook();
@@ -521,6 +552,9 @@ impl Session {
         self.flush().await?;
         if let Some(txn) = self.txn.take() {
             txn.commit().await?;
+            if self.expire_on_commit {
+                self.clear_identity_map();
+            }
             for hook in &mut self.after_commit_hooks {
                 hook();
             }

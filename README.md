@@ -465,6 +465,24 @@ session.commit().await?; // fires on_before_flush, then on_after_commit
 
 Hooks are plain `FnMut()` closures (no `async` support — they fire at a specific synchronous point inside an already-`async fn`, not as their own awaited step) and run in registration order. `on_before_flush`/`on_after_flush` only fire when a flush actually has queued writes to send (a flush with nothing pending — including the implicit ones inside `get`/`load_all`/`query`/`commit`/`savepoint` — is a no-op and doesn't trigger them), and `on_after_flush` never fires for a flush that failed. `on_before_commit` fires on every `commit()` call, pending writes or not; `on_after_commit`/`on_after_rollback` only fire when a transaction actually existed to commit/roll back — calling `commit()`/`rollback()` when nothing was ever flushed or read (so no transaction was ever opened) doesn't trigger them.
 
+### Expiring on commit
+
+`engine.session().with_expire_on_commit()` clears the whole identity map right after every successful `commit()`, so the next `get`/`load_all`/`query` for a row re-fetches it fresh from the database instead of handing back a cached, possibly now-stale in-memory handle:
+
+```rust
+let mut session = engine.session().with_expire_on_commit();
+
+let ada = session.get::<User>(1_i64).await?.unwrap();
+ada.borrow_mut().name = "not yet saved".into(); // in-memory only
+
+session.add(&User { id: 2, name: "grace".into() });
+session.commit().await?; // clears the identity map, since a real commit happened
+
+let ada_again = session.get::<User>(1_i64).await?.unwrap(); // fresh fetch, not the stale handle above
+```
+
+This is coarser than SQLAlchemy's own `expire_on_commit`, which lazily re-fetches each *attribute* the next time it's accessed rather than the whole object — rusty_db's mapped types are plain structs with no attribute-access proxy to hook into, so there's no per-field equivalent to offer, only clearing the map outright. It only affects what a *future* `get`/`load_all`/`query` call returns — handles you already hold keep working exactly as `clear_identity_map()` describes, and a `commit()` with nothing to commit (no transaction was ever opened) doesn't clear anything. Off by default, unlike SQLAlchemy's `Session` (where `expire_on_commit=True` is the default) — every behavior change in this crate is opt-in, and clearing the identity map on every commit is a real change from the caching `Session` otherwise does.
+
 ### Identity map
 
 `Session::get`/`load_all` cache decoded rows by `(type, primary key)`: loading the same row twice through the same session returns the exact same `Rc<RefCell<T>>` handle rather than two independently-decoded copies, and mutations made through one handle are visible through any other handle to that row — including handles you fetch *after* the mutation, since the identity map wins over what's actually in the database:
@@ -577,6 +595,8 @@ Unlike `Migrator::up`, which commits each migration independently, `session.migr
 This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 `tests/concurrent_sessions.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover multiple `Session`s sharing one `Engine`/connection pool at the same time — `Session` is intentionally `!Send` (it hands out `Rc`s for the identity map), so these run via `tokio::task::LocalSet`/`spawn_local` rather than `tokio::spawn`, which is the standard way to get genuinely concurrent, interleaved execution of `!Send` futures on one thread. They cover independent commits landing correctly under a burst of concurrent sessions, one session's flushed-but-uncommitted write staying invisible to a concurrent reader on a separate connection (deterministically ordered via a `oneshot` channel, not timing), and two sessions never sharing identity-map state for the same row. Same skip-if-unreachable behavior as the Postgres/MySQL smoke tests; each test uses its own table to avoid colliding with other tests running concurrently against the same live server.
+
+`tests/session_expire_on_commit.rs` (SQLite) covers `Session::with_expire_on_commit`: the identity map is cleared after a real commit but left untouched by a no-op `commit()` (nothing was ever flushed or read, so no transaction was ever opened), untouched entirely without the option set, and a row fetched after expiration reflects the database's actual post-commit state — including a change made directly through the underlying `Engine`, bypassing the session — rather than a stale in-memory edit or the old cached handle.
 
 `tests/pool_exhaustion.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `PoolConfig` itself: a `connect()` beyond a pool's `max_connections` blocks rather than erroring or handing out a duplicate connection, and succeeds once an outstanding connection is dropped back to the pool (proven with `tokio::time::timeout` rather than assumptions about scheduling order); a higher `max_connections` is honored before the pool starts blocking; a configured `acquire_timeout` errors out promptly instead of blocking forever; and a burst of `Session`s serializes correctly (no lost or corrupted writes) when they're all forced to take turns on a single-connection pool.
 
