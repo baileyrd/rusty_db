@@ -34,7 +34,8 @@ As of the most recently merged work: a query builder (`Select`/`Insert`/
 `DELETE`, table aliasing/self-joins, a `text()` escape hatch for dropping
 raw SQL into an otherwise builder-constructed query, `COUNT`/`SUM`/`AVG`/
 `MIN`/`MAX`/arbitrary expression `SELECT` columns via `SelectExpr`,
-`GROUP BY`/`HAVING`); first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
+`GROUP BY`/`HAVING`, `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` via
+`SetOperation`); first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
 `chrono`'s `NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`, and
 `Vec<T>` arrays (native on Postgres, JSON-flattened on MySQL/MariaDB and
 SQLite); `#[derive(Mapped)]` with one primary key, one version column, one
@@ -61,7 +62,6 @@ observability. See `README.md` for the full tour with examples.
   again in Rust. **L**
 - **CTEs (`WITH`, `WITH RECURSIVE`)** — no support; recursive CTEs in
   particular have no workaround at all today. **L**
-- **Set operations** (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) — absent. **M**
 - **Window functions** (`OVER (PARTITION BY ... ORDER BY ...)`, `ROW_NUMBER`,
   `RANK`, running totals) — absent. **L**
 - **`CASE` expressions, `COALESCE`, arithmetic/string SQL functions**
