@@ -178,6 +178,34 @@ fn between_renders_inclusive_bounds() {
 }
 
 #[test]
+fn table_alias_renders_as_clause_and_qualifies_its_own_columns() {
+    let employees = Table::new("employees");
+    let managers = employees.alias("managers");
+
+    // The alias is a distinct `Table` handle: its own `.col(...)` qualifies
+    // with the alias, while the original still qualifies with the real name.
+    let query = Select::from(&employees)
+        .columns([employees.col("name"), managers.col("name")])
+        .join(
+            &managers,
+            employees.col("manager_id").eq_col(&managers.col("id")),
+        );
+
+    let (sql, _) = query.to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT "employees"."name", "managers"."name" FROM "employees" INNER JOIN "employees" AS "managers" ON "employees"."manager_id" = "managers"."id""#
+    );
+}
+
+#[test]
+fn a_table_without_an_alias_renders_unchanged() {
+    let users = Table::new("users");
+    let (sql, _) = Select::from(&users).to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"SELECT * FROM "users""#);
+}
+
+#[test]
 fn ilike_renders_as_ilike_on_postgres_and_falls_back_to_like_elsewhere() {
     let users = Table::new("users");
     let query = Select::from(&users).filter(users.col("name").ilike("%ada%"));

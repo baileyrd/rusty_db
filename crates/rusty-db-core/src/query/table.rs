@@ -6,22 +6,65 @@ use crate::value::Value;
 #[derive(Debug, Clone)]
 pub struct Table {
     name: String,
+    alias: Option<String>,
 }
 
 impl Table {
     pub fn new(name: impl Into<String>) -> Self {
-        Table { name: name.into() }
+        Table {
+            name: name.into(),
+            alias: None,
+        }
     }
 
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Reference a column belonging to this table.
+    /// A second, aliased reference to the same underlying table — for a
+    /// self-join, or anywhere the same table needs to appear more than
+    /// once in one query. `.col(...)` on the result qualifies columns with
+    /// the alias, not the original table name, and `Select`/`join` render
+    /// `<table> AS <alias>` for it.
+    ///
+    /// ```
+    /// # use rusty_db_core::Table;
+    /// let employees = Table::new("employees");
+    /// let managers = employees.alias("managers");
+    /// let query = employees.col("manager_id").eq_col(&managers.col("id"));
+    /// ```
+    pub fn alias(&self, alias: impl Into<String>) -> Self {
+        Table {
+            name: self.name.clone(),
+            alias: Some(alias.into()),
+        }
+    }
+
+    /// The name queries should qualify this table's columns with: the
+    /// alias if one was given, otherwise the table's own name.
+    fn qualifier(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Reference a column belonging to this table (qualified by its alias,
+    /// if it has one).
     pub fn col(&self, name: impl Into<String>) -> Column {
         Column {
-            table: self.name.clone(),
+            table: self.qualifier().to_string(),
             name: name.into(),
+        }
+    }
+
+    /// This table as it appears in a `FROM`/`JOIN` clause: just its quoted
+    /// name, or `<name> AS <alias>` if it was given one via `.alias(...)`.
+    pub(crate) fn as_clause_sql(&self, dialect: &dyn Dialect) -> String {
+        match &self.alias {
+            Some(alias) => format!(
+                "{} AS {}",
+                dialect.quote_ident(&self.name),
+                dialect.quote_ident(alias)
+            ),
+            None => dialect.quote_ident(&self.name),
         }
     }
 }
