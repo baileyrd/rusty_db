@@ -40,7 +40,8 @@ pub use rusty_db_mysql as mysql;
 pub mod prelude {
     pub use rusty_db_core::{
         Column, Delete, Engine, Entity, Expr, FromRow, Identifiable, Insert, Join, JoinKind,
-        Mapped, Migration, Migrator, PoolConfig, Row, Select, Session, Table, ToSql, Update, Value,
+        Mapped, Migration, Migrator, PoolConfig, ReplicaSet, Row, Select, Session, Table, ToSql,
+        Update, Value,
     };
 
     // `Mapped` above is the trait (type namespace); this is the derive
