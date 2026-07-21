@@ -1,6 +1,7 @@
 use crate::error::Result;
 use crate::query::{Delete, Insert, Update};
 use crate::row::Row;
+use crate::value::Value;
 
 /// Describes the table a struct maps to. Implemented by `#[derive(Mapped)]`
 /// (from `rusty-db-derive`), not meant to be implemented by hand.
@@ -33,4 +34,8 @@ pub trait Entity: Mapped {
 pub trait Identifiable: Entity {
     fn update(&self) -> Update;
     fn delete_query(&self) -> Delete;
+
+    /// The value of `self`'s `#[table(primary_key)]` field. Used by
+    /// `Session`'s identity map to key cached instances.
+    fn primary_key_value(&self) -> Value;
 }

@@ -219,6 +219,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                         #core::Delete::from(&Self::table())
                             .filter(Self::table().col(#pk_column).eq(::std::clone::Clone::clone(&self.#pk_ident)))
                     }
+
+                    /// The value of the `#[table(primary_key)]` field.
+                    pub fn primary_key_value(&self) -> #core::Value {
+                        ::std::convert::Into::into(::std::clone::Clone::clone(&self.#pk_ident))
+                    }
                 }
 
                 impl #core::Identifiable for #struct_ident {
@@ -228,6 +233,10 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
                     fn delete_query(&self) -> #core::Delete {
                         Self::delete_query(self)
+                    }
+
+                    fn primary_key_value(&self) -> #core::Value {
+                        Self::primary_key_value(self)
                     }
                 }
             }
