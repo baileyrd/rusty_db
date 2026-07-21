@@ -10,6 +10,7 @@
 //! database is actually behind it is decided at startup by which `Driver`
 //! gets passed to `Engine::new`.
 
+pub mod backup;
 pub mod connection;
 pub mod dialect;
 pub mod engine;
@@ -26,6 +27,7 @@ pub mod session;
 pub mod timeout;
 pub mod value;
 
+pub use backup::{DatabaseDump, TableDump};
 pub use connection::{Connection, Driver, Executor};
 pub use dialect::Dialect;
 pub use engine::{Engine, Transaction};
