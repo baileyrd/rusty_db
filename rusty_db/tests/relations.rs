@@ -6,8 +6,8 @@ use rusty_db::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Mapped)]
 #[table(name = "users")]
-#[has_many(Order, foreign_key = "user_id")]
-#[has_one(Profile, foreign_key = "user_id")]
+#[has_many(Order, foreign_key = "user_id", cascade = "delete")]
+#[has_one(Profile, foreign_key = "user_id", cascade = "delete")]
 struct User {
     #[table(primary_key)]
     id: i64,
@@ -39,7 +39,8 @@ struct Profile {
     Tag,
     through = "post_tags",
     local_key = "post_id",
-    foreign_key = "tag_id"
+    foreign_key = "tag_id",
+    cascade = "delete"
 )]
 struct Post {
     #[table(primary_key)]
@@ -52,6 +53,24 @@ struct Post {
 struct Tag {
     #[table(primary_key)]
     id: i64,
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Mapped)]
+#[table(name = "teams")]
+#[has_many(Player, foreign_key = "team_id", cascade = "orphan")]
+struct Team {
+    #[table(primary_key)]
+    id: i64,
+    name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Mapped)]
+#[table(name = "players")]
+struct Player {
+    #[table(primary_key)]
+    id: i64,
+    team_id: Option<i64>,
     name: String,
 }
 
@@ -102,6 +121,22 @@ async fn engine_with_schema() -> rusty_db::Result<Engine> {
         .await?
         .execute(
             "CREATE TABLE post_tags (post_id INTEGER NOT NULL, tag_id INTEGER NOT NULL)",
+            &[],
+        )
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            &[],
+        )
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE players (id INTEGER PRIMARY KEY, team_id INTEGER, name TEXT NOT NULL)",
             &[],
         )
         .await?;
@@ -415,6 +450,208 @@ async fn many_to_many_returns_empty_map_for_empty_input() -> rusty_db::Result<()
     let no_posts: Vec<Post> = Vec::new();
     let tags_by_post: HashMap<i64, Vec<Tag>> = Post::load_tags(&engine, &no_posts).await?;
     assert!(tags_by_post.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_cascading_deletes_cascade_delete_children_and_the_parent() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine
+        .execute(
+            &(Order {
+                id: 1,
+                user_id: 1,
+                amount: 100,
+            })
+            .insert(),
+        )
+        .await?;
+    engine
+        .execute(
+            &(Order {
+                id: 2,
+                user_id: 1,
+                amount: 50,
+            })
+            .insert(),
+        )
+        .await?;
+    engine
+        .execute(
+            &(Profile {
+                id: 1,
+                user_id: 1,
+                bio: "mathematician".to_string(),
+            })
+            .insert(),
+        )
+        .await?;
+
+    ada.delete_cascading(&engine).await?;
+
+    let users: Vec<User> = engine.fetch_all_as(&Select::from(&User::table())).await?;
+    assert!(users.is_empty(), "the user itself should be deleted");
+    let orders: Vec<Order> = engine.fetch_all_as(&Select::from(&Order::table())).await?;
+    assert!(
+        orders.is_empty(),
+        "cascade = \"delete\" has_many children should be deleted too"
+    );
+    let profiles: Vec<Profile> = engine
+        .fetch_all_as(&Select::from(&Profile::table()))
+        .await?;
+    assert!(
+        profiles.is_empty(),
+        "cascade = \"delete\" has_one child should be deleted too"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_cascading_does_not_touch_a_different_users_children() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+    engine
+        .execute(
+            &(Order {
+                id: 1,
+                user_id: 2,
+                amount: 200,
+            })
+            .insert(),
+        )
+        .await?;
+
+    ada.delete_cascading(&engine).await?;
+
+    let users: Vec<User> = engine.fetch_all_as(&Select::from(&User::table())).await?;
+    assert_eq!(users, vec![grace]);
+    let orders: Vec<Order> = engine.fetch_all_as(&Select::from(&Order::table())).await?;
+    assert_eq!(orders.len(), 1, "grace's order should be untouched");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_cascading_orphans_instead_of_deleting_in_orphan_mode() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let team = Team {
+        id: 1,
+        name: "rustaceans".to_string(),
+    };
+    engine.execute(&team.insert()).await?;
+    engine
+        .execute(
+            &(Player {
+                id: 1,
+                team_id: Some(1),
+                name: "ferris".to_string(),
+            })
+            .insert(),
+        )
+        .await?;
+    engine
+        .execute(
+            &(Player {
+                id: 2,
+                team_id: Some(1),
+                name: "cargo".to_string(),
+            })
+            .insert(),
+        )
+        .await?;
+
+    team.delete_cascading(&engine).await?;
+
+    let teams: Vec<Team> = engine.fetch_all_as(&Select::from(&Team::table())).await?;
+    assert!(teams.is_empty(), "the team itself should be deleted");
+
+    let mut players: Vec<Player> = engine.fetch_all_as(&Select::from(&Player::table())).await?;
+    players.sort_by_key(|p| p.id);
+    assert_eq!(
+        players,
+        vec![
+            Player {
+                id: 1,
+                team_id: None,
+                name: "ferris".to_string(),
+            },
+            Player {
+                id: 2,
+                team_id: None,
+                name: "cargo".to_string(),
+            },
+        ],
+        "cascade = \"orphan\" players should survive, with their foreign key nulled out"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_cascading_many_to_many_deletes_join_rows_but_not_the_targets(
+) -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let post = Post {
+        id: 1,
+        title: "Why Rust".to_string(),
+    };
+    let other_post = Post {
+        id: 2,
+        title: "Also About Rust".to_string(),
+    };
+    engine.execute(&post.insert()).await?;
+    engine.execute(&other_post.insert()).await?;
+
+    let rust_tag = Tag {
+        id: 1,
+        name: "rust".to_string(),
+    };
+    engine.execute(&rust_tag.insert()).await?;
+
+    // Both posts share the same tag, so deleting one post's join rows must
+    // not touch the tag itself (still referenced by the other post) or the
+    // other post's own join row.
+    insert_post_tag(&engine, post.id, rust_tag.id).await?;
+    insert_post_tag(&engine, other_post.id, rust_tag.id).await?;
+
+    post.delete_cascading(&engine).await?;
+
+    let posts: Vec<Post> = engine.fetch_all_as(&Select::from(&Post::table())).await?;
+    assert_eq!(posts, vec![other_post.clone()]);
+
+    let tags: Vec<Tag> = engine.fetch_all_as(&Select::from(&Tag::table())).await?;
+    assert_eq!(
+        tags,
+        vec![rust_tag.clone()],
+        "the shared tag must survive — many_to_many cascade only deletes join rows"
+    );
+
+    let remaining_tags_by_post: HashMap<i64, Vec<Tag>> =
+        Post::load_tags(&engine, std::slice::from_ref(&other_post)).await?;
+    assert_eq!(
+        remaining_tags_by_post.get(&other_post.id).unwrap(),
+        &vec![rust_tag]
+    );
 
     Ok(())
 }

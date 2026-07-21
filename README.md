@@ -624,6 +624,29 @@ let tags_by_post: HashMap<i64, Vec<Tag>> = Post::load_tags(&engine, &posts).awai
 
 Unlike `has_many`/`has_one`/`belongs_to`, which only ever need one extra query beyond the parents you already have, this one's a real SQL `JOIN` against the join table rather than a plain `WHERE ... IN (...)` — still exactly one extra query for the whole batch, just joined instead of filtered. Generated from, and callable directly as, `rusty_db::relations::load_many_to_many`. The three named parameters can appear in any order after `Target`.
 
+### Cascade rules
+
+`has_many`/`has_one`/`many_to_many` accept an optional `cascade = "delete"` or `cascade = "orphan"` parameter (`many_to_many` only supports `"delete"`). Any relation carrying one generates `Self::delete_cascading(&self, engine)`, which runs every cascading relationship's cleanup query, then deletes `self`, all inside one transaction:
+
+```rust
+#[derive(Mapped)]
+#[table(name = "users")]
+#[has_many(Order, foreign_key = "user_id", cascade = "delete")]
+#[has_one(Profile, foreign_key = "user_id", cascade = "delete")]
+struct User {
+    #[table(primary_key)]
+    id: i64,
+    name: String,
+}
+
+let ada: User = /* ... */;
+ada.delete_cascading(&engine).await?; // deletes ada's orders and profile, then ada herself
+```
+
+`cascade = "delete"` on `has_many`/`has_one` issues a `DELETE` against the child table filtered by the foreign key; `cascade = "orphan"` issues an `UPDATE ... SET <foreign_key> = NULL` instead, so the children survive with a null foreign key rather than being removed. `cascade = "delete"` on `many_to_many` deletes only the join-table rows for this parent — never the target's own rows, which may still be referenced by other parents (there's no `"orphan"` mode for `many_to_many`, since nulling a join table's row doesn't mean anything; the row itself *is* the association). Without at least one `cascade = "..."` parameter somewhere on a type, `delete_cascading` simply isn't generated for it at all.
+
+This is a plain `Engine`-based alternative to `Session::delete`, not integrated with it — no identity-map eviction, no audit logging, no soft-delete support (cascading always issues a real `DELETE`/`UPDATE`, the same way `delete_query()` does) — call it directly when you want cascading, consistent with every other relationship helper's "explicitly loaded/called, no hidden magic" philosophy.
+
 ### Migrations
 
 `Engine::migrator()` (or `Migrator::new(&engine)`) runs versioned schema migrations, tracking which have applied in a bookkeeping table (`_rusty_db_migrations` by default). Migrations are plain SQL — the query builder covers DML, not DDL, and DDL syntax diverges more across databases than DML does, so there's no attempt to make a migration portable for you:
@@ -667,7 +690,7 @@ Unlike `Migrator::up`, which commits each migration independently, `session.migr
 
 ## Status
 
-This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/has-one/belongs-to/many-to-many eager loading), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 `tests/concurrent_sessions.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover multiple `Session`s sharing one `Engine`/connection pool at the same time — `Session` is intentionally `!Send` (it hands out `Rc`s for the identity map), so these run via `tokio::task::LocalSet`/`spawn_local` rather than `tokio::spawn`, which is the standard way to get genuinely concurrent, interleaved execution of `!Send` futures on one thread. They cover independent commits landing correctly under a burst of concurrent sessions, one session's flushed-but-uncommitted write staying invisible to a concurrent reader on a separate connection (deterministically ordered via a `oneshot` channel, not timing), and two sessions never sharing identity-map state for the same row. Same skip-if-unreachable behavior as the Postgres/MySQL smoke tests; each test uses its own table to avoid colliding with other tests running concurrently against the same live server.
 
@@ -682,6 +705,8 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 `tests/relations.rs` (SQLite) now also covers `#[has_one(...)]`: a batch of parents where only some have a matching child comes back with entries only for those that do (same "no entry at all" shape `has_many` already had for a childless parent); and a parent with *two* matching child rows — a relationship that isn't actually one-to-one — returns `Error::Conflict` rather than silently keeping or dropping one of them.
 
 It also covers `#[many_to_many(...)]`: a batch of parents joined through a join table to a shared and a distinct set of targets comes back grouped correctly per parent (a post tagged `rust`+`systems` and another tagged `rust`+`databases` both get the right two tags, with `rust` correctly appearing under both), a parent with no join-table rows at all has no entry in the map, and empty input returns an empty map, same as the other three relationship kinds.
+
+It also covers cascade rules (`delete_cascading`): deleting a user with `cascade = "delete"` `has_many`/`has_one` relations removes both its orders and its profile along with the user itself, while a different user's own orders are left completely untouched; deleting a team with a `cascade = "orphan"` `has_many` leaves its players in place but with their foreign key nulled out rather than deleting them; and deleting a post with a `cascade = "delete"` `many_to_many` removes only that post's own join-table rows — a tag shared with another post survives, and so does the other post's own join row and its own view of that tag through `load_tags`.
 
 `tests/query_timeout.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `with_timeout`: an operation finishing inside its timeout succeeds normally; a genuinely slow/blocked operation is cancelled and returns `Error::Timeout` instead of hanging; a cancelled operation leaves the pool usable afterward rather than stuck; a timeout on one call has no lingering effect on later calls; and aborting a task running a slow operation (`JoinHandle::abort`, the other standard way to cancel a Rust future) cancels it the same way a timeout would. The SQLite version gets a genuinely blocked (not simulated) query via real lock contention — holding SQLite's write lock on one connection while a second connection attempts a conflicting write, which sqlx's SQLite driver retries against its own 5-second `busy_timeout` rather than erroring immediately. The Postgres/MySQL versions use their real, built-in `pg_sleep()`/`SLEEP()` functions for a genuinely slow query instead.
 

@@ -48,6 +48,11 @@
 //!   = "...", local_key = "...", foreign_key = "...")]` attribute,
 //!   batch-loading every `Target` row joined to `Self` through a join
 //!   table (see `rusty_db_core::relations::load_many_to_many`)
+//! - `Self::delete_cascading(&self, engine)`, but only if at least one
+//!   `has_many`/`has_one`/`many_to_many` attribute also carries a `cascade
+//!   = "delete"` or `cascade = "orphan"` parameter — deletes (or, in
+//!   `"orphan"` mode, nulls the foreign key of) every cascading
+//!   relationship's rows, then deletes `self`, all in one transaction
 //!
 //! A field additionally marked `#[table(version)]` (requires
 //! `#[table(primary_key)]` too) turns on optimistic locking: `update`'s
@@ -95,29 +100,54 @@ struct FieldInfo {
     soft_delete: bool,
 }
 
-/// The shared shape of `#[has_many(Target, foreign_key = "...")]` and
-/// `#[belongs_to(Target, foreign_key = "...")]`.
+/// The shared shape of `#[has_many(Target, foreign_key = "...")]`,
+/// `#[has_one(Target, foreign_key = "...")]`, and `#[belongs_to(Target,
+/// foreign_key = "...")]` — all three also accept an optional `cascade =
+/// "delete"` or `cascade = "orphan"` (meaningless, and rejected, on
+/// `belongs_to`; see `expand_cascade_delete`).
 struct RelationSpec {
     target: syn::Path,
     foreign_key: syn::LitStr,
+    cascade: Option<syn::LitStr>,
 }
 
 impl Parse for RelationSpec {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let target: syn::Path = input.parse()?;
         input.parse::<Token![,]>()?;
-        let key: syn::Ident = input.parse()?;
-        if key != "foreign_key" {
-            return Err(syn::Error::new_spanned(
-                &key,
-                "expected `foreign_key = \"...\"`",
-            ));
+
+        let mut foreign_key: Option<syn::LitStr> = None;
+        let mut cascade: Option<syn::LitStr> = None;
+
+        loop {
+            let key: syn::Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            let value: syn::LitStr = input.parse()?;
+            if key == "foreign_key" {
+                foreign_key = Some(value);
+            } else if key == "cascade" {
+                cascade = Some(value);
+            } else {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    "expected `foreign_key` or `cascade`",
+                ));
+            }
+            if input.is_empty() {
+                break;
+            }
+            input.parse::<Token![,]>()?;
         }
-        input.parse::<Token![=]>()?;
-        let foreign_key: syn::LitStr = input.parse()?;
+
         Ok(RelationSpec {
             target,
-            foreign_key,
+            foreign_key: foreign_key.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "expected `foreign_key = \"...\"`",
+                )
+            })?,
+            cascade,
         })
     }
 }
@@ -125,12 +155,15 @@ impl Parse for RelationSpec {
 /// `#[many_to_many(Target, through = "...", local_key = "...", foreign_key
 /// = "...")]`'s shape: a join table (`through`) with a column referencing
 /// this struct (`local_key`) and a column referencing `Target`
-/// (`foreign_key`). The three named parameters may appear in any order.
+/// (`foreign_key`). The three required named parameters, plus the optional
+/// `cascade = "delete"` (the only mode it supports — see
+/// `expand_cascade_delete`), may appear in any order.
 struct ManyToManySpec {
     target: syn::Path,
     through: syn::LitStr,
     local_key: syn::LitStr,
     foreign_key: syn::LitStr,
+    cascade: Option<syn::LitStr>,
 }
 
 impl Parse for ManyToManySpec {
@@ -141,6 +174,7 @@ impl Parse for ManyToManySpec {
         let mut through: Option<syn::LitStr> = None;
         let mut local_key: Option<syn::LitStr> = None;
         let mut foreign_key: Option<syn::LitStr> = None;
+        let mut cascade: Option<syn::LitStr> = None;
 
         loop {
             let key: syn::Ident = input.parse()?;
@@ -152,10 +186,12 @@ impl Parse for ManyToManySpec {
                 local_key = Some(value);
             } else if key == "foreign_key" {
                 foreign_key = Some(value);
+            } else if key == "cascade" {
+                cascade = Some(value);
             } else {
                 return Err(syn::Error::new_spanned(
                     &key,
-                    "expected `through`, `local_key`, or `foreign_key`",
+                    "expected `through`, `local_key`, `foreign_key`, or `cascade`",
                 ));
             }
             if input.is_empty() {
@@ -184,6 +220,7 @@ impl Parse for ManyToManySpec {
                     "#[many_to_many(...)] requires `foreign_key = \"...\"`",
                 )
             })?,
+            cascade,
         })
     }
 }
@@ -449,6 +486,15 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         .map(|spec| expand_many_to_many(struct_ident, &core, primary_key, spec))
         .collect::<syn::Result<Vec<_>>>()?;
 
+    let cascade_delete_impl = expand_cascade_delete(
+        struct_ident,
+        &core,
+        primary_key,
+        &has_many,
+        &has_one,
+        &many_to_many,
+    )?;
+
     Ok(quote! {
         impl #core::Mapped for #struct_ident {
             const TABLE_NAME: &'static str = #table_name;
@@ -490,6 +536,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         #(#has_one_impls)*
         #(#belongs_to_impls)*
         #(#many_to_many_impls)*
+        #cascade_delete_impl
     })
 }
 
@@ -649,6 +696,143 @@ fn expand_many_to_many(
     })
 }
 
+/// Generates `Self::delete_cascading`, but only if at least one
+/// `#[has_many(...)]`/`#[has_one(...)]`/`#[many_to_many(...)]` attribute on
+/// this struct carries a `cascade = "..."` parameter — otherwise emits
+/// nothing (an empty token stream), the same "only if the attribute is
+/// present" shape every other generated method already follows.
+///
+/// `delete_cascading` runs every cascading relationship's cleanup query
+/// first (a `has_many`/`has_one` in `cascade = "delete"` mode issues a
+/// `DELETE`; in `cascade = "orphan"` mode, an `UPDATE ... SET <foreign_key>
+/// = NULL`; a `many_to_many` in `cascade = "delete"` mode — its only
+/// supported mode — deletes the join-table rows, never the `Target` rows
+/// themselves, since those may still be referenced by other parents), then
+/// deletes `self`, all inside one transaction: a failure at any point
+/// rolls the whole thing back, leaving nothing changed.
+fn expand_cascade_delete(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    has_many: &[RelationSpec],
+    has_one: &[RelationSpec],
+    many_to_many: &[ManyToManySpec],
+) -> syn::Result<TokenStream2> {
+    let cascading_relations: Vec<&RelationSpec> = has_many
+        .iter()
+        .chain(has_one.iter())
+        .filter(|spec| spec.cascade.is_some())
+        .collect();
+    let cascading_many_to_many: Vec<&ManyToManySpec> = many_to_many
+        .iter()
+        .filter(|spec| spec.cascade.is_some())
+        .collect();
+
+    if cascading_relations.is_empty() && cascading_many_to_many.is_empty() {
+        return Ok(quote! {});
+    }
+
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            struct_ident,
+            "`cascade = \"...\"` requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_ident = &pk.ident;
+
+    let mut cascade_stmts = Vec::new();
+
+    for spec in &cascading_relations {
+        let child = &spec.target;
+        let fk_column = &spec.foreign_key;
+        let cascade_lit = spec.cascade.as_ref().expect("filtered to Some above");
+        let stmt = match cascade_lit.value().as_str() {
+            "delete" => quote! {
+                let child_table = #core::Table::new(<#child as #core::Mapped>::TABLE_NAME);
+                let query = #core::Delete::from(&child_table)
+                    .filter(child_table.col(#fk_column).eq(::std::clone::Clone::clone(&self.#pk_ident)));
+                if let ::std::result::Result::Err(err) = txn.execute_query(&query, engine.dialect()).await {
+                    txn.rollback().await?;
+                    return ::std::result::Result::Err(err);
+                }
+            },
+            "orphan" => quote! {
+                let child_table = #core::Table::new(<#child as #core::Mapped>::TABLE_NAME);
+                let query = #core::Update::table(&child_table)
+                    .set(#fk_column, #core::Value::Null)
+                    .filter(child_table.col(#fk_column).eq(::std::clone::Clone::clone(&self.#pk_ident)));
+                if let ::std::result::Result::Err(err) = txn.execute_query(&query, engine.dialect()).await {
+                    txn.rollback().await?;
+                    return ::std::result::Result::Err(err);
+                }
+            },
+            other => {
+                return Err(syn::Error::new_spanned(
+                    cascade_lit,
+                    format!(
+                        "unsupported cascade mode {other:?}; expected \"delete\" or \"orphan\""
+                    ),
+                ));
+            }
+        };
+        cascade_stmts.push(quote! { { #stmt } });
+    }
+
+    for spec in &cascading_many_to_many {
+        let through = &spec.through;
+        let local_key = &spec.local_key;
+        let cascade_lit = spec.cascade.as_ref().expect("filtered to Some above");
+        if cascade_lit.value() != "delete" {
+            return Err(syn::Error::new_spanned(
+                cascade_lit,
+                format!(
+                    "unsupported cascade mode {:?} for #[many_to_many(...)]; only \"delete\" \
+                     is supported there (it deletes the join-table rows, never the target's own \
+                     rows, which may still be referenced by other parents)",
+                    cascade_lit.value()
+                ),
+            ));
+        }
+        cascade_stmts.push(quote! {
+            {
+                let through_table = #core::Table::new(#through);
+                let query = #core::Delete::from(&through_table)
+                    .filter(through_table.col(#local_key).eq(::std::clone::Clone::clone(&self.#pk_ident)));
+                if let ::std::result::Result::Err(err) = txn.execute_query(&query, engine.dialect()).await {
+                    txn.rollback().await?;
+                    return ::std::result::Result::Err(err);
+                }
+            }
+        });
+    }
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// Deletes this row, first running every cascading relationship's
+            /// cleanup query (see each `cascade = "..."` relation attribute
+            /// for what it does), all inside one transaction — a failure at
+            /// any point rolls the whole thing back, leaving nothing changed.
+            ///
+            /// A plain `Engine`-based alternative to `Session::delete`, not
+            /// integrated with it (no identity-map eviction, no audit
+            /// logging, no soft-delete) — call this directly when you want
+            /// cascading, the same way `delete_query()` is a direct
+            /// alternative to going through a `Session` at all.
+            pub async fn delete_cascading(&self, engine: &#core::Engine) -> #core::Result<()> {
+                let mut txn = engine.begin().await?;
+                #(#cascade_stmts)*
+                if let ::std::result::Result::Err(err) =
+                    txn.execute_query(&self.delete_query(), engine.dialect()).await
+                {
+                    txn.rollback().await?;
+                    return ::std::result::Result::Err(err);
+                }
+                txn.commit().await
+            }
+        }
+    })
+}
+
 /// `#[belongs_to(Parent, foreign_key = "...")]` generates a batched loader
 /// keyed by the `Parent`'s primary key, using `Self`'s own `foreign_key`
 /// field as the value to look up.
@@ -658,6 +842,14 @@ fn expand_belongs_to(
     fields: &[FieldInfo],
     spec: &RelationSpec,
 ) -> syn::Result<TokenStream2> {
+    if let Some(cascade) = &spec.cascade {
+        return Err(syn::Error::new_spanned(
+            cascade,
+            "#[belongs_to(...)] doesn't support `cascade` — cascade rules belong on the \
+             has_many/has_one side (the parent whose delete triggers the cascade), not on \
+             belongs_to (the child side)",
+        ));
+    }
     let fk_column_value = spec.foreign_key.value();
     let fk_field = fields.iter().find(|f| f.column == fk_column_value).ok_or_else(|| {
         syn::Error::new_spanned(
