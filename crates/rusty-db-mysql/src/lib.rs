@@ -9,6 +9,7 @@ use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::{Column as _, MySql, MySqlPool, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::MySqlDialect;
+use rusty_db_core::value::array_to_json;
 use rusty_db_core::{
     CheckConstraint, ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, ForeignKey,
     IndexInfo, PoolConfig, PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint,
@@ -448,6 +449,10 @@ macro_rules! bind_params {
                 Value::Time(t) => query.bind(*t),
                 Value::DateTime(dt) => query.bind(*dt),
                 Value::Timestamp(ts) => query.bind(*ts),
+                // MySQL/MariaDB has no native array column type at all;
+                // bind its JSON array text form instead, same as any other
+                // text value.
+                Value::Array(items) => query.bind(array_to_json(items).to_string()),
             };
         }
         query

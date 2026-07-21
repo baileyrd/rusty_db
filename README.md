@@ -285,7 +285,7 @@ engine.execute(&user.update()).await?;   // only generated when a field is #[tab
 engine.execute(&user.delete_query()).await?;
 ```
 
-Field types are limited to whatever `Value` already converts from (`bool`, `i64`, `i32`, `f64`, `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, `Json`, `NaiveDate`, `NaiveTime`, `NaiveDateTime`, `DateTime<Utc>`, and `Option<_>` of those) — plus any type deriving `MappedEnum`/`MappedNewtype`, or implementing `Into<Value>`/`FromValue` by hand (see "Custom types" below). A field additionally marked `#[table(version)]` (requires `#[table(primary_key)]` too) turns on optimistic locking — see below.
+Field types are limited to whatever `Value` already converts from (`bool`, `i64`, `i32`, `f64`, `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, `Json`, `NaiveDate`, `NaiveTime`, `NaiveDateTime`, `DateTime<Utc>`, `Vec<T>` for a handful of element types (see "Array columns" below), and `Option<_>` of any of those) — plus any type deriving `MappedEnum`/`MappedNewtype`, or implementing `Into<Value>`/`FromValue` by hand (see "Custom types" below). A field additionally marked `#[table(version)]` (requires `#[table(primary_key)]` too) turns on optimistic locking — see below.
 
 ### UUID values
 
@@ -409,6 +409,34 @@ engine.execute(&account.insert()).await?; // stores status as the text "banned_u
 ```
 
 By default each variant stores as `Value::Text` holding its own snake_case name (`Active` → `"active"`) — override one with `#[mapped_enum(rename = "...")]` on that specific variant, as `Banned` does above. `#[mapped_enum(as_int)]` on the enum itself switches the whole thing to `Value::I64` instead, storing each variant's own discriminant (`v as i64`, so explicit `= N` values on individual variants are honored) rather than its name; unlike the text form, this doesn't survive the enum's variants being reordered or renumbered later; whichever mode is picked, decoding an unrecognized stored value (an unmapped string, or an integer with no matching variant) is an error rather than a silent fallback. This works identically on every backend, since it's an ordinary `TEXT`/`INTEGER` column underneath, not a database-native enum type (Postgres's own `CREATE TYPE ... AS ENUM` isn't required, or supported specially, here).
+
+### Array columns
+
+`Value::Array` backs `Vec<T>` for a handful of element types — `bool`, `i64`, `f64`, `String`, `Uuid`, `BigDecimal`, the four temporal types above, and `Value` itself as a fully-generic escape hatch:
+
+```rust
+#[derive(Mapped)]
+#[table(name = "playlists")]
+struct Playlist {
+    #[table(primary_key)]
+    id: i64,
+    track_ids: Vec<i64>,
+    tags: Vec<String>,
+    featured_ids: Option<Vec<i64>>,
+}
+
+let playlist = Playlist {
+    id: 1,
+    track_ids: vec![10, 20, 30],
+    tags: vec!["rock".into(), "live".into()],
+    featured_ids: None,
+};
+engine.execute(&playlist.insert()).await?;
+```
+
+Postgres has a native array type for virtually every scalar column type (`INTEGER[]`/`TEXT[]`/`UUID[]`/...) and round-trips this variant directly over its binary wire format. MySQL/MariaDB and SQLite have no array column type at all, so on those two an array field is stored as a JSON array instead (both already support JSON, natively or as text) — `FromValue for Vec<T>` parses that JSON-array form back too, so a mapped struct's `Vec<T>` field round-trips correctly on every backend, just without Postgres's native wire format (or a native array type at all) on the other two.
+
+One sharp edge on Postgres specifically: binding an array picks its native Postgres array type by inspecting the first non-null element, since `Value::Array` itself carries no element-type tag once constructed (unlike a mapped struct field's own static Rust type, which the query-building layer doesn't see by the time it's binding parameters). An empty array, or one whose every element is `Value::Null`, has no element to inspect — that case binds as `TEXT[]`, which needs an explicit cast (or, more simply, a `TEXT[]` target column) if that's not what the column actually expects. A Postgres array containing a genuine `NULL` element decodes fine into the `Vec<Value>` escape hatch (each element independently, `Value::Null` included) but not into a concrete `Vec<i64>` field, which has nowhere to put a `NULL` — that's a decode error rather than silently dropping or defaulting it.
 
 ### Custom types
 
@@ -850,7 +878,7 @@ Unlike `Migrator::up`, which commits each migration independently, `session.migr
 
 ## Status
 
-This covers Core (query builder, connections, first-class `Uuid`/`BigDecimal`/`Json`/temporal (`NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`) value types), a thin mapping layer (`#[derive(Mapped)]`, `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]` for custom field types, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder, connections, first-class `Uuid`/`BigDecimal`/`Json`/temporal (`NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`)/array (`Vec<T>`) value types), a thin mapping layer (`#[derive(Mapped)]`, `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]` for custom field types, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 `tests/concurrent_sessions.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover multiple `Session`s sharing one `Engine`/connection pool at the same time — `Session` is intentionally `!Send` (it hands out `Rc`s for the identity map), so these run via `tokio::task::LocalSet`/`spawn_local` rather than `tokio::spawn`, which is the standard way to get genuinely concurrent, interleaved execution of `!Send` futures on one thread. They cover independent commits landing correctly under a burst of concurrent sessions, one session's flushed-but-uncommitted write staying invisible to a concurrent reader on a separate connection (deterministically ordered via a `oneshot` channel, not timing), and two sessions never sharing identity-map state for the same row. Same skip-if-unreachable behavior as the Postgres/MySQL smoke tests; each test uses its own table to avoid colliding with other tests running concurrently against the same live server.
 
@@ -875,6 +903,8 @@ It also covers cascade rules (`delete_cascading`): deleting a user with `cascade
 `tests/json_value.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `Value::Json`/`Json`: a mapped struct's `Json` field (including an `Option<Json>` one) round-trips correctly on every backend, and — Postgres-only — a native `JSONB` column decodes as `Value::Json` directly rather than `Value::Text`. Getting this working on MySQL/MariaDB surfaced a real quirk: its `JSON` columns report as one of MySQL's own `BLOB`-family types at the wire-protocol level, so they decode as `Value::Bytes`, not `Value::Text` the way `DECIMAL`/`UUID`-as-text columns do elsewhere on that backend — `FromValue for Json` accepts that form too (via UTF-8 first, then JSON parsing), so a `Json` field round-trips there without the caller ever needing to know about the difference.
 
 `tests/temporal_value.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `Value::Date`/`Value::Time`/`Value::DateTime`/`Value::Timestamp`: a mapped struct's four temporal fields round-trip correctly on every backend; on SQLite specifically, a `NaiveDateTime` field parses back correctly regardless of whether the stored text is space- or `T`-separated, and (as a standalone conversion-logic check, not a database one, since SQLite can't tell the two apart at decode time to begin with) `Value::DateTime`/`Value::Timestamp` fall back to each other correctly. Postgres and MySQL each get a test confirming all four decode as their native variant directly rather than `Value::Text` — MySQL's specifically confirms its `DATETIME`/`TIMESTAMP` split decodes as `Value::DateTime`/`Value::Timestamp` respectively despite being identical bytes on the wire.
+
+`tests/array_value.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `Value::Array`/`Vec<T>`: a mapped struct's array fields (including an `Option<Vec<T>>` one, and an empty array) round-trip correctly on every backend; on SQLite, a `Vec<T>` field also parses back correctly from raw JSON array text inserted outside this crate's own binding. Postgres gets a test confirming all four array columns decode as `Value::Array` directly rather than `Value::Text`, plus two tests pinning down the one documented sharp edge: an empty array round-trips into a `TEXT[]` column (where the binding default happens to match) but is a clear database error against a differently-typed empty array column, and a native array containing a genuine `NULL` element decodes fine into the `Vec<Value>` escape hatch but is a decode error into a concrete `Vec<i64>` field. MySQL's confirms the same JSON-array flattening `tests/json_value_mysql.rs` already covers for `Value::Json` applies here too.
 
 `tests/mapped_enum.rs` (SQLite) covers `#[derive(MappedEnum)]`: a text-mode enum field round-trips through a mapped struct, including a `#[mapped_enum(rename = "...")]`'d variant storing its overridden text rather than the default snake_case name; an unrenamed variant stores its plain snake_case name; an `as_int`-mode enum field round-trips using each variant's own discriminant, including an explicit `= N` one; and a stored value with no matching variant (an unrecognized string, in text mode) is a decode error rather than a silent fallback. No `_postgres`/`_mysql` counterparts — the generated `From`/`FromValue` impls are pure Rust-side conversions to/from `Value::Text`/`Value::I64`, both already exercised per-driver everywhere else, with nothing left that's actually driver-specific to prove again.
 

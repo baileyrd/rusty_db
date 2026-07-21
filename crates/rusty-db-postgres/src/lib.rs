@@ -344,6 +344,18 @@ fn to_core_err(e: sqlx::Error) -> Error {
     Error::Database(e.to_string())
 }
 
+/// Turns a decoded Postgres array (each element independently nullable)
+/// into `Value::Array`, wrapping each present element with `wrap` and each
+/// absent one as `Value::Null`.
+fn array_value<T>(items: Vec<Option<T>>, wrap: impl Fn(T) -> Value) -> Value {
+    Value::Array(
+        items
+            .into_iter()
+            .map(|item| item.map(&wrap).unwrap_or(Value::Null))
+            .collect(),
+    )
+}
+
 fn row_from_postgres(row: &PgRow) -> Result<Row> {
     let columns: Arc<[String]> = row
         .columns()
@@ -428,6 +440,79 @@ fn row_from_postgres(row: &PgRow) -> Result<Row> {
                 .map_err(to_core_err)?
                 .map(Value::Json)
                 .unwrap_or(Value::Null),
+            // Postgres has a native array type for virtually every scalar
+            // column type; each element can independently be NULL, so
+            // each decodes via Vec<Option<T>> rather than Vec<T>.
+            "BOOL[]" => row
+                .try_get::<Option<Vec<Option<bool>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, Value::Bool))
+                .unwrap_or(Value::Null),
+            "INT2[]" => row
+                .try_get::<Option<Vec<Option<i16>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, |x| Value::I64(x as i64)))
+                .unwrap_or(Value::Null),
+            "INT4[]" => row
+                .try_get::<Option<Vec<Option<i32>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, |x| Value::I64(x as i64)))
+                .unwrap_or(Value::Null),
+            "INT8[]" => row
+                .try_get::<Option<Vec<Option<i64>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, Value::I64))
+                .unwrap_or(Value::Null),
+            "FLOAT4[]" => row
+                .try_get::<Option<Vec<Option<f32>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, |x| Value::F64(x as f64)))
+                .unwrap_or(Value::Null),
+            "FLOAT8[]" => row
+                .try_get::<Option<Vec<Option<f64>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, Value::F64))
+                .unwrap_or(Value::Null),
+            "NUMERIC[]" => row
+                .try_get::<Option<Vec<Option<BigDecimal>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, Value::Decimal))
+                .unwrap_or(Value::Null),
+            "DATE[]" => row
+                .try_get::<Option<Vec<Option<NaiveDate>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, Value::Date))
+                .unwrap_or(Value::Null),
+            "TIME[]" => row
+                .try_get::<Option<Vec<Option<NaiveTime>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, Value::Time))
+                .unwrap_or(Value::Null),
+            "TIMESTAMP[]" => row
+                .try_get::<Option<Vec<Option<NaiveDateTime>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, Value::DateTime))
+                .unwrap_or(Value::Null),
+            "TIMESTAMPTZ[]" => row
+                .try_get::<Option<Vec<Option<DateTime<Utc>>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, Value::Timestamp))
+                .unwrap_or(Value::Null),
+            "UUID[]" => row
+                .try_get::<Option<Vec<Option<Uuid>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, Value::Uuid))
+                .unwrap_or(Value::Null),
+            "TEXT[]" | "VARCHAR[]" | "\"CHAR\"[]" | "CHAR[]" | "NAME[]" => row
+                .try_get::<Option<Vec<Option<String>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, Value::Text))
+                .unwrap_or(Value::Null),
+            "JSON[]" | "JSONB[]" => row
+                .try_get::<Option<Vec<Option<JsonValue>>>, _>(i)
+                .map_err(to_core_err)?
+                .map(|v| array_value(v, Value::Json))
+                .unwrap_or(Value::Null),
             // TEXT, VARCHAR, CHAR(N)/BPCHAR, NAME, citext, etc. all decode
             // fine as strings (these genuinely are sent as text).
             _ => row
@@ -460,6 +545,124 @@ macro_rules! bind_params {
                 Value::Time(t) => query.bind(*t),
                 Value::DateTime(dt) => query.bind(*dt),
                 Value::Timestamp(ts) => query.bind(*ts),
+                // Postgres has a native array type for virtually every
+                // scalar column type; pick the concrete Vec<Option<T>> to
+                // bind based on the first non-null element (an empty or
+                // all-null array has no element to infer a type from, and
+                // neither does one made of a kind with no array support
+                // here — Value::Bytes/Value::Array itself — so both fall
+                // back to each element's own text form as TEXT[], which
+                // needs an explicit cast if the target column isn't text).
+                Value::Array(items) => match items.iter().find(|v| !matches!(v, Value::Null)) {
+                    Some(Value::Bool(_)) => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::Bool(b) => Some(*b),
+                                _ => None,
+                            })
+                            .collect::<Vec<Option<bool>>>(),
+                    ),
+                    Some(Value::I64(_)) => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::I64(x) => Some(*x),
+                                _ => None,
+                            })
+                            .collect::<Vec<Option<i64>>>(),
+                    ),
+                    Some(Value::F64(_)) => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::F64(x) => Some(*x),
+                                _ => None,
+                            })
+                            .collect::<Vec<Option<f64>>>(),
+                    ),
+                    Some(Value::Text(_)) => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::Text(s) => Some(s.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<Option<String>>>(),
+                    ),
+                    Some(Value::Uuid(_)) => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::Uuid(u) => Some(*u),
+                                _ => None,
+                            })
+                            .collect::<Vec<Option<Uuid>>>(),
+                    ),
+                    Some(Value::Decimal(_)) => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::Decimal(d) => Some(d.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<Option<BigDecimal>>>(),
+                    ),
+                    Some(Value::Json(_)) => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::Json(j) => Some(j.clone()),
+                                _ => None,
+                            })
+                            .collect::<Vec<Option<JsonValue>>>(),
+                    ),
+                    Some(Value::Date(_)) => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::Date(d) => Some(*d),
+                                _ => None,
+                            })
+                            .collect::<Vec<Option<NaiveDate>>>(),
+                    ),
+                    Some(Value::Time(_)) => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::Time(t) => Some(*t),
+                                _ => None,
+                            })
+                            .collect::<Vec<Option<NaiveTime>>>(),
+                    ),
+                    Some(Value::DateTime(_)) => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::DateTime(dt) => Some(*dt),
+                                _ => None,
+                            })
+                            .collect::<Vec<Option<NaiveDateTime>>>(),
+                    ),
+                    Some(Value::Timestamp(_)) => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::Timestamp(ts) => Some(*ts),
+                                _ => None,
+                            })
+                            .collect::<Vec<Option<DateTime<Utc>>>>(),
+                    ),
+                    _ => query.bind(
+                        items
+                            .iter()
+                            .map(|v| match v {
+                                Value::Null => None,
+                                other => Some(other.to_string()),
+                            })
+                            .collect::<Vec<Option<String>>>(),
+                    ),
+                },
             };
         }
         query

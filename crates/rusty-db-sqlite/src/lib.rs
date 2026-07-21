@@ -8,6 +8,7 @@ use sqlx::sqlite::{SqlitePoolOptions, SqliteRow};
 use sqlx::{Column as _, Row as _, Sqlite, SqlitePool, TypeInfo as _, ValueRef as _};
 
 use rusty_db_core::dialect::QuestionMarkDialect;
+use rusty_db_core::value::array_to_json;
 use rusty_db_core::{
     ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, ForeignKey, IndexInfo,
     PoolConfig, PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
@@ -587,6 +588,10 @@ macro_rules! bind_params {
                 // Same reasoning, but RFC 3339 (so the offset survives),
                 // since SQLite has no native TIMESTAMPTZ-equivalent type.
                 Value::Timestamp(ts) => query.bind(ts.to_rfc3339()),
+                // SQLite has no native array column type at all either;
+                // bind its JSON array text form, same as any other text
+                // value.
+                Value::Array(items) => query.bind(array_to_json(items).to_string()),
             };
         }
         query

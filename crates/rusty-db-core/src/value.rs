@@ -86,6 +86,30 @@ pub enum Value {
     /// round-trips correctly everywhere, just without a native temporal
     /// column type on SQLite specifically.
     Timestamp(DateTime<Utc>),
+    /// An ordered collection of homogeneously-typed values (a Postgres
+    /// native array column, e.g. `INTEGER[]`/`TEXT[]`/`UUID[]`). Postgres
+    /// has a native array type for virtually every scalar column type and
+    /// round-trips this variant directly over its binary wire format.
+    /// MySQL/MariaDB and SQLite have no array column type at all, so on
+    /// those two an array field is stored as a JSON array instead (both
+    /// already support JSON, natively or as text) — `FromValue for
+    /// Vec<T>` (for the handful of `T` this crate implements it for —
+    /// `bool`, `i64`, `f64`, `String`, `Uuid`, `BigDecimal`, `NaiveDate`,
+    /// `NaiveTime`, `NaiveDateTime`, `DateTime<Utc>`, and `Value` itself
+    /// as a fully-generic escape hatch) parses that JSON-array form back
+    /// too, so a mapped struct's `Vec<T>` field still round-trips
+    /// correctly everywhere, just without Postgres's native wire format
+    /// (or a native array type at all) on the other two.
+    ///
+    /// A known limitation on Postgres specifically: binding an array picks
+    /// its native Postgres array type by inspecting the first non-null
+    /// element, since (unlike a mapped struct field's own static Rust
+    /// type) `Value::Array` itself carries no element-type tag once
+    /// constructed. An empty array, or one whose every element is
+    /// `Value::Null`, has no element to inspect — that case binds as
+    /// `TEXT[]`, which needs an explicit cast (or, more simply, a `TEXT[]`
+    /// target column) if that's not what the column actually expects.
+    Array(Vec<Value>),
 }
 
 impl fmt::Display for Value {
@@ -104,6 +128,16 @@ impl fmt::Display for Value {
             Value::Time(t) => write!(f, "{t}"),
             Value::DateTime(dt) => write!(f, "{dt}"),
             Value::Timestamp(ts) => write!(f, "{ts}"),
+            Value::Array(items) => {
+                write!(f, "[")?;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, "]")
+            }
         }
     }
 }
@@ -340,6 +374,118 @@ impl FromValue for DateTime<Utc> {
         }
     }
 }
+
+/// Converts a single scalar `Value` into JSON, for encoding a
+/// `Value::Array` as a JSON array on backends (MySQL/MariaDB, SQLite)
+/// with no native array column type of their own.
+fn value_to_json(v: &Value) -> Json {
+    match v {
+        Value::Null => Json::Null,
+        Value::Bool(b) => Json::Bool(*b),
+        Value::I64(i) => Json::from(*i),
+        Value::F64(f) => serde_json::Number::from_f64(*f)
+            .map(Json::Number)
+            .unwrap_or(Json::Null),
+        Value::Text(s) => Json::String(s.clone()),
+        Value::Uuid(u) => Json::String(u.to_string()),
+        Value::Decimal(d) => Json::String(d.to_string()),
+        Value::Json(j) => j.clone(),
+        Value::Date(d) => Json::String(d.to_string()),
+        Value::Time(t) => Json::String(t.to_string()),
+        Value::DateTime(dt) => Json::String(dt.to_string()),
+        Value::Timestamp(ts) => Json::String(ts.to_rfc3339()),
+        Value::Array(items) => Json::Array(items.iter().map(value_to_json).collect()),
+        // Not meaningfully representable as a JSON scalar (no `Vec<u8>`
+        // array-element support exists — see the module-level array
+        // discussion); round-trips as null rather than erroring outright.
+        Value::Bytes(_) => Json::Null,
+    }
+}
+
+/// Renders a `Value::Array`'s elements as a JSON array — used by drivers
+/// to bind `Value::Array` on backends with no native array column type of
+/// their own (MySQL/MariaDB, SQLite; both already support storing/binding
+/// plain JSON text).
+pub fn array_to_json(items: &[Value]) -> Json {
+    Json::Array(items.iter().map(value_to_json).collect())
+}
+
+/// The inverse of `value_to_json`, used when decoding a `Value::Array`
+/// back out of its JSON-flattened form.
+fn json_scalar_to_value(j: &Json) -> Value {
+    match j {
+        Json::Null => Value::Null,
+        Json::Bool(b) => Value::Bool(*b),
+        Json::Number(n) => n
+            .as_i64()
+            .map(Value::I64)
+            .unwrap_or_else(|| Value::F64(n.as_f64().unwrap_or(f64::NAN))),
+        Json::String(s) => Value::Text(s.clone()),
+        Json::Array(_) | Json::Object(_) => Value::Json(j.clone()),
+    }
+}
+
+/// Implements `From<Vec<$elem_ty>> for Value` and `FromValue for
+/// Vec<$elem_ty>` for one array element type. Kept to concrete element
+/// types (rather than one blanket `impl<T> ... for Vec<T>`) because a
+/// blanket impl here would conflict with the existing dedicated
+/// `Vec<u8>`/`Value::Bytes` handling above.
+macro_rules! impl_array {
+    ($elem_ty:ty) => {
+        impl From<Vec<$elem_ty>> for Value {
+            fn from(v: Vec<$elem_ty>) -> Self {
+                Value::Array(v.into_iter().map(Value::from).collect())
+            }
+        }
+
+        impl FromValue for Vec<$elem_ty> {
+            fn from_value(value: &Value) -> Result<Self, String> {
+                match value {
+                    Value::Array(items) => items
+                        .iter()
+                        .map(<$elem_ty as FromValue>::from_value)
+                        .collect(),
+                    // MySQL/MariaDB and SQLite have no native array column
+                    // type at all, so an array is stored as a JSON array
+                    // there instead; decode whichever shape that JSON
+                    // value actually comes back as on each backend (native
+                    // JSON on Postgres/MySQL — see Value::Json's own doc
+                    // for why MySQL specifically decodes as bytes — or
+                    // text on SQLite).
+                    Value::Json(Json::Array(items)) => items
+                        .iter()
+                        .map(|j| <$elem_ty as FromValue>::from_value(&json_scalar_to_value(j)))
+                        .collect(),
+                    Value::Text(s) => {
+                        let parsed: Json = serde_json::from_str(s)
+                            .map_err(|e| format!("invalid array JSON {s:?}: {e}"))?;
+                        <Vec<$elem_ty> as FromValue>::from_value(&Value::Json(parsed))
+                    }
+                    Value::Bytes(b) => {
+                        let s = std::str::from_utf8(b)
+                            .map_err(|e| format!("invalid UTF-8 in array JSON bytes: {e}"))?;
+                        let parsed: Json = serde_json::from_str(s)
+                            .map_err(|e| format!("invalid array JSON {s:?}: {e}"))?;
+                        <Vec<$elem_ty> as FromValue>::from_value(&Value::Json(parsed))
+                    }
+                    other => Err(format!("expected array, got {other}")),
+                }
+            }
+        }
+    };
+}
+
+impl_array!(bool);
+impl_array!(i64);
+impl_array!(f64);
+impl_array!(String);
+impl_array!(Uuid);
+impl_array!(BigDecimal);
+impl_array!(NaiveDate);
+impl_array!(NaiveTime);
+impl_array!(NaiveDateTime);
+impl_array!(DateTime<Utc>);
+impl_array!(Value);
 
 impl<T: FromValue> FromValue for Option<T> {
     fn from_value(value: &Value) -> Result<Self, String> {
