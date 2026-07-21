@@ -128,6 +128,15 @@ impl Transaction {
         self.connection().fetch_all(&sql, &params).await
     }
 
+    pub async fn fetch_optional(
+        &mut self,
+        query: &dyn ToSql,
+        dialect: &dyn Dialect,
+    ) -> Result<Option<Row>> {
+        let (sql, params) = query.to_sql(dialect);
+        self.connection().fetch_optional(&sql, &params).await
+    }
+
     pub async fn execute_query(&mut self, query: &dyn ToSql, dialect: &dyn Dialect) -> Result<u64> {
         let (sql, params) = query.to_sql(dialect);
         self.connection().execute(&sql, &params).await

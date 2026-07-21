@@ -99,7 +99,7 @@ Field types are limited to whatever `Value` already converts from (`bool`, `i64`
 
 ### Session / unit of work
 
-`Engine::session()` (or `Session::new(engine)`) gives you a unit of work: queue writes with `add`/`update`/`delete` (available for any `#[derive(Mapped)]` type — `add` needs the `Entity` impl every mapped type gets, `update`/`delete` need `Identifiable`, which requires a `#[table(primary_key)]` field), then flush them all in a single transaction with `commit()`:
+`Engine::session()` (or `Session::new(engine)`) gives you a unit of work: queue writes with `add`/`update`/`delete` (available for any `#[derive(Mapped)]` type — `add` needs the `Entity` impl every mapped type gets, `update`/`delete` need `Identifiable`, which requires a `#[table(primary_key)]` field), then send them to the database with `commit()`:
 
 ```rust
 let mut session = engine.session();
@@ -115,7 +115,9 @@ session.delete(&some_other_user);
 session.commit().await?; // update + delete, atomically
 ```
 
-If any statement in the batch fails, `commit()` rolls back the whole transaction and leaves the queue untouched, so you can fix the problem and call `commit()` again. There's no autoflush, so reads (`engine.fetch_all_as`, `session.get`/`load_all` below, etc.) never see writes that are queued but not yet committed — always `commit()` before reading anything you just wrote through a `Session`.
+A session's writes actually run inside one ongoing transaction that begins lazily (on the first flush or read) and stays open until `commit()` (`COMMIT`) or `rollback()` (`ROLLBACK` — undoing anything already flushed into it, not just what's still queued). `session.flush()` sends every currently-queued write into that transaction without committing it — `session.get`/`load_all` (see the identity map below) call this automatically first (autoflush), so they always see your own not-yet-committed writes. Nothing outside the session sees them until `commit()`: raw reads through `Engine` (`engine.fetch_all_as`, etc.) go through a different connection and only ever see already-committed data, exactly like a second client would.
+
+If a flush fails partway through a batch, the whole transaction (including anything flushed earlier in its lifetime) rolls back and the queue is left untouched, so fixing the problem and calling `commit()`/flushing again starts over cleanly.
 
 ### Identity map
 
@@ -134,7 +136,7 @@ assert_eq!(ada_again.borrow().active, false); // sees the in-memory change
 let users = session.load_all::<User>(&Select::from(&User::table())).await?; // Vec<Rc<RefCell<User>>>
 // users[0] is `ada` again if its primary key was already cached, not a fresh decode.
 
-session.update(&*ada.borrow()); // queue the change; identity map doesn't auto-flush
+session.update(&*ada.borrow()); // queued; autoflushes on the next get/load_all, or on commit()
 session.commit().await?;
 ```
 
@@ -204,7 +206,7 @@ Each migration runs in its own transaction (its `up`/`down` statements plus the 
 
 ## Status
 
-This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), a unit-of-work `Session` with an identity map, and versioned migrations. Still missing: autoflush (the identity map doesn't see uncommitted writes, and deleting an entity doesn't evict it from the cache). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), versioned migrations, and a unit-of-work `Session` with autoflush and an identity map. Still missing: migrations don't participate in a session's transaction, and deleting an entity doesn't evict it from the identity map. Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 ## Running tests
 
