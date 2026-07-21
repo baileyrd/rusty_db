@@ -9,8 +9,9 @@
 //! `SelectExpr`, `Select::group_by`/`.having`, `Select::union`/
 //! `union_all`/`intersect`/`except`, `Column::lower`/`upper`/`concat`/
 //! `add`/`sub`/`mul`/`div`, `Expr::now`/`coalesce`, `Case`, subqueries
-//! (`Column::in_subquery`, `Expr::exists`, `Expr::subquery`), and CTEs
-//! (`Select::with`/`.with_recursive` via `Cte`).
+//! (`Column::in_subquery`, `Expr::exists`, `Expr::subquery`), CTEs
+//! (`Select::with`/`.with_recursive` via `Cte`), and window functions
+//! (`Expr::row_number`/`rank`/`dense_rank`, `.over(...)` via `Window`).
 //! `RETURNING` on `UPDATE`/`DELETE` has no SQLite coverage here since
 //! SQLite's dialect doesn't support it (see
 //! `query_builder_extras_postgres.rs`); `Column::concat`'s `CONCAT(...)`
@@ -759,6 +760,109 @@ async fn with_recursive_walks_a_management_hierarchy() -> rusty_db::Result<()> {
             ("zoe".to_string(), 3),
         ]
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn row_number_resets_per_partition_and_orders_within_it() -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    // "Ada" and "ada" are distinct, case-sensitive partitions of one row
+    // each; "Grace" is a partition of two, numbered 1 then 2 by id order.
+    let row_num = Expr::row_number().over(
+        Window::new()
+            .partition_by([orders.col("customer")])
+            .order_by(orders.col("id").asc()),
+    );
+    let rows = engine
+        .fetch_all(
+            &Select::from(&orders)
+                .columns([
+                    SelectExpr::from(orders.col("id")),
+                    SelectExpr::from(orders.col("customer")),
+                    SelectExpr::from(row_num).alias("rn"),
+                ])
+                .order_by(orders.col("id").asc()),
+        )
+        .await?;
+    let rns: Vec<i64> = rows
+        .iter()
+        .map(|r| r.get_by_name::<i64>("rn"))
+        .collect::<rusty_db::Result<_>>()?;
+    assert_eq!(
+        rns,
+        vec![1, 1, 1, 2],
+        "Grace's second order (id=4) is the only rn=2"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rank_and_dense_rank_treat_ties_differently() -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    // amounts in id order: 10, 50, 50, 200 -- the two amount=50 rows tie.
+    let rank = Expr::rank().over(Window::new().order_by(orders.col("amount").asc()));
+    let dense_rank = Expr::dense_rank().over(Window::new().order_by(orders.col("amount").asc()));
+    let rows = engine
+        .fetch_all(
+            &Select::from(&orders)
+                .columns([
+                    SelectExpr::from(rank).alias("rank"),
+                    SelectExpr::from(dense_rank).alias("dense_rank"),
+                ])
+                .order_by(orders.col("amount").asc())
+                .order_by(orders.col("id").asc()),
+        )
+        .await?;
+    let ranks: Vec<i64> = rows
+        .iter()
+        .map(|r| r.get_by_name::<i64>("rank"))
+        .collect::<rusty_db::Result<_>>()?;
+    let dense_ranks: Vec<i64> = rows
+        .iter()
+        .map(|r| r.get_by_name::<i64>("dense_rank"))
+        .collect::<rusty_db::Result<_>>()?;
+    assert_eq!(
+        ranks,
+        vec![1, 2, 2, 4],
+        "RANK skips ahead by the tie's size"
+    );
+    assert_eq!(dense_ranks, vec![1, 2, 2, 3], "DENSE_RANK never skips");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sum_as_a_window_function_computes_a_running_total_per_partition() -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    let running_total = orders.col("amount").sum().over(
+        Window::new()
+            .partition_by([orders.col("customer")])
+            .order_by(orders.col("id").asc()),
+    );
+    let rows = engine
+        .fetch_all(
+            &Select::from(&orders)
+                .columns([
+                    SelectExpr::from(orders.col("id")),
+                    SelectExpr::from(running_total).alias("running_total"),
+                ])
+                .order_by(orders.col("id").asc()),
+        )
+        .await?;
+    let totals: Vec<i64> = rows
+        .iter()
+        .map(|r| r.get_by_name::<i64>("running_total"))
+        .collect::<rusty_db::Result<_>>()?;
+    // Ada: 10. ada: 50. Grace: 50 (first order), then 50 + 200 = 250 (second).
+    assert_eq!(totals, vec![10, 50, 50, 250]);
 
     Ok(())
 }

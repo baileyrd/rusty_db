@@ -39,7 +39,7 @@ pub use migration::{AppliedMigration, Migration, Migrator};
 pub use pool::{PoolConfig, PoolMetrics, PoolStats};
 pub use query::{
     AggFunc, ArithOp, BulkInsert, Case, Column, Cte, Delete, Expr, Insert, Join, JoinKind, Select,
-    SelectExpr, SetOp, SetOperation, Table, ToSql, Update,
+    SelectExpr, SetOp, SetOperation, Table, ToSql, Update, Window,
 };
 pub use replica::ReplicaSet;
 pub use row::Row;

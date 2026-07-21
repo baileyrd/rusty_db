@@ -135,6 +135,21 @@ pub enum Expr {
     /// and (at most) one row — nothing here enforces that. See
     /// `Expr::subquery(...)`.
     Subquery(Box<Select>),
+    /// `ROW_NUMBER()` — a 1-based row number within its window, reset at
+    /// the start of each partition. Only meaningful behind `.over(...)`
+    /// (see `Window`); has no ordinary (non-windowed) form.
+    RowNumber,
+    /// `RANK()` — like `ROW_NUMBER()`, but rows tying on the window's
+    /// `ORDER BY` get the same rank, and the rank after a tie skips ahead
+    /// by the tie's size (1, 2, 2, 4, ...). Only meaningful behind
+    /// `.over(...)`.
+    Rank,
+    /// `DENSE_RANK()` — like `RANK()`, but never skips a rank after a tie
+    /// (1, 2, 2, 3, ...). Only meaningful behind `.over(...)`.
+    DenseRank,
+    /// `function OVER (PARTITION BY ... ORDER BY ...)`. Built via
+    /// `Window`, not constructed directly.
+    Window(Box<Expr>, Vec<Expr>, Vec<(Column, bool)>),
 }
 
 impl From<Column> for Expr {
@@ -442,6 +457,31 @@ impl Expr {
         Expr::Coalesce(exprs.into_iter().collect())
     }
 
+    /// `ROW_NUMBER()` — pair with `.over(...)` (see `Window`) to actually
+    /// use it; on its own it isn't valid SQL.
+    pub fn row_number() -> Self {
+        Expr::RowNumber
+    }
+
+    /// `RANK()` — see `Expr::row_number` for the same "needs `.over(...)`"
+    /// caveat.
+    pub fn rank() -> Self {
+        Expr::Rank
+    }
+
+    /// `DENSE_RANK()` — see `Expr::row_number` for the same "needs
+    /// `.over(...)`" caveat.
+    pub fn dense_rank() -> Self {
+        Expr::DenseRank
+    }
+
+    /// Turns this expression (a ranking function like `Expr::row_number()`,
+    /// or an ordinary aggregate like `.sum()`) into a window function:
+    /// `self OVER (PARTITION BY ... ORDER BY ...)`. See `Window`.
+    pub fn over(self, window: Window) -> Self {
+        Expr::Window(Box::new(self), window.partition_by, window.order_by)
+    }
+
     /// Render this expression to SQL, pushing any literal values into
     /// `params` in the order their placeholders appear.
     pub fn render(&self, dialect: &dyn Dialect, params: &mut Vec<Value>) -> String {
@@ -552,6 +592,43 @@ impl Expr {
             Expr::Subquery(subquery) => {
                 format!("({})", subquery.render_into(dialect, params))
             }
+            Expr::RowNumber => "ROW_NUMBER()".to_string(),
+            Expr::Rank => "RANK()".to_string(),
+            Expr::DenseRank => "DENSE_RANK()".to_string(),
+            Expr::Window(function, partition_by, order_by) => {
+                let function_sql = function.render(dialect, params);
+                let mut over = String::new();
+                if !partition_by.is_empty() {
+                    over.push_str("PARTITION BY ");
+                    over.push_str(
+                        &partition_by
+                            .iter()
+                            .map(|e| e.render(dialect, params))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                if !order_by.is_empty() {
+                    if !over.is_empty() {
+                        over.push(' ');
+                    }
+                    over.push_str("ORDER BY ");
+                    over.push_str(
+                        &order_by
+                            .iter()
+                            .map(|(col, asc)| {
+                                format!(
+                                    "{} {}",
+                                    col.qualified_sql(dialect),
+                                    if *asc { "ASC" } else { "DESC" }
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                format!("{function_sql} OVER ({over})")
+            }
         }
     }
 }
@@ -595,6 +672,54 @@ impl Case {
 impl From<Case> for Expr {
     fn from(case: Case) -> Self {
         Expr::Case(case.arms, case.otherwise)
+    }
+}
+
+/// A window's `PARTITION BY`/`ORDER BY` clause, attached to a ranking
+/// function (`Expr::row_number()`/`.rank()`/`.dense_rank()`) or an
+/// ordinary aggregate (`.sum()`/`.count()`/etc.) via `.over(...)`:
+///
+/// ```
+/// # use rusty_db_core::{Expr, Select, SelectExpr, Table, Window};
+/// let orders = Table::new("orders");
+/// let running_total = orders
+///     .col("amount")
+///     .sum()
+///     .over(Window::new().partition_by([orders.col("customer")]).order_by(orders.col("id").asc()));
+/// let query = Select::from(&orders).columns([SelectExpr::from(running_total).alias("running_total")]);
+/// ```
+///
+/// Both clauses are optional and independent — `PARTITION BY` alone splits
+/// rows into groups without ordering them; `ORDER BY` alone treats the
+/// whole result as one partition, ordered; neither (`Window::new()`, or
+/// equivalently `.over(Window::new())`) means one unordered partition
+/// covering every row, rendering as the still-valid `OVER ()`.
+#[derive(Debug, Clone, Default)]
+pub struct Window {
+    partition_by: Vec<Expr>,
+    order_by: Vec<(Column, bool)>,
+}
+
+impl Window {
+    pub fn new() -> Self {
+        Window::default()
+    }
+
+    /// `PARTITION BY ...` — splits rows into groups the window function is
+    /// computed independently within, the same `Column`/`Expr` mix
+    /// `Select::columns`/`.group_by` accept.
+    pub fn partition_by<E: Into<Expr>>(mut self, columns: impl IntoIterator<Item = E>) -> Self {
+        self.partition_by = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// `ORDER BY ...` within the window — determines row order for
+    /// `ROW_NUMBER`/`RANK`/`DENSE_RANK`, and which rows are "so far" for a
+    /// running aggregate. Calling this more than once adds more `ORDER BY`
+    /// columns, the same as repeated `Select::order_by`.
+    pub fn order_by(mut self, ordering: (Column, bool)) -> Self {
+        self.order_by.push(ordering);
+        self
     }
 }
 
