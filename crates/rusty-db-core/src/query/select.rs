@@ -1,5 +1,6 @@
 use super::expr::Expr;
 use super::join::{Join, JoinKind};
+use super::set_op::{SetOp, SetOperation};
 use super::table::{Column, Table};
 use super::ToSql;
 use crate::dialect::Dialect;
@@ -179,18 +180,47 @@ impl Select {
         self.offset = Some(offset);
         self
     }
+
+    /// `self UNION other` — combines both result sets, deduplicating
+    /// matching rows (see `.union_all(...)` to keep duplicates). Chain
+    /// further `.union`/`.union_all`/`.intersect`/`.except` calls on the
+    /// resulting `SetOperation` to combine more than two.
+    pub fn union(self, other: Select) -> SetOperation {
+        SetOperation::new(self, SetOp::Union, other)
+    }
+
+    /// `self UNION ALL other` — like `.union(...)`, but keeps duplicate
+    /// rows instead of deduplicating them.
+    pub fn union_all(self, other: Select) -> SetOperation {
+        SetOperation::new(self, SetOp::UnionAll, other)
+    }
+
+    /// `self INTERSECT other` — only rows present in both result sets.
+    pub fn intersect(self, other: Select) -> SetOperation {
+        SetOperation::new(self, SetOp::Intersect, other)
+    }
+
+    /// `self EXCEPT other` — rows in `self`'s result set that aren't also
+    /// in `other`'s.
+    pub fn except(self, other: Select) -> SetOperation {
+        SetOperation::new(self, SetOp::Except, other)
+    }
 }
 
-impl ToSql for Select {
-    fn to_sql(&self, dialect: &dyn Dialect) -> (String, Vec<Value>) {
-        let mut params = Vec::new();
-
+impl Select {
+    /// Renders this `SELECT`'s SQL, pushing its bind parameters onto an
+    /// existing `params` list instead of starting a fresh one — needed by
+    /// `SetOperation`, which stitches more than one `Select` into a single
+    /// statement and so needs their placeholders numbered sequentially
+    /// across all of them (Postgres's `$1, $2, ...` would otherwise
+    /// restart from `$1` in every arm, colliding instead of continuing).
+    pub(crate) fn render_into(&self, dialect: &dyn Dialect, params: &mut Vec<Value>) -> String {
         let columns_sql = if self.columns.is_empty() {
             "*".to_string()
         } else {
             self.columns
                 .iter()
-                .map(|c| c.render(dialect, &mut params))
+                .map(|c| c.render(dialect, params))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -207,19 +237,19 @@ impl ToSql for Select {
             sql.push(' ');
             sql.push_str(&join.table.as_clause_sql(dialect));
             sql.push_str(" ON ");
-            sql.push_str(&join.on.render(dialect, &mut params));
+            sql.push_str(&join.on.render(dialect, params));
         }
 
         if let Some(filter) = &self.filter {
             sql.push_str(" WHERE ");
-            sql.push_str(&filter.render(dialect, &mut params));
+            sql.push_str(&filter.render(dialect, params));
         }
 
         if !self.group_by.is_empty() {
             let group_sql = self
                 .group_by
                 .iter()
-                .map(|e| e.render(dialect, &mut params))
+                .map(|e| e.render(dialect, params))
                 .collect::<Vec<_>>()
                 .join(", ");
             sql.push_str(" GROUP BY ");
@@ -228,7 +258,7 @@ impl ToSql for Select {
 
         if let Some(having) = &self.having {
             sql.push_str(" HAVING ");
-            sql.push_str(&having.render(dialect, &mut params));
+            sql.push_str(&having.render(dialect, params));
         }
 
         if !self.order_by.is_empty() {
@@ -256,6 +286,14 @@ impl ToSql for Select {
             sql.push_str(&format!(" OFFSET {offset}"));
         }
 
+        sql
+    }
+}
+
+impl ToSql for Select {
+    fn to_sql(&self, dialect: &dyn Dialect) -> (String, Vec<Value>) {
+        let mut params = Vec::new();
+        let sql = self.render_into(dialect, &mut params);
         (sql, params)
     }
 }

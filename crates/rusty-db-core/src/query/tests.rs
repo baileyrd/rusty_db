@@ -376,3 +376,80 @@ fn expr_level_comparisons_work_on_an_arbitrary_expression_not_just_a_column() {
     assert_eq!(sql, r#"SELECT * FROM "orders" WHERE amount * 2 >= ?"#);
     assert_eq!(params, vec![Value::I64(50)]);
 }
+
+#[test]
+fn union_renders_both_arms_joined_by_the_keyword() {
+    let active = Table::new("active_users");
+    let archived = Table::new("archived_users");
+
+    let (sql, _) = Select::from(&active)
+        .columns([active.col("id")])
+        .union(Select::from(&archived).columns([archived.col("id")]))
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT "active_users"."id" FROM "active_users" UNION SELECT "archived_users"."id" FROM "archived_users""#
+    );
+}
+
+#[test]
+fn union_all_intersect_and_except_render_their_own_keyword() {
+    let a = Table::new("a");
+    let b = Table::new("b");
+
+    let (union_all_sql, _) = Select::from(&a)
+        .union_all(Select::from(&b))
+        .to_sql(&QuestionMarkDialect);
+    assert!(union_all_sql.contains(" UNION ALL "));
+
+    let (intersect_sql, _) = Select::from(&a)
+        .intersect(Select::from(&b))
+        .to_sql(&QuestionMarkDialect);
+    assert!(intersect_sql.contains(" INTERSECT "));
+
+    let (except_sql, _) = Select::from(&a)
+        .except(Select::from(&b))
+        .to_sql(&QuestionMarkDialect);
+    assert!(except_sql.contains(" EXCEPT "));
+}
+
+#[test]
+fn set_operations_chain_to_combine_more_than_two_selects() {
+    let a = Table::new("a");
+    let b = Table::new("b");
+    let c = Table::new("c");
+
+    let (sql, _) = Select::from(&a)
+        .union(Select::from(&b))
+        .union_all(Select::from(&c))
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT * FROM "a" UNION SELECT * FROM "b" UNION ALL SELECT * FROM "c""#
+    );
+}
+
+#[test]
+fn set_operation_params_are_numbered_sequentially_across_both_arms_on_postgres() {
+    let orders = Table::new("orders");
+    let refunds = Table::new("refunds");
+
+    let (sql, params) = Select::from(&orders)
+        .columns([orders.col("id")])
+        .filter(orders.col("amount").gt(10_i64))
+        .union(
+            Select::from(&refunds)
+                .columns([refunds.col("id")])
+                .filter(refunds.col("amount").gt(20_i64)),
+        )
+        .to_sql(&NumberedDialect);
+    // Each arm renders its own placeholder independently via Select::to_sql,
+    // but SetOperation threads one shared params list through both arms via
+    // render_into, so the second arm's placeholder continues as $2, not a
+    // colliding, restarted $1.
+    assert_eq!(
+        sql,
+        r#"SELECT "orders"."id" FROM "orders" WHERE "orders"."amount" > $1 UNION SELECT "refunds"."id" FROM "refunds" WHERE "refunds"."amount" > $2"#
+    );
+    assert_eq!(params, vec![Value::I64(10), Value::I64(20)]);
+}
