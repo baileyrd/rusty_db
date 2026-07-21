@@ -14,6 +14,13 @@ pub trait Mapped {
 
     /// The column marked `#[table(primary_key)]`, if any.
     const PRIMARY_KEY: Option<&'static str> = None;
+
+    /// The column marked `#[table(version)]` for optimistic locking, if
+    /// any. When present, `Identifiable::update`/`delete_query` include
+    /// it in their `WHERE` clause (matching the value the struct was
+    /// last loaded with) — see `Session::update`/`delete`, which turn a
+    /// zero-rows-affected result into `Error::Conflict` when this is set.
+    const VERSION_COLUMN: Option<&'static str> = None;
 }
 
 /// Decodes a `Row` into a concrete type. Implemented by `#[derive(Mapped)]`.

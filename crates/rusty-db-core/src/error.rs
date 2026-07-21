@@ -28,6 +28,9 @@ pub enum Error {
 
     #[error("unsupported: {0}")]
     Unsupported(String),
+
+    #[error("optimistic lock conflict: {0}")]
+    Conflict(String),
 }
 
 /// Identifies a column either by its position or its name, for error reporting.

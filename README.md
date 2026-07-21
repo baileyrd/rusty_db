@@ -182,7 +182,7 @@ engine.execute(&user.update()).await?;   // only generated when a field is #[tab
 engine.execute(&user.delete_query()).await?;
 ```
 
-Field types are limited to whatever `Value` already converts from (`bool`, `i64`, `i32`, `f64`, `String`, `Vec<u8>`, and `Option<_>` of those) — there's no arbitrary custom-type support yet.
+Field types are limited to whatever `Value` already converts from (`bool`, `i64`, `i32`, `f64`, `String`, `Vec<u8>`, and `Option<_>` of those) — there's no arbitrary custom-type support yet. A field additionally marked `#[table(version)]` (requires `#[table(primary_key)]` too) turns on optimistic locking — see below.
 
 ### Session / unit of work
 
@@ -222,6 +222,31 @@ for entry in session.audit_log().await? {
 ```
 
 This records the rendered SQL statement and its bound parameters (formatted to text) for each write — a lightweight write-ahead trail of *which statement ran, on which table, when*, not a structured before/after diff of column values. `audit_log()` autoflushes and reads through the session's own transaction first (the same "see your own writes" behavior `get`/`load_all` have), so it reflects writes this session has flushed but not yet committed too.
+
+### Optimistic locking
+
+A `#[table(version)]` field (alongside `#[table(primary_key)]`) makes `Session::update`/`delete` detect conflicting concurrent writes instead of silently overwriting (or deleting on top of) a change somebody else already made:
+
+```rust
+#[derive(Mapped)]
+#[table(name = "documents")]
+struct Document {
+    #[table(primary_key)]
+    id: i64,
+    #[table(version)]
+    version: i64,
+    title: String,
+}
+
+session.update(&Document { id: 1, version: 1, title: "final".into() });
+session.commit().await?; // succeeds; the stored row's version becomes 2
+
+// ...using that same stale version: 1 copy again later...
+session.update(&Document { id: 1, version: 1, title: "clobbering edit".into() });
+session.commit().await?; // Err(Error::Conflict(_)) — the stored version is already 2
+```
+
+`update`'s generated `WHERE` clause requires the version column to still match what this struct was loaded with (and its `SET` clause increments it); `delete_query`'s `WHERE` clause requires the same match, unchanged. When `Session::update`/`delete`'s statement ends up matching zero rows — because the version moved on (or the row's gone entirely) — `flush`/`commit` return `Error::Conflict` instead of treating it as a silent no-op. A type with no `#[table(version)]` field is completely unaffected: a stale/missing-row update or delete on it stays a silent no-op, exactly as before this feature existed.
 
 ### Identity map
 
@@ -349,6 +374,8 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 `tests/tls_postgres.rs`/`tests/tls_mysql.rs` cover encrypted connections (no SQLite equivalent — it has no network/TLS concept at all): the default `sslmode`/`ssl-mode` (`prefer`/`PREFERRED`) already opportunistically encrypts against a server that supports it, verified against the server's own bookkeeping (`pg_stat_ssl`, `SHOW STATUS LIKE 'Ssl_cipher'`) rather than just assuming the connection attempt succeeding means it's encrypted; `disable`/`DISABLED` produces a genuinely plain connection; `require`/`REQUIRED` encrypts without verifying the certificate; and `verify-full`/`verify-ca`/`VERIFY_CA` succeed with the server's actual CA (and, for `verify-full`, matching hostname) but fail closed against a CA that doesn't match — proving certificate verification actually verifies something rather than silently accepting any well-formed root. This environment's Postgres already has TLS enabled by default (a self-signed cert the Debian/Ubuntu package generates automatically); MariaDB needed a one-time setup of a self-signed CA/server certificate (`ssl-ca`/`ssl-cert`/`ssl-key` in `/etc/mysql/mariadb.conf.d/50-server.cnf`) to have any TLS support to test against at all.
 
 `tests/audit_log.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests that most directly exercise change tracking, since the identity-map/uncommitted-write-visibility behavior is already covered by the SQLite version and doesn't need re-proving per driver) cover `Session`'s opt-in audit logging: a plain session never creates an audit table at all; insert/update/delete each get recorded with the right table, operation, and rendered SQL/params; a failed write's audit entry rolls back right along with the write itself (proving the audit trail shares the write's own transaction rather than being an independent, potentially-inconsistent side effect); the session's own `audit_log()` sees its not-yet-committed entries (autoflush + read-through-transaction, same as `get`/`load_all`); and a custom audit table name is honored. The Postgres/MySQL versions use their own audit table name per test (`with_audit_log_table`) to avoid colliding with other tests running concurrently against the same shared live server, and are careful to `commit()` (closing the transaction `audit_log()` itself opens) before any cleanup `DROP TABLE` from a separate connection — otherwise the cleanup deadlocks waiting on a lock the still-open session transaction is holding.
+
+`tests/optimistic_locking.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — the two conflict-detection tests, since the identity/no-op-without-`#[table(version)]` cases don't need re-proving per driver) cover `#[table(version)]`: updating with the current version succeeds and increments the stored version; updating with a stale version (superseded by someone else's edit) fails with `Error::Conflict` and leaves the other edit intact; updating a row someone else already deleted also conflicts; the same two cases for `delete`; and a type with no `#[table(version)]` field keeps its pre-existing behavior of a silent no-op on a stale/missing-row write — proving the feature is fully opt-in.
 
 ## Running tests
 
