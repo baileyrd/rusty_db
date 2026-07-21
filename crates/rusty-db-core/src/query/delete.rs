@@ -8,6 +8,7 @@ use crate::value::Value;
 pub struct Delete {
     table: Table,
     filter: Option<Expr>,
+    returning: Vec<String>,
 }
 
 impl Delete {
@@ -15,6 +16,7 @@ impl Delete {
         Delete {
             table: table.clone(),
             filter: None,
+            returning: Vec::new(),
         }
     }
 
@@ -23,6 +25,13 @@ impl Delete {
             Some(existing) => existing.and(expr),
             None => expr,
         });
+        self
+    }
+
+    /// Request columns back via `RETURNING` (only honored by dialects where
+    /// `Dialect::supports_returning()` is true; ignored otherwise).
+    pub fn returning(mut self, columns: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.returning = columns.into_iter().map(Into::into).collect();
         self
     }
 }
@@ -35,6 +44,17 @@ impl ToSql for Delete {
         if let Some(filter) = &self.filter {
             sql.push_str(" WHERE ");
             sql.push_str(&filter.render(dialect, &mut params));
+        }
+
+        if !self.returning.is_empty() && dialect.supports_returning() {
+            let returning_sql = self
+                .returning
+                .iter()
+                .map(|c| dialect.quote_ident(c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(" RETURNING ");
+            sql.push_str(&returning_sql);
         }
 
         (sql, params)

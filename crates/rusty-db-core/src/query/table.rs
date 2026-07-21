@@ -100,6 +100,17 @@ impl Column {
         self.binop(BinOp::Like, pattern)
     }
 
+    /// Case-insensitive `LIKE` — see `Dialect::ilike_operator` for how it
+    /// renders per backend.
+    pub fn ilike(&self, pattern: impl Into<Value>) -> Expr {
+        self.binop(BinOp::ILike, pattern)
+    }
+
+    /// `self BETWEEN low AND high` (inclusive of both bounds).
+    pub fn between(&self, low: impl Into<Value>, high: impl Into<Value>) -> Expr {
+        Expr::Column(self.clone()).between(low, high)
+    }
+
     pub fn is_null(&self) -> Expr {
         Expr::Column(self.clone()).is_null()
     }

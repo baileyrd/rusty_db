@@ -9,6 +9,7 @@ use crate::value::Value;
 pub struct Select {
     table: Table,
     columns: Vec<Column>,
+    distinct: bool,
     joins: Vec<Join>,
     filter: Option<Expr>,
     order_by: Vec<(Column, bool)>,
@@ -22,6 +23,7 @@ impl Select {
         Select {
             table: table.clone(),
             columns: Vec::new(),
+            distinct: false,
             joins: Vec::new(),
             filter: None,
             order_by: Vec::new(),
@@ -32,6 +34,13 @@ impl Select {
 
     pub fn columns(mut self, columns: impl IntoIterator<Item = Column>) -> Self {
         self.columns = columns.into_iter().collect();
+        self
+    }
+
+    /// `SELECT DISTINCT ...` — dedupe rows that are identical across every
+    /// selected column.
+    pub fn distinct(mut self) -> Self {
+        self.distinct = true;
         self
     }
 
@@ -101,8 +110,9 @@ impl ToSql for Select {
                 .join(", ")
         };
 
+        let distinct_sql = if self.distinct { "DISTINCT " } else { "" };
         let mut sql = format!(
-            "SELECT {columns_sql} FROM {}",
+            "SELECT {distinct_sql}{columns_sql} FROM {}",
             dialect.quote_ident(self.table.name())
         );
 

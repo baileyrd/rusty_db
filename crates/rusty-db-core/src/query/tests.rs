@@ -125,3 +125,66 @@ fn empty_in_list_is_always_false() {
     assert!(sql.contains("1 = 0"));
     assert!(params.is_empty());
 }
+
+#[test]
+fn distinct_adds_the_keyword_right_after_select() {
+    let users = Table::new("users");
+
+    let (sql, _) = Select::from(&users)
+        .columns([users.col("name")])
+        .distinct()
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"SELECT DISTINCT "users"."name" FROM "users""#);
+
+    let (plain_sql, _) = Select::from(&users)
+        .columns([users.col("name")])
+        .to_sql(&QuestionMarkDialect);
+    assert!(!plain_sql.contains("DISTINCT"));
+}
+
+#[test]
+fn update_and_delete_only_add_returning_when_dialect_supports_it() {
+    let users = Table::new("users");
+
+    let update = Update::table(&users)
+        .set("active", false)
+        .filter(users.col("id").eq(1_i64))
+        .returning(["id", "active"]);
+    let (pg_sql, _) = update.clone().to_sql(&NumberedDialect);
+    assert!(pg_sql.contains(r#"RETURNING "id", "active""#));
+    let (sqlite_sql, _) = update.to_sql(&QuestionMarkDialect);
+    assert!(!sqlite_sql.contains("RETURNING"));
+
+    let delete = Delete::from(&users)
+        .filter(users.col("id").eq(1_i64))
+        .returning(["id"]);
+    let (pg_sql, _) = delete.clone().to_sql(&NumberedDialect);
+    assert!(pg_sql.contains(r#"RETURNING "id""#));
+    let (sqlite_sql, _) = delete.to_sql(&QuestionMarkDialect);
+    assert!(!sqlite_sql.contains("RETURNING"));
+}
+
+#[test]
+fn between_renders_inclusive_bounds() {
+    let orders = Table::new("orders");
+    let (sql, params) = Select::from(&orders)
+        .filter(orders.col("amount").between(10_i64, 100_i64))
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT * FROM "orders" WHERE "orders"."amount" BETWEEN ? AND ?"#
+    );
+    assert_eq!(params, vec![Value::I64(10), Value::I64(100)]);
+}
+
+#[test]
+fn ilike_renders_as_ilike_on_postgres_and_falls_back_to_like_elsewhere() {
+    let users = Table::new("users");
+    let query = Select::from(&users).filter(users.col("name").ilike("%ada%"));
+
+    let (pg_sql, _) = query.clone().to_sql(&NumberedDialect);
+    assert!(pg_sql.contains(r#""users"."name" ILIKE $1"#));
+
+    let (sqlite_sql, _) = query.to_sql(&QuestionMarkDialect);
+    assert!(sqlite_sql.contains(r#""users"."name" LIKE ?"#));
+}
