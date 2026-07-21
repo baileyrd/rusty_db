@@ -9,7 +9,8 @@ crates/rusty-db-core      database-agnostic layer: query builder, Row/Value, Dri
 crates/rusty-db-derive    #[derive(Mapped)] proc macro: maps a struct onto a table
 crates/rusty-db-sqlite    SQLite Driver impl (wraps sqlx::SqlitePool)
 crates/rusty-db-postgres  PostgreSQL Driver impl (wraps sqlx::PgPool)
-rusty_db/                 facade crate: re-exports core + feature-gated drivers ("sqlite", "postgres", "derive")
+crates/rusty-db-mysql     MySQL/MariaDB Driver impl (wraps sqlx::MySqlPool)
+rusty_db/                 facade crate: re-exports core + feature-gated drivers ("sqlite", "postgres", "mysql", "derive")
 ```
 
 Application code depends only on `rusty-db-core` (via the `rusty_db` facade): `Engine`, `Table`/`Column`, `Select`/`Insert`/`Update`/`Delete`, `Expr`. Which database actually runs underneath is decided once, at startup, by which `Driver` you construct the `Engine` with — everything built on top is portable across backends.
@@ -40,7 +41,7 @@ A driver crate implements two traits from `rusty-db-core`:
 - `Driver`: hands out connections (`connect(&self) -> Result<Box<dyn Connection>>`) and exposes a `Dialect` (identifier quoting, placeholder style, e.g. `?` vs `$1`).
 - `Connection` (via `Executor`): runs SQL text + positional `Value` params, returns `Row`s.
 
-The query builder never talks to a database directly — it renders `(String, Vec<Value>)` via `ToSql::to_sql(&dialect)`, and `Engine` hands that off to whichever `Connection` the configured `Driver` produced. `rusty-db-sqlite` and `rusty-db-postgres` both implement this by wrapping `sqlx`, decoding sqlx rows into `Value` based on each column's runtime type.
+The query builder never talks to a database directly — it renders `(String, Vec<Value>)` via `ToSql::to_sql(&dialect)`, and `Engine` hands that off to whichever `Connection` the configured `Driver` produced. `rusty-db-sqlite`, `rusty-db-postgres`, and `rusty-db-mysql` all implement this by wrapping `sqlx`, decoding sqlx rows into `Value` based on each column's runtime type — `?`-placeholder, double-quote-identifier dialects for SQLite, `$1`-placeholder dialects (with `RETURNING` support) for Postgres, and `?`-placeholder, backtick-identifier dialects for MySQL/MariaDB (`rusty_db::mysql::MySqlDriver`, `mysql` feature).
 
 ### Transactions
 
@@ -178,7 +179,7 @@ Each migration runs in its own transaction (its `up`/`down` statements plus the 
 
 ## Status
 
-This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), a unit-of-work `Session`, and versioned migrations. Still missing: an identity map/autoflush. Postgres and SQLite are the only drivers; both are implemented but only SQLite is exercised by the test suite in this environment (no live Postgres server available here).
+This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), a unit-of-work `Session`, and versioned migrations. Still missing: an identity map/autoflush. Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`); SQLite and MySQL are exercised by the test suite (the latter against a real MariaDB server when `MYSQL_TEST_URL`, defaulting to `mysql://rusty:rusty@127.0.0.1/rusty_db_test`, is reachable — the tests skip themselves rather than fail if it isn't), but there's no live Postgres server available in this environment, so that driver is implemented but untested here.
 
 ## Running tests
 

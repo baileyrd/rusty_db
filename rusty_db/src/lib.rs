@@ -33,6 +33,9 @@ pub use rusty_db_sqlite as sqlite;
 #[cfg(feature = "postgres")]
 pub use rusty_db_postgres as postgres;
 
+#[cfg(feature = "mysql")]
+pub use rusty_db_mysql as mysql;
+
 /// Re-exports the pieces most programs need in scope.
 pub mod prelude {
     pub use rusty_db_core::{
@@ -50,4 +53,7 @@ pub mod prelude {
 
     #[cfg(feature = "postgres")]
     pub use rusty_db_postgres::PostgresDriver;
+
+    #[cfg(feature = "mysql")]
+    pub use rusty_db_mysql::MySqlDriver;
 }

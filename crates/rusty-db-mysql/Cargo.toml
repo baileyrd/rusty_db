@@ -1,0 +1,15 @@
+[package]
+name = "rusty-db-mysql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MySQL/MariaDB driver for rusty_db, built on sqlx"
+
+[dependencies]
+rusty-db-core.workspace = true
+async-trait.workspace = true
+sqlx = { workspace = true, features = ["mysql", "chrono"] }
+
+[dev-dependencies]
+tokio.workspace = true

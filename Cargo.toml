@@ -5,6 +5,7 @@ members = [
     "crates/rusty-db-derive",
     "crates/rusty-db-sqlite",
     "crates/rusty-db-postgres",
+    "crates/rusty-db-mysql",
     "rusty_db",
 ]
 
@@ -19,6 +20,7 @@ rusty-db-core = { path = "crates/rusty-db-core", version = "0.1.0" }
 rusty-db-derive = { path = "crates/rusty-db-derive", version = "0.1.0" }
 rusty-db-sqlite = { path = "crates/rusty-db-sqlite", version = "0.1.0" }
 rusty-db-postgres = { path = "crates/rusty-db-postgres", version = "0.1.0" }
+rusty-db-mysql = { path = "crates/rusty-db-mysql", version = "0.1.0" }
 async-trait = "0.1"
 thiserror = "1"
 futures-core = "0.3"
