@@ -45,6 +45,33 @@ impl MySqlDriver {
         if let Some(timeout) = config.acquire_timeout {
             options = options.acquire_timeout(timeout);
         }
+        if let Some(sql) = config.on_connect {
+            options = options.after_connect(move |conn, _meta| {
+                let sql = Arc::clone(&sql);
+                Box::pin(async move {
+                    sqlx::query(&sql).execute(conn).await?;
+                    Ok(())
+                })
+            });
+        }
+        if let Some(sql) = config.before_acquire {
+            options = options.before_acquire(move |conn, _meta| {
+                let sql = Arc::clone(&sql);
+                Box::pin(async move {
+                    sqlx::query(&sql).execute(conn).await?;
+                    Ok(true)
+                })
+            });
+        }
+        if let Some(sql) = config.after_release {
+            options = options.after_release(move |conn, _meta| {
+                let sql = Arc::clone(&sql);
+                Box::pin(async move {
+                    sqlx::query(&sql).execute(conn).await?;
+                    Ok(true)
+                })
+            });
+        }
         let pool = options
             .connect(url)
             .await
