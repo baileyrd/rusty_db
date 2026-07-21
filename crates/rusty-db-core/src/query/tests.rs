@@ -319,3 +319,60 @@ fn arbitrary_expression_can_be_a_select_column() {
     assert_eq!(sql, r#"SELECT amount * ? AS "with_tax" FROM "orders""#);
     assert_eq!(params, vec![Value::F64(1.1)]);
 }
+
+#[test]
+fn group_by_renders_after_where_and_before_order_by() {
+    let orders = Table::new("orders");
+    let (sql, params) = Select::from(&orders)
+        .columns([
+            SelectExpr::from(orders.col("customer")),
+            SelectExpr::from(orders.col("amount").sum()).alias("total"),
+        ])
+        .filter(orders.col("amount").gt(0_i64))
+        .group_by([orders.col("customer")])
+        .order_by(orders.col("customer").asc())
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT "orders"."customer", SUM("orders"."amount") AS "total" FROM "orders" WHERE "orders"."amount" > ? GROUP BY "orders"."customer" ORDER BY "orders"."customer" ASC"#
+    );
+    assert_eq!(params, vec![Value::I64(0)]);
+}
+
+#[test]
+fn group_by_accepts_multiple_columns() {
+    let orders = Table::new("orders");
+    let (sql, _) = Select::from(&orders)
+        .group_by([orders.col("customer"), orders.col("status")])
+        .to_sql(&QuestionMarkDialect);
+    assert!(sql.contains(r#"GROUP BY "orders"."customer", "orders"."status""#));
+}
+
+#[test]
+fn having_filters_on_an_aggregate_and_combines_with_and_on_repeated_calls() {
+    let orders = Table::new("orders");
+    let (sql, params) = Select::from(&orders)
+        .columns([
+            SelectExpr::from(orders.col("customer")),
+            SelectExpr::from(orders.col("amount").sum()).alias("total"),
+        ])
+        .group_by([orders.col("customer")])
+        .having(orders.col("amount").sum().gt(100_i64))
+        .having(orders.col("amount").count().lt(10_i64))
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT "orders"."customer", SUM("orders"."amount") AS "total" FROM "orders" GROUP BY "orders"."customer" HAVING (SUM("orders"."amount") > ?) AND (COUNT("orders"."amount") < ?)"#
+    );
+    assert_eq!(params, vec![Value::I64(100), Value::I64(10)]);
+}
+
+#[test]
+fn expr_level_comparisons_work_on_an_arbitrary_expression_not_just_a_column() {
+    let orders = Table::new("orders");
+    let (sql, params) = Select::from(&orders)
+        .filter(Expr::text("amount * 2", []).gte(50_i64))
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"SELECT * FROM "orders" WHERE amount * 2 >= ?"#);
+    assert_eq!(params, vec![Value::I64(50)]);
+}

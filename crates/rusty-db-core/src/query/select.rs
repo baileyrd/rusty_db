@@ -69,6 +69,8 @@ pub struct Select {
     distinct: bool,
     joins: Vec<Join>,
     filter: Option<Expr>,
+    group_by: Vec<Expr>,
+    having: Option<Expr>,
     order_by: Vec<(Column, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
@@ -83,6 +85,8 @@ impl Select {
             distinct: false,
             joins: Vec::new(),
             filter: None,
+            group_by: Vec::new(),
+            having: None,
             order_by: Vec::new(),
             limit: None,
             offset: None,
@@ -140,6 +144,27 @@ impl Select {
         self
     }
 
+    /// `GROUP BY`. Accepts plain `Column`s (the common case) or arbitrary
+    /// `Expr`s, same as `.columns(...)` — mixing the two in one call means
+    /// converting the plain ones with `Expr::col(...)` first, for the same
+    /// one-concrete-item-type-per-call reason `SelectExpr` documents.
+    pub fn group_by<E: Into<Expr>>(mut self, columns: impl IntoIterator<Item = E>) -> Self {
+        self.group_by = columns.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// `HAVING` — a second filter applied after `GROUP BY` collapses rows,
+    /// so (unlike `.filter(...)`'s `WHERE`) it can reference an aggregate
+    /// (`orders.col("amount").sum().gt(100)`). Calling this more than once
+    /// combines every condition with `AND`, same as repeated `.filter(...)`.
+    pub fn having(mut self, expr: Expr) -> Self {
+        self.having = Some(match self.having {
+            Some(existing) => existing.and(expr),
+            None => expr,
+        });
+        self
+    }
+
     pub fn order_by(mut self, ordering: (Column, bool)) -> Self {
         self.order_by.push(ordering);
         self
@@ -188,6 +213,22 @@ impl ToSql for Select {
         if let Some(filter) = &self.filter {
             sql.push_str(" WHERE ");
             sql.push_str(&filter.render(dialect, &mut params));
+        }
+
+        if !self.group_by.is_empty() {
+            let group_sql = self
+                .group_by
+                .iter()
+                .map(|e| e.render(dialect, &mut params))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(" GROUP BY ");
+            sql.push_str(&group_sql);
+        }
+
+        if let Some(having) = &self.having {
+            sql.push_str(" HAVING ");
+            sql.push_str(&having.render(dialect, &mut params));
         }
 
         if !self.order_by.is_empty() {
