@@ -8,7 +8,7 @@ use crate::engine::{Engine, Transaction};
 use crate::error::{Error, Result};
 use crate::mapping::{Entity, FromRow, Identifiable, Mapped};
 use crate::migration::{self, Migration};
-use crate::query::{Insert, Select, Table, ToSql};
+use crate::query::{BulkInsert, Insert, Select, Table, ToSql};
 use crate::value::Value;
 
 /// One write queued by `add`/`update`/`delete`, tagged with what it's for
@@ -115,6 +115,24 @@ impl Session {
             table: T::TABLE_NAME,
             operation: AuditOperation::Insert,
             query: Box::new(entity.insert()),
+            requires_row_affected: false,
+        });
+    }
+
+    /// Queue inserts for every entity in `entities` as a single bulk
+    /// `INSERT` (`BulkInsert`) — one statement (and, at flush time, one
+    /// round trip) for the whole batch, instead of one per entity as
+    /// repeated `add` calls would. A no-op for an empty slice.
+    pub fn add_all<T: Entity>(&mut self, entities: &[T]) {
+        let Some(bulk) = BulkInsert::combine(entities.iter().map(Entity::insert))
+            .expect("entities of the same type always share a table and column order")
+        else {
+            return;
+        };
+        self.pending.push(PendingWrite {
+            table: T::TABLE_NAME,
+            operation: AuditOperation::Insert,
+            query: Box::new(bulk),
             requires_row_affected: false,
         });
     }

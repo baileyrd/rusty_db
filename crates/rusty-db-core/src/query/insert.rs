@@ -30,6 +30,13 @@ impl Insert {
         self.returning = columns.into_iter().map(Into::into).collect();
         self
     }
+
+    /// This insert's table and its `(column, value)` assignments, in the
+    /// order `.value(...)` was called — used by `BulkInsert::combine` to
+    /// merge several single-row `Insert`s into one multi-row statement.
+    pub(crate) fn into_parts(self) -> (Table, Vec<(String, Value)>) {
+        (self.table, self.assignments)
+    }
 }
 
 impl ToSql for Insert {
