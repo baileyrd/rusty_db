@@ -36,7 +36,9 @@ raw SQL into an otherwise builder-constructed query, `COUNT`/`SUM`/`AVG`/
 `MIN`/`MAX`/arbitrary expression `SELECT` columns via `SelectExpr`,
 `GROUP BY`/`HAVING`, `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT` via
 `SetOperation`, `LOWER`/`UPPER`/concatenation/arithmetic/`CASE`/
-`COALESCE`/`CURRENT_TIMESTAMP`); first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
+`COALESCE`/`CURRENT_TIMESTAMP`, and subqueries — `IN (subquery)`,
+correlated `EXISTS`, and scalar subqueries, though not yet a subquery in a
+`FROM` clause); first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
 `chrono`'s `NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`, and
 `Vec<T>` arrays (native on Postgres, JSON-flattened on MySQL/MariaDB and
 SQLite); `#[derive(Mapped)]` with one primary key, one version column, one
@@ -57,10 +59,6 @@ observability. See `README.md` for the full tour with examples.
 
 ## Query builder (Core-equivalent)
 
-- **Subqueries** — no way to nest a `Select` inside another query's `FROM`,
-  column list, or a filter (`IN (subquery)`, scalar subquery, correlated
-  `EXISTS`). Currently the only composition is fetching once and filtering
-  again in Rust. **L**
 - **CTEs (`WITH`, `WITH RECURSIVE`)** — no support; recursive CTEs in
   particular have no workaround at all today. **L**
 - **Window functions** (`OVER (PARTITION BY ... ORDER BY ...)`, `ROW_NUMBER`,
@@ -109,8 +107,10 @@ observability. See `README.md` for the full tour with examples.
   always being eagerly select-in-loaded) — today every relationship is
   eager, which is safe but can over-fetch. **L**
 - **Additional eager-loading strategies** (`joined`/`subquery`, alongside
-  the existing select-in) — mostly matters once subqueries/joins-in-`Select`
-  exist to make a real choice between strategies meaningful. **M**
+  the existing select-in) — joins and basic subqueries (`IN`/`EXISTS`/
+  scalar) both exist now, but SQLAlchemy's `subqueryload` strategy
+  specifically needs a subquery usable as a `FROM`-clause data source,
+  which still doesn't exist. **M**
 
 ## Async & performance
 
