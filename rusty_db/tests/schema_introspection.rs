@@ -212,6 +212,61 @@ async fn table_schema_reports_single_column_and_composite_foreign_keys() -> rust
 }
 
 #[tokio::test]
+async fn table_schema_reports_indexes_excluding_the_primary_keys_own() -> rusty_db::Result<()> {
+    let engine = file_engine("indexes").await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE people (\
+                 id INTEGER PRIMARY KEY, \
+                 email TEXT, \
+                 first_name TEXT, \
+                 last_name TEXT, \
+                 UNIQUE (email)\
+             )",
+            &[],
+        )
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE INDEX people_name ON people (last_name, first_name)",
+            &[],
+        )
+        .await?;
+
+    let schema = engine.table_schema("people").await?.expect("table exists");
+    assert_eq!(
+        schema.indexes.len(),
+        2,
+        "the primary key's own index should not be included: {:?}",
+        schema.indexes
+    );
+
+    let unique_index = schema
+        .indexes
+        .iter()
+        .find(|i| i.columns == vec!["email".to_string()])
+        .expect("the UNIQUE (email) index");
+    assert!(unique_index.unique);
+
+    let plain_index = schema
+        .indexes
+        .iter()
+        .find(|i| i.name == "people_name")
+        .expect("the plain CREATE INDEX");
+    assert!(!plain_index.unique);
+    assert_eq!(
+        plain_index.columns,
+        vec!["last_name".to_string(), "first_name".to_string()]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn table_schema_returns_none_for_a_table_that_does_not_exist() -> rusty_db::Result<()> {
     let engine = file_engine("missing_table").await?;
     assert_eq!(engine.table_schema("does_not_exist").await?, None);

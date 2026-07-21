@@ -166,6 +166,16 @@ if let Some(schema) = engine.table_schema("orders").await? {
 
 SQLite doesn't name foreign keys at all (there's no `CONSTRAINT <name>` for them), so `ForeignKey::name` there is synthetic (`"fk_1"`, `"fk_2"`, ...) rather than anything recoverable from the database.
 
+`schema.indexes` reflects every index on the table — its name, the column(s) it covers in index order, and whether it enforces uniqueness — including ones that also back a `UNIQUE` constraint (already covered separately by `unique_constraints`), but excluding the index automatically backing the primary key itself (already `ColumnInfo::primary_key`):
+
+```rust
+if let Some(schema) = engine.table_schema("people").await? {
+    for index in &schema.indexes {
+        println!("{}: {:?} (unique={})", index.name, index.columns, index.unique);
+    }
+}
+```
+
 ### Backup and restore
 
 `Engine::backup`/`restore` do a *logical* (row-data) backup — built entirely on `list_tables`/`table_schema` and the query builder, not any database-specific backup mechanism (`pg_dump`, SQLite's own backup API, etc) — so a `DatabaseDump` is the same shape regardless of which backend produced it, and can even be restored into a different `Engine` than the one it came from:
@@ -503,6 +513,8 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 Reflecting `CHECK` constraints turned up two more real per-backend quirks, each confirmed against a live server rather than assumed: Postgres's `information_schema.check_constraints` also reports a synthetic entry for every `NOT NULL` column (its catalog-level way of representing `NOT NULL`, already covered by `ColumnInfo::nullable`) — fixed by querying `pg_catalog.pg_constraint` directly and filtering to `contype = 'c'` (genuine `CHECK`), which also gives a cleaner expression via `pg_get_expr` than `information_schema`'s doubly-parenthesized text. And SQLite has no catalog for `CHECK` constraints at all, so `crates/rusty-db-sqlite/src/lib.rs`'s `check_constraints` module recovers them with its own small tokenizer over the table's `CREATE TABLE` text (unit-tested directly, independent of a live database, with 6 tests covering a named constraint, synthetic positional names for anonymous ones, an inline column-level `CHECK`, nested parens and string literals inside the expression, a `CHECK`-like word inside a string literal not being mistaken for a real one, and a table with no `CHECK` constraints at all).
 
 Foreign key reflection (`schema.foreign_keys`) is covered by the same `tests/schema_introspection*.rs` files: both a single-column and a genuinely composite (two-column) foreign key come back with their columns correctly paired against the referenced table's columns, in order. Getting that pairing right for a composite key surfaced a real `information_schema` pitfall on Postgres: joining `key_column_usage` to `constraint_column_usage` by constraint name alone (the usual approach) has no shared ordinal between the two, so it cross-joins every local column with every referenced column of a multi-column key instead of pairing them up correctly. Fixed by querying `pg_catalog.pg_constraint`'s own `conkey`/`confkey` arrays instead and pairing them positionally via `unnest(...) WITH ORDINALITY`, which is exact regardless of how many columns are involved. MySQL/MariaDB's `information_schema.key_column_usage` already includes `referenced_table_name`/`referenced_column_name` directly on each row (a MySQL-specific extension beyond the SQL standard), so no equivalent care was needed there. SQLite doesn't name foreign keys at all, so `ForeignKey::name` there is synthetic (`"fk_1"`, `"fk_2"`, ...), grouped from `PRAGMA foreign_key_list`'s rows sharing the same `id`.
+
+Index reflection (`schema.indexes`) rounds out the same test files: a `UNIQUE`-backed index and a plain, non-unique multi-column index both come back with the right name, columns (in index order), and `unique` flag, and the primary key's own automatically-created index is never included among them (already `ColumnInfo::primary_key`) — verified on Postgres via a `NOT EXISTS` against `pg_constraint` (the reliable way to identify it, since its name isn't predictable), on MySQL/MariaDB by excluding `index_name = 'PRIMARY'`, and on SQLite by excluding `PRAGMA index_list`'s `origin = "pk"` row.
 
 `tests/backup_restore.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `backup`/`restore`: a backup captures every row of every table; restoring returns the database to exactly its backed-up state after rows are deleted, updated, and added; a dump backed up from one `Engine` restores correctly into a completely different one; a failing restore (a corrupted dump with a duplicate primary key partway through) rolls back the *entire* transaction rather than leaving the table partially wiped; and backing up an empty table round-trips correctly. The Postgres/MySQL versions scope every backup/restore to their own table via `backup_tables`, since a whole-database `restore()` would otherwise risk wiping tables that other tests running concurrently against the same shared live server still need.
 

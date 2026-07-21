@@ -67,8 +67,20 @@ pub struct ForeignKey {
     pub referenced_columns: Vec<String>,
 }
 
+/// A reflected index: its name, the column(s) it covers in index order,
+/// and whether it enforces uniqueness. Includes indexes backing a
+/// `UNIQUE` constraint (see `UniqueConstraint`) as well as plain,
+/// non-unique indexes; excludes the index automatically backing the
+/// primary key itself (already `ColumnInfo::primary_key`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexInfo {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
 /// A reflected table: its name and columns, in the database's own column
-/// order, plus its `UNIQUE`/`CHECK`/foreign key constraints.
+/// order, plus its `UNIQUE`/`CHECK`/foreign key constraints and indexes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
     pub name: String,
@@ -76,4 +88,5 @@ pub struct TableSchema {
     pub unique_constraints: Vec<UniqueConstraint>,
     pub check_constraints: Vec<CheckConstraint>,
     pub foreign_keys: Vec<ForeignKey>,
+    pub indexes: Vec<IndexInfo>,
 }

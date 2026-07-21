@@ -42,7 +42,9 @@ pub use query::{
 };
 pub use replica::ReplicaSet;
 pub use row::Row;
-pub use schema::{CheckConstraint, ColumnInfo, ForeignKey, TableSchema, UniqueConstraint};
+pub use schema::{
+    CheckConstraint, ColumnInfo, ForeignKey, IndexInfo, TableSchema, UniqueConstraint,
+};
 pub use session::Session;
 pub use timeout::with_timeout;
 pub use value::{FromValue, Value};

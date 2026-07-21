@@ -12,7 +12,8 @@ use sqlx::{Column as _, Postgres, Row as _, TypeInfo as _};
 use rusty_db_core::dialect::NumberedDialect;
 use rusty_db_core::{
     CheckConstraint, ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, ForeignKey,
-    PoolConfig, PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint, Value,
+    IndexInfo, PoolConfig, PoolMetrics, PoolStats, Result, Row, TableSchema, UniqueConstraint,
+    Value,
 };
 
 static DIALECT: NumberedDialect = NumberedDialect;
@@ -240,7 +241,7 @@ impl Driver for PostgresDriver {
                    AND rel.relname = $1 \
                  GROUP BY con.conname, frel.relname \
                  ORDER BY con.conname",
-                &[table_value],
+                std::slice::from_ref(&table_value),
             )
             .await?;
         let foreign_keys = fk_rows
@@ -263,12 +264,55 @@ impl Driver for PostgresDriver {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // Excludes the index automatically backing the primary key
+        // (already `ColumnInfo::primary_key`) via a `NOT EXISTS` against
+        // `pg_constraint`'s own `conindid` — the reliable way to identify
+        // it, since its name isn't predictable.
+        let index_rows = conn
+            .fetch_all(
+                "SELECT idx.relname AS index_name, \
+                        ix.indisunique AS is_unique, \
+                        string_agg(att.attname, ',' ORDER BY k.ord) AS columns \
+                 FROM pg_catalog.pg_index ix \
+                 JOIN pg_catalog.pg_class idx ON idx.oid = ix.indexrelid \
+                 JOIN pg_catalog.pg_class tbl ON tbl.oid = ix.indrelid \
+                 JOIN pg_catalog.pg_namespace ns ON ns.oid = tbl.relnamespace \
+                 JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
+                 JOIN pg_catalog.pg_attribute att \
+                   ON att.attrelid = tbl.oid AND att.attnum = k.attnum \
+                 WHERE ns.nspname = 'public' \
+                   AND tbl.relname = $1 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM pg_catalog.pg_constraint con \
+                     WHERE con.contype = 'p' AND con.conindid = idx.oid \
+                   ) \
+                 GROUP BY idx.relname, ix.indisunique \
+                 ORDER BY idx.relname",
+                &[table_value],
+            )
+            .await?;
+        let indexes = index_rows
+            .iter()
+            .map(|row| {
+                Ok(IndexInfo {
+                    name: row.get_by_name::<String>("index_name")?,
+                    columns: row
+                        .get_by_name::<String>("columns")?
+                        .split(',')
+                        .map(str::to_string)
+                        .collect(),
+                    unique: row.get_by_name::<bool>("is_unique")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         Ok(Some(TableSchema {
             name: table.to_string(),
             columns,
             unique_constraints,
             check_constraints,
             foreign_keys,
+            indexes,
         }))
     }
 }

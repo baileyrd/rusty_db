@@ -281,3 +281,76 @@ async fn table_schema_reports_single_column_and_composite_foreign_keys() -> rust
 
     Ok(())
 }
+
+#[tokio::test]
+async fn table_schema_reports_indexes_excluding_the_primary_keys_own() -> rusty_db::Result<()> {
+    let Some(engine) = test_engine().await else {
+        return Ok(());
+    };
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE IF EXISTS schema_introspection_people_idx", &[])
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE schema_introspection_people_idx (\
+                 id BIGINT PRIMARY KEY, \
+                 email VARCHAR(255), \
+                 first_name VARCHAR(100), \
+                 last_name VARCHAR(100), \
+                 UNIQUE KEY people_email_unique (email)\
+             )",
+            &[],
+        )
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE INDEX schema_introspection_people_idx_name \
+                 ON schema_introspection_people_idx (last_name, first_name)",
+            &[],
+        )
+        .await?;
+
+    let schema = engine
+        .table_schema("schema_introspection_people_idx")
+        .await?
+        .expect("table exists");
+    assert_eq!(
+        schema.indexes.len(),
+        2,
+        "the primary key's own index should not be included: {:?}",
+        schema.indexes
+    );
+
+    let unique_index = schema
+        .indexes
+        .iter()
+        .find(|i| i.name == "people_email_unique")
+        .expect("the UNIQUE (email) index");
+    assert!(unique_index.unique);
+    assert_eq!(unique_index.columns, vec!["email".to_string()]);
+
+    let plain_index = schema
+        .indexes
+        .iter()
+        .find(|i| i.name == "schema_introspection_people_idx_name")
+        .expect("the plain CREATE INDEX");
+    assert!(!plain_index.unique);
+    assert_eq!(
+        plain_index.columns,
+        vec!["last_name".to_string(), "first_name".to_string()]
+    );
+
+    engine
+        .connect()
+        .await?
+        .execute("DROP TABLE schema_introspection_people_idx", &[])
+        .await?;
+
+    Ok(())
+}
