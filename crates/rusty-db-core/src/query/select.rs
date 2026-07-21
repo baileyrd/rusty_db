@@ -1,4 +1,5 @@
 use super::expr::Expr;
+use super::join::{Join, JoinKind};
 use super::table::{Column, Table};
 use super::ToSql;
 use crate::dialect::Dialect;
@@ -8,6 +9,7 @@ use crate::value::Value;
 pub struct Select {
     table: Table,
     columns: Vec<Column>,
+    joins: Vec<Join>,
     filter: Option<Expr>,
     order_by: Vec<(Column, bool)>,
     limit: Option<i64>,
@@ -20,6 +22,7 @@ impl Select {
         Select {
             table: table.clone(),
             columns: Vec::new(),
+            joins: Vec::new(),
             filter: None,
             order_by: Vec::new(),
             limit: None,
@@ -29,6 +32,34 @@ impl Select {
 
     pub fn columns(mut self, columns: impl IntoIterator<Item = Column>) -> Self {
         self.columns = columns.into_iter().collect();
+        self
+    }
+
+    /// `INNER JOIN other ON on`.
+    pub fn join(mut self, other: &Table, on: Expr) -> Self {
+        self.joins
+            .push(Join::new(JoinKind::Inner, other.clone(), on));
+        self
+    }
+
+    /// `LEFT JOIN other ON on`.
+    pub fn left_join(mut self, other: &Table, on: Expr) -> Self {
+        self.joins
+            .push(Join::new(JoinKind::Left, other.clone(), on));
+        self
+    }
+
+    /// `RIGHT JOIN other ON on`.
+    pub fn right_join(mut self, other: &Table, on: Expr) -> Self {
+        self.joins
+            .push(Join::new(JoinKind::Right, other.clone(), on));
+        self
+    }
+
+    /// `FULL JOIN other ON on`.
+    pub fn full_join(mut self, other: &Table, on: Expr) -> Self {
+        self.joins
+            .push(Join::new(JoinKind::Full, other.clone(), on));
         self
     }
 
@@ -74,6 +105,15 @@ impl ToSql for Select {
             "SELECT {columns_sql} FROM {}",
             dialect.quote_ident(self.table.name())
         );
+
+        for join in &self.joins {
+            sql.push(' ');
+            sql.push_str(join.kind.as_sql());
+            sql.push(' ');
+            sql.push_str(&dialect.quote_ident(join.table.name()));
+            sql.push_str(" ON ");
+            sql.push_str(&join.on.render(dialect, &mut params));
+        }
 
         if let Some(filter) = &self.filter {
             sql.push_str(" WHERE ");

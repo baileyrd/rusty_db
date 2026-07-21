@@ -6,9 +6,10 @@ A Rust take on [SQLAlchemy Core](https://docs.sqlalchemy.org/en/20/core/): a sin
 
 ```
 crates/rusty-db-core      database-agnostic layer: query builder, Row/Value, Driver/Connection traits, Engine
+crates/rusty-db-derive    #[derive(Mapped)] proc macro: maps a struct onto a table
 crates/rusty-db-sqlite    SQLite Driver impl (wraps sqlx::SqlitePool)
 crates/rusty-db-postgres  PostgreSQL Driver impl (wraps sqlx::PgPool)
-rusty_db/                 facade crate: re-exports core + feature-gated drivers ("sqlite", "postgres")
+rusty_db/                 facade crate: re-exports core + feature-gated drivers ("sqlite", "postgres", "derive")
 ```
 
 Application code depends only on `rusty-db-core` (via the `rusty_db` facade): `Engine`, `Table`/`Column`, `Select`/`Insert`/`Update`/`Delete`, `Expr`. Which database actually runs underneath is decided once, at startup, by which `Driver` you construct the `Engine` with — everything built on top is portable across backends.
@@ -50,9 +51,52 @@ txn.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", &[100.into
 txn.commit().await?; // or txn.rollback().await?
 ```
 
+### Joins
+
+`Select` supports `join`/`left_join`/`right_join`/`full_join`, and `Column::eq_col` builds a column-to-column condition (as opposed to `Column::eq`, which compares against a literal):
+
+```rust
+let orders = Table::new("orders");
+let users = Table::new("users");
+
+let query = Select::from(&orders)
+    .columns([orders.col("amount"), users.col("name")])
+    .join(&users, orders.col("user_id").eq_col(&users.col("id")))
+    .filter(users.col("active").eq(true));
+```
+
+### Struct-to-table mapping (`#[derive(Mapped)]`)
+
+Enable the `derive` feature to map a struct onto a table:
+
+```rust
+use rusty_db::prelude::*;
+
+#[derive(Mapped)]
+#[table(name = "users")] // optional; defaults to the snake_case struct name
+struct User {
+    #[table(primary_key)]
+    id: i64,
+    name: String,
+    active: bool,
+}
+
+let user = User { id: 1, name: "ada".into(), active: true };
+engine.execute(&user.insert()).await?;
+
+let users: Vec<User> = engine.fetch_all_as(&Select::from(&User::table())).await?;
+
+let mut user = users.into_iter().next().unwrap();
+user.active = false;
+engine.execute(&user.update()).await?;   // only generated when a field is #[table(primary_key)]
+engine.execute(&user.delete_query()).await?;
+```
+
+Field types are limited to whatever `Value` already converts from (`bool`, `i64`, `i32`, `f64`, `String`, `Vec<u8>`, and `Option<_>` of those) — there's no arbitrary custom-type support yet.
+
 ## Status
 
-This is the Core layer only — a query builder and connection abstraction, not yet an ORM. There is no struct-to-table mapping, session/unit-of-work, migrations, or joins yet. Postgres and SQLite are the only drivers; both are implemented but only SQLite is exercised by the test suite in this environment (no live Postgres server available here).
+This covers Core (query builder, connections) plus a thin mapping layer (`#[derive(Mapped)]`, joins). Still missing: a real session/unit-of-work layer, relationships/eager-loading, and migrations. Postgres and SQLite are the only drivers; both are implemented but only SQLite is exercised by the test suite in this environment (no live Postgres server available here).
 
 ## Running tests
 

@@ -84,6 +84,39 @@ fn update_and_delete_render_where_clause() {
 }
 
 #[test]
+fn join_renders_kind_table_and_on_clause() {
+    let users = Table::new("users");
+    let orders = Table::new("orders");
+
+    let query = Select::from(&orders)
+        .columns([orders.col("id"), users.col("name")])
+        .join(&users, orders.col("user_id").eq_col(&users.col("id")))
+        .filter(users.col("active").eq(true));
+
+    let (sql, params) = query.to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT "orders"."id", "users"."name" FROM "orders" INNER JOIN "users" ON "orders"."user_id" = "users"."id" WHERE "users"."active" = ?"#
+    );
+    assert_eq!(params, vec![Value::Bool(true)]);
+}
+
+#[test]
+fn left_join_renders_left_join_keyword() {
+    let users = Table::new("users");
+    let orders = Table::new("orders");
+
+    let query =
+        Select::from(&users).left_join(&orders, orders.col("user_id").eq_col(&users.col("id")));
+
+    let (sql, _) = query.to_sql(&NumberedDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT * FROM "users" LEFT JOIN "orders" ON "orders"."user_id" = "users"."id""#
+    );
+}
+
+#[test]
 fn empty_in_list_is_always_false() {
     let users = Table::new("users");
     let (sql, params) = Select::from(&users)

@@ -22,6 +22,11 @@
 
 pub use rusty_db_core::*;
 
+/// `#[derive(Mapped)]`: maps a struct onto a table (see `rusty-db-derive`
+/// for the attributes it accepts).
+#[cfg(feature = "derive")]
+pub use rusty_db_derive::Mapped;
+
 #[cfg(feature = "sqlite")]
 pub use rusty_db_sqlite as sqlite;
 
@@ -31,8 +36,14 @@ pub use rusty_db_postgres as postgres;
 /// Re-exports the pieces most programs need in scope.
 pub mod prelude {
     pub use rusty_db_core::{
-        Column, Delete, Engine, Expr, Insert, Row, Select, Table, ToSql, Update, Value,
+        Column, Delete, Engine, Expr, FromRow, Insert, Join, JoinKind, Mapped, Row, Select, Table,
+        ToSql, Update, Value,
     };
+
+    // `Mapped` above is the trait (type namespace); this is the derive
+    // macro of the same name (macro namespace) — no conflict.
+    #[cfg(feature = "derive")]
+    pub use rusty_db_derive::Mapped;
 
     #[cfg(feature = "sqlite")]
     pub use rusty_db_sqlite::SqliteDriver;
