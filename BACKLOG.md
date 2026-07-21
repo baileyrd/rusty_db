@@ -15,14 +15,14 @@ Every item below is also tracked as a GitHub issue, grouped under one
 tracking epic per section: [Schema/DDL/reflection (#54)](https://github.com/baileyrd/rusty_db/issues/54),
 [Mapping/derive macro (#60)](https://github.com/baileyrd/rusty_db/issues/60),
 [Relationships/eager loading (#66)](https://github.com/baileyrd/rusty_db/issues/66),
-[Async & performance (#77)](https://github.com/baileyrd/rusty_db/issues/77),
 [Topology/deployment (#80)](https://github.com/baileyrd/rusty_db/issues/80),
 [Tooling (#83)](https://github.com/baileyrd/rusty_db/issues/83).
 
-Three tracking epics are fully done and no longer listed above: [Value/type
+Four tracking epics are fully done and no longer listed above: [Value/type
 system (#46)](https://github.com/baileyrd/rusty_db/issues/46),
-[Session/unit-of-work (#73)](https://github.com/baileyrd/rusty_db/issues/73), and
-[Query builder (#38)](https://github.com/baileyrd/rusty_db/issues/38)
+[Session/unit-of-work (#73)](https://github.com/baileyrd/rusty_db/issues/73),
+[Query builder (#38)](https://github.com/baileyrd/rusty_db/issues/38), and
+[Async & performance (#77)](https://github.com/baileyrd/rusty_db/issues/77)
 — see "current state" below for what they added.
 
 ## How to read "current state"
@@ -56,8 +56,9 @@ migrations; schema introspection (columns/types/nullability/PK/foreign
 keys/indexes/unique constraints/check constraints/column defaults);
 logical backup/restore; read replicas; TLS; query timeouts; connection-pool
 observability; connection-level event hooks (`PoolConfig::with_on_connect`/
-`.with_before_acquire`/`.with_after_release`); and a tunable per-connection
-statement-cache capacity (`PoolConfig::with_statement_cache_capacity`).
+`.with_before_acquire`/`.with_after_release`); a tunable per-connection
+statement-cache capacity (`PoolConfig::with_statement_cache_capacity`); and
+streaming query results (`Engine::fetch_stream`/`fetch_stream_as`).
 See `README.md` for the full tour with examples.
 
 ---
@@ -110,12 +111,6 @@ See `README.md` for the full tour with examples.
   specifically needs a subquery usable as a `FROM`-clause data source,
   which still doesn't exist. **M**
 
-## Async & performance
-
-- **Streaming query results** (a cursor/`Stream`-based fetch instead of
-  always collecting a full `Vec<Row>`) — every fetch path
-  (`fetch_all`/`fetch_all_as`) materializes the entire result set today,
-  which is a real ceiling for large exports/reports. **L**
 ## Topology / deployment
 
 - **Sharding / multi-tenant routing** beyond the existing single-primary +
