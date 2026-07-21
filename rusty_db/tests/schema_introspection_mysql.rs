@@ -153,6 +153,9 @@ async fn table_schema_reports_defaults_unique_and_check_constraints() -> rusty_d
                  id BIGINT PRIMARY KEY, \
                  email VARCHAR(255) NOT NULL, \
                  balance BIGINT NOT NULL DEFAULT 0, \
+                 nickname VARCHAR(50), \
+                 note VARCHAR(50) DEFAULT NULL, \
+                 literal_null VARCHAR(50) DEFAULT 'NULL', \
                  CONSTRAINT email_unique UNIQUE (email), \
                  CONSTRAINT balance_check CHECK (balance >= 0)\
              )",
@@ -170,7 +173,35 @@ async fn table_schema_reports_defaults_unique_and_check_constraints() -> rusty_d
     let email = schema.columns.iter().find(|c| c.name == "email").unwrap();
     assert_eq!(
         email.default, None,
-        "a column with no DEFAULT reflects None"
+        "a NOT NULL column with no DEFAULT reflects None"
+    );
+    let nickname = schema
+        .columns
+        .iter()
+        .find(|c| c.name == "nickname")
+        .unwrap();
+    assert_eq!(
+        nickname.default, None,
+        "a nullable column with no DEFAULT clause reflects None, not MariaDB's \
+         literal (unquoted) \"NULL\" catalog text"
+    );
+    let note = schema.columns.iter().find(|c| c.name == "note").unwrap();
+    assert_eq!(
+        note.default, None,
+        "an explicit DEFAULT NULL on a nullable column is indistinguishable from \
+         no default at all in MariaDB's own catalog, and behaves identically, so \
+         it reflects None too"
+    );
+    let literal_null = schema
+        .columns
+        .iter()
+        .find(|c| c.name == "literal_null")
+        .unwrap();
+    assert_eq!(
+        literal_null.default.as_deref(),
+        Some("'NULL'"),
+        "a genuine string-literal default of the text NULL is quoted in MariaDB's \
+         catalog and must not be mistaken for the no-default case"
     );
 
     assert_eq!(schema.unique_constraints.len(), 1);

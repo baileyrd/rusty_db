@@ -132,12 +132,16 @@ impl Driver for MySqlDriver {
         let columns = rows
             .iter()
             .map(|row| {
+                let nullable = row.get_by_name::<String>("is_nullable")? == "YES";
                 Ok(ColumnInfo {
                     name: row.get_by_name::<String>("column_name")?,
                     type_name: row.get_by_name::<String>("column_type")?,
-                    nullable: row.get_by_name::<String>("is_nullable")? == "YES",
+                    nullable,
                     primary_key: row.get_by_name::<String>("column_key")? == "PRI",
-                    default: row.get_by_name::<Option<String>>("column_default")?,
+                    default: normalize_default(
+                        nullable,
+                        row.get_by_name::<Option<String>>("column_default")?,
+                    ),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -223,6 +227,27 @@ impl Driver for MySqlDriver {
             foreign_keys,
             indexes,
         }))
+    }
+}
+
+/// MariaDB/MySQL's `information_schema.columns.column_default` reports the
+/// literal, unquoted text `"NULL"` for a nullable column with no
+/// meaningful default — both when no `DEFAULT` clause was given at all,
+/// and for an explicit `DEFAULT NULL` (the two are indistinguishable in
+/// this text form, and behave identically anyway: a nullable column with
+/// no value on `INSERT` becomes `NULL` regardless of which one it was).
+/// Without this, `ColumnInfo::default` would report `Some("NULL")` for
+/// every nullable column that has no real default, unlike Postgres and
+/// SQLite, which both report genuine SQL `NULL` (i.e. `None`) for the
+/// same case.
+///
+/// A *string* literal default of the four characters `NULL` is reported
+/// quoted (`"'NULL'"`) and is left untouched here — it's a real default,
+/// not this ambiguity.
+fn normalize_default(nullable: bool, default: Option<String>) -> Option<String> {
+    match default {
+        Some(text) if nullable && text == "NULL" => None,
+        other => other,
     }
 }
 
