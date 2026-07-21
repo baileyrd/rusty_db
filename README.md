@@ -451,6 +451,20 @@ let first_match = session
 
 `.all()`/`.first()` (which just adds `LIMIT 1`) run the query (autoflushing first, same as `load_all`/`get`) and decode results through the session's identity map exactly the same way — a row already cached comes back as the same handle, in-memory changes and all.
 
+### Session hooks
+
+`session.on_before_flush`/`on_after_flush`/`on_before_commit`/`on_after_commit`/`on_after_rollback` register plain callbacks that fire at specific points in a session's lifecycle — for logging, metrics, cache invalidation, or anything else that should happen alongside a flush/commit/rollback without threading extra code through every call site:
+
+```rust
+session.on_before_flush(|| println!("about to send queued writes"));
+session.on_after_commit(|| println!("transaction committed"));
+
+session.add(&User { id: 1, name: "ada".into(), active: true });
+session.commit().await?; // fires on_before_flush, then on_after_commit
+```
+
+Hooks are plain `FnMut()` closures (no `async` support — they fire at a specific synchronous point inside an already-`async fn`, not as their own awaited step) and run in registration order. `on_before_flush`/`on_after_flush` only fire when a flush actually has queued writes to send (a flush with nothing pending — including the implicit ones inside `get`/`load_all`/`query`/`commit`/`savepoint` — is a no-op and doesn't trigger them), and `on_after_flush` never fires for a flush that failed. `on_before_commit` fires on every `commit()` call, pending writes or not; `on_after_commit`/`on_after_rollback` only fire when a transaction actually existed to commit/roll back — calling `commit()`/`rollback()` when nothing was ever flushed or read (so no transaction was ever opened) doesn't trigger them.
+
 ### Identity map
 
 `Session::get`/`load_all` cache decoded rows by `(type, primary key)`: loading the same row twice through the same session returns the exact same `Rc<RefCell<T>>` handle rather than two independently-decoded copies, and mutations made through one handle are visible through any other handle to that row — including handles you fetch *after* the mutation, since the identity map wins over what's actually in the database:
@@ -599,6 +613,8 @@ Index reflection (`schema.indexes`) rounds out the same test files: a `UNIQUE`-b
 `tests/savepoints.rs` (SQLite, 6 tests) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests that most directly prove `SAVEPOINT`/`ROLLBACK TO SAVEPOINT`/`RELEASE SAVEPOINT` actually work against a real server, since the rest is `Session`-level logic independent of the driver underneath) cover `Session::savepoint`/`rollback_to_savepoint`/`release_savepoint`: rolling back to a savepoint undoes a sub-unit of work (whether already flushed or still only queued) without aborting the rest of the transaction, which keeps committing normally afterward; releasing a savepoint keeps its effects and lets the transaction continue; savepoints nest, rolling back an inner one independently of an outer one still open around it; and both an unreleased savepoint and a full `Session::rollback()` behave correctly regardless of whether a savepoint is still open — standard SQL behavior this crate doesn't need to do anything special to get right, beyond generating unique, safe (unquoted) savepoint names so nested savepoints within one session never collide.
 
 `tests/session_query.rs` (SQLite) covers `Session::query`/`SessionQuery`: `.filter`/`.order_by` narrow and order the result set; `.limit`/`.offset` page through it; `.first()` returns just the first matching row (`None` when nothing matches); results come back through the identity map exactly like `load_all`'s do, including reflecting an in-memory change made through a handle fetched a different way; and `.active_only()` excludes soft-deleted rows for a `#[table(soft_delete)]` type, the same as `load_active`. No `_postgres`/`_mysql` counterparts — this is `Session`-level logic built entirely on `load_all` and `Select`'s own filter/order/limit/offset, both already exercised per-driver elsewhere.
+
+`tests/session_hooks.rs` (SQLite) covers `Session::on_before_flush`/`on_after_flush`/`on_before_commit`/`on_after_commit`/`on_after_rollback`: `on_before_flush` only fires when a flush actually has something queued to send, not for a no-op flush; `on_after_flush` fires after a successful flush and in the right order relative to `on_before_flush`, but never fires at all for a flush that failed; `on_before_commit` fires on every `commit()` call regardless of whether anything was pending; `on_after_commit`/`on_after_rollback` only fire when a transaction actually existed to commit/roll back (not when `commit()`/`rollback()` was a no-op because nothing was ever flushed or read); and multiple hooks registered on the same event run in registration order. No `_postgres`/`_mysql` counterparts — hooks are plain `Session`-level callbacks with no interaction with which driver is underneath.
 
 ## Running tests
 

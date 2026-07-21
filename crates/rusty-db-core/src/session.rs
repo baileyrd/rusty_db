@@ -67,7 +67,19 @@ pub struct Session {
     audit_enabled: bool,
     audit_table: &'static str,
     next_savepoint_id: u64,
+    before_flush_hooks: Vec<Hook>,
+    after_flush_hooks: Vec<Hook>,
+    before_commit_hooks: Vec<Hook>,
+    after_commit_hooks: Vec<Hook>,
+    after_rollback_hooks: Vec<Hook>,
 }
+
+/// A callback registered with `on_before_flush`/`on_after_flush`/
+/// `on_before_commit`/`on_after_commit`/`on_after_rollback`. Plain
+/// `FnMut()` (no `Send` bound needed, matching `Session` itself, and no
+/// async support — these fire at a specific synchronous point inside an
+/// already-`async fn`, not as their own awaited step).
+type Hook = Box<dyn FnMut()>;
 
 /// A point inside a `Session`'s transaction created by `Session::savepoint`,
 /// for `rollback_to_savepoint`/`release_savepoint`. Its name is generated
@@ -89,7 +101,53 @@ impl Session {
             audit_enabled: false,
             audit_table: "_rusty_db_audit_log",
             next_savepoint_id: 0,
+            before_flush_hooks: Vec::new(),
+            after_flush_hooks: Vec::new(),
+            before_commit_hooks: Vec::new(),
+            after_commit_hooks: Vec::new(),
+            after_rollback_hooks: Vec::new(),
         }
+    }
+
+    /// Registers a callback to run immediately before this session sends
+    /// its currently-queued writes to the database — an explicit
+    /// `flush()`/`commit()`, or the autoflush before a `get`/`load_all`/
+    /// `audit_log`/`query` call — but only when there's actually something
+    /// queued to send; a flush with nothing pending is a no-op and doesn't
+    /// fire this. Hooks run in registration order.
+    pub fn on_before_flush(&mut self, hook: impl FnMut() + 'static) {
+        self.before_flush_hooks.push(Box::new(hook));
+    }
+
+    /// Like `on_before_flush`, but fires right after the flush actually
+    /// succeeds (never after a failed one — the transaction rolls back
+    /// instead, so nothing to "after" there).
+    pub fn on_after_flush(&mut self, hook: impl FnMut() + 'static) {
+        self.after_flush_hooks.push(Box::new(hook));
+    }
+
+    /// Registers a callback to run at the very start of `commit()`, before
+    /// it flushes any queued writes or issues `COMMIT` — fires every time
+    /// `commit()` is called, whether or not there ends up being anything
+    /// to actually commit.
+    pub fn on_before_commit(&mut self, hook: impl FnMut() + 'static) {
+        self.before_commit_hooks.push(Box::new(hook));
+    }
+
+    /// Registers a callback to run right after `commit()` successfully
+    /// issues `COMMIT` — only when a transaction was actually open to
+    /// commit; calling `commit()` when nothing was ever flushed or read
+    /// (so no transaction was ever opened in the first place) doesn't
+    /// fire this.
+    pub fn on_after_commit(&mut self, hook: impl FnMut() + 'static) {
+        self.after_commit_hooks.push(Box::new(hook));
+    }
+
+    /// Registers a callback to run right after `rollback()` successfully
+    /// issues `ROLLBACK` — only when a transaction was actually open to
+    /// roll back.
+    pub fn on_after_rollback(&mut self, hook: impl FnMut() + 'static) {
+        self.after_rollback_hooks.push(Box::new(hook));
     }
 
     /// Record every write this session flushes into an append-only audit
@@ -277,6 +335,10 @@ impl Session {
             return Ok(());
         }
 
+        for hook in &mut self.before_flush_hooks {
+            hook();
+        }
+
         let rendered: Vec<(&'static str, AuditOperation, String, Vec<Value>, bool)> = {
             let dialect = self.engine.dialect();
             self.pending
@@ -328,6 +390,11 @@ impl Session {
         }
 
         self.pending.clear();
+
+        for hook in &mut self.after_flush_hooks {
+            hook();
+        }
+
         Ok(())
     }
 
@@ -444,11 +511,19 @@ impl Session {
 
     /// Flush any remaining queued writes, then commit this session's
     /// transaction (a no-op if nothing was ever flushed or read, so no
-    /// transaction is open).
+    /// transaction is open). Runs `on_before_commit` hooks first (always)
+    /// and `on_after_commit` hooks last (only if a transaction actually
+    /// existed to commit) — see those for details.
     pub async fn commit(&mut self) -> Result<()> {
+        for hook in &mut self.before_commit_hooks {
+            hook();
+        }
         self.flush().await?;
         if let Some(txn) = self.txn.take() {
             txn.commit().await?;
+            for hook in &mut self.after_commit_hooks {
+                hook();
+            }
         }
         Ok(())
     }
@@ -456,11 +531,15 @@ impl Session {
     /// Discard queued writes and, if a transaction is open, roll it back —
     /// undoing any writes already flushed into it, not just the still-queued
     /// ones. The identity map is left as-is; call `clear_identity_map()` too
-    /// if you need a clean slate.
+    /// if you need a clean slate. Runs `on_after_rollback` hooks, but only
+    /// if a transaction actually existed to roll back.
     pub async fn rollback(&mut self) -> Result<()> {
         self.pending.clear();
         if let Some(txn) = self.txn.take() {
             txn.rollback().await?;
+            for hook in &mut self.after_rollback_hooks {
+                hook();
+            }
         }
         Ok(())
     }
