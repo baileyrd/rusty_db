@@ -1,6 +1,7 @@
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::rc::Rc;
 
 use crate::audit::{self, AuditEntry, AuditOperation};
@@ -8,7 +9,7 @@ use crate::engine::{Engine, Transaction};
 use crate::error::{Error, Result};
 use crate::mapping::{Entity, FromRow, Identifiable, Mapped};
 use crate::migration::{self, Migration};
-use crate::query::{BulkInsert, Delete, Insert, Select, Table, ToSql, Update};
+use crate::query::{BulkInsert, Column, Delete, Expr, Insert, Select, Table, ToSql, Update};
 use crate::value::Value;
 
 /// One write queued by `add`/`update`/`delete`, tagged with what it's for
@@ -620,6 +621,98 @@ impl Session {
     /// `load_all` for a given row re-fetches it as a fresh instance.
     pub fn clear_identity_map(&mut self) {
         self.identity_map.clear();
+    }
+
+    /// A fluent, type-bound query against `T`'s own table, instead of
+    /// building a `Select::from(&T::table())` yourself and passing it to
+    /// `load_all`. Terminal methods (`all`/`first`) go through `load_all`
+    /// under the hood, so results are identity-mapped exactly the same way.
+    ///
+    /// ```
+    /// # use rusty_db_core::{FromRow, Identifiable, Mapped, Session, Table};
+    /// # async fn example<T: Identifiable + FromRow + 'static>(session: &mut Session) -> rusty_db_core::Result<()> {
+    /// let table = Table::new(T::TABLE_NAME);
+    /// let recent = session
+    ///     .query::<T>()
+    ///     .filter(table.col("active").eq(true))
+    ///     .order_by(table.col("id").desc())
+    ///     .limit(10)
+    ///     .all()
+    ///     .await?;
+    /// # let _ = recent;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn query<T: Identifiable>(&mut self) -> SessionQuery<'_, T> {
+        SessionQuery {
+            session: self,
+            select: Select::from(&Table::new(T::TABLE_NAME)),
+            marker: PhantomData,
+        }
+    }
+}
+
+/// A fluent query against one type's table, built by `Session::query`.
+/// `.filter`/`.order_by`/`.limit`/`.offset`/`.active_only` mirror
+/// `Select`'s own builder methods; `.all()`/`.first()` run it (autoflushing
+/// first) and decode through the session's identity map, same as
+/// `load_all`.
+pub struct SessionQuery<'a, T> {
+    session: &'a mut Session,
+    select: Select,
+    marker: PhantomData<T>,
+}
+
+impl<'a, T> SessionQuery<'a, T>
+where
+    T: Identifiable + FromRow + 'static,
+{
+    pub fn filter(mut self, expr: Expr) -> Self {
+        self.select = self.select.filter(expr);
+        self
+    }
+
+    pub fn order_by(mut self, ordering: (Column, bool)) -> Self {
+        self.select = self.select.order_by(ordering);
+        self
+    }
+
+    pub fn limit(mut self, limit: i64) -> Self {
+        self.select = self.select.limit(limit);
+        self
+    }
+
+    pub fn offset(mut self, offset: i64) -> Self {
+        self.select = self.select.offset(offset);
+        self
+    }
+
+    /// Excludes soft-deleted rows, for a `#[table(soft_delete)]` type (see
+    /// `Mapped::not_deleted_filter`) — a no-op for a type with no
+    /// soft-delete column. Mirrors `Session::load_active` for the fluent
+    /// query API.
+    pub fn active_only(mut self) -> Self {
+        if let Some(not_deleted) = T::not_deleted_filter() {
+            self.select = self.select.filter(not_deleted);
+        }
+        self
+    }
+
+    /// Runs the query (autoflushing first) and returns every matching row,
+    /// identity-mapped the same way `Session::load_all` does.
+    pub async fn all(self) -> Result<Vec<Rc<RefCell<T>>>> {
+        self.session.load_all(&self.select).await
+    }
+
+    /// Like `all`, but only the first matching row (adds `LIMIT 1`).
+    pub async fn first(mut self) -> Result<Option<Rc<RefCell<T>>>> {
+        self.select = self.select.limit(1);
+        Ok(self
+            .session
+            .load_all(&self.select)
+            .await?
+            .into_iter()
+            .next())
     }
 }
 
