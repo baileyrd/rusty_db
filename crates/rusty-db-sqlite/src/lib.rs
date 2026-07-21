@@ -9,8 +9,8 @@ use sqlx::{Column as _, Row as _, Sqlite, SqlitePool, TypeInfo as _, ValueRef as
 
 use rusty_db_core::dialect::QuestionMarkDialect;
 use rusty_db_core::{
-    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, Result, Row,
-    TableSchema, Value,
+    ColumnInfo, Connection, Dialect, Driver, Engine, Error, Executor, PoolConfig, PoolMetrics,
+    PoolStats, Result, Row, TableSchema, Value,
 };
 
 static DIALECT: QuestionMarkDialect = QuestionMarkDialect;
@@ -18,6 +18,7 @@ static DIALECT: QuestionMarkDialect = QuestionMarkDialect;
 /// A `Driver` backed by a pooled SQLite connection (via `sqlx::SqlitePool`).
 pub struct SqliteDriver {
     pool: SqlitePool,
+    metrics: Arc<PoolMetrics>,
 }
 
 impl SqliteDriver {
@@ -27,7 +28,10 @@ impl SqliteDriver {
             .connect(url)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            metrics: Arc::new(PoolMetrics::new()),
+        })
     }
 
     /// Connect with explicit pool tuning (e.g. a constrained
@@ -42,7 +46,10 @@ impl SqliteDriver {
             .connect(url)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            metrics: Arc::new(PoolMetrics::new()),
+        })
     }
 
     /// Convenience: connect and wrap directly in an `Engine`.
@@ -61,16 +68,31 @@ impl SqliteDriver {
 #[async_trait]
 impl Driver for SqliteDriver {
     async fn connect(&self) -> Result<Box<dyn Connection>> {
+        let guard = self.metrics.track_acquire();
         let conn = self
             .pool
             .acquire()
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
+        guard.succeeded();
         Ok(Box::new(SqliteConnection { conn }))
     }
 
     fn dialect(&self) -> &dyn Dialect {
         &DIALECT
+    }
+
+    fn pool_stats(&self) -> PoolStats {
+        let idle = self.pool.num_idle() as u32;
+        let active = self.pool.size();
+        PoolStats {
+            max_connections: self.pool.options().get_max_connections(),
+            active,
+            idle,
+            in_use: active.saturating_sub(idle),
+            waiters: self.metrics.waiters(),
+            total_acquires: self.metrics.total_acquires(),
+        }
     }
 
     async fn list_tables(&self) -> Result<Vec<String>> {
