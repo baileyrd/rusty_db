@@ -4,8 +4,9 @@
 //! in-memory) SQL engine, not just checking rendered SQL strings:
 //! `Select::distinct`, `Column::between`, `Column::ilike`'s portable
 //! fallback to plain `LIKE` on backends without a native `ILIKE` keyword,
-//! and `Table::alias` for self-joins. `RETURNING` on `UPDATE`/`DELETE` has
-//! no SQLite coverage here since SQLite's dialect doesn't support it (see
+//! `Table::alias` for self-joins, and `Expr::text` for raw SQL fragments
+//! composed into the builder. `RETURNING` on `UPDATE`/`DELETE` has no
+//! SQLite coverage here since SQLite's dialect doesn't support it (see
 //! `query_builder_extras_postgres.rs`).
 
 use rusty_db::prelude::*;
@@ -165,6 +166,34 @@ async fn table_alias_supports_a_real_self_join() -> rusty_db::Result<()> {
     assert_eq!(rows[0].get::<String>(1)?, "ada");
     assert_eq!(rows[1].get::<String>(0)?, "linus");
     assert_eq!(rows[1].get::<String>(1)?, "ada");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn text_composes_a_raw_fragment_into_an_otherwise_builder_filter() -> rusty_db::Result<()> {
+    let engine = seeded_engine().await?;
+    let orders = Table::new("orders");
+
+    // A raw fragment (with its own `?` placeholder) combined with an
+    // ordinary builder-constructed filter via `.and(...)`.
+    let rows = engine
+        .fetch_all(
+            &Select::from(&orders)
+                .columns([orders.col("id")])
+                .filter(
+                    Expr::text("lower(customer) = ?", [Value::Text("ada".to_string())])
+                        .and(orders.col("amount").gt(20_i64)),
+                )
+                .order_by(orders.col("id").asc()),
+        )
+        .await?;
+    let ids: Vec<i64> = rows
+        .iter()
+        .map(|r| r.get::<i64>(0))
+        .collect::<rusty_db::Result<_>>()?;
+    // id=1 (Ada, amount=10) fails the amount filter; id=2 (ada, amount=50) matches both.
+    assert_eq!(ids, vec![2]);
 
     Ok(())
 }
