@@ -27,6 +27,11 @@ pub use rusty_db_core::*;
 #[cfg(feature = "derive")]
 pub use rusty_db_derive::Mapped;
 
+/// `#[derive(MappedEnum)]`: maps a fieldless enum onto a single column
+/// (see `rusty-db-derive` for the attributes it accepts).
+#[cfg(feature = "derive")]
+pub use rusty_db_derive::MappedEnum;
+
 #[cfg(feature = "sqlite")]
 pub use rusty_db_sqlite as sqlite;
 
@@ -50,6 +55,9 @@ pub mod prelude {
     // macro of the same name (macro namespace) — no conflict.
     #[cfg(feature = "derive")]
     pub use rusty_db_derive::Mapped;
+
+    #[cfg(feature = "derive")]
+    pub use rusty_db_derive::MappedEnum;
 
     #[cfg(feature = "sqlite")]
     pub use rusty_db_sqlite::SqliteDriver;

@@ -74,8 +74,33 @@
 //! Field types must implement `Into<Value>` on an owned clone (i.e. the set
 //! of types `Value` already converts from: `bool`, `i64`, `i32`, `f64`,
 //! `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, `Json`, and `Option<_>` of
-//! those). A `#[table(version)]` field's type must also support `+ 1` (in
-//! practice, `i64`/`i32`).
+//! those — plus any enum carrying `#[derive(MappedEnum)]`, below). A
+//! `#[table(version)]` field's type must also support `+ 1` (in practice,
+//! `i64`/`i32`).
+//!
+//! `#[derive(MappedEnum)]`: maps a fieldless (unit-variant-only) enum onto
+//! a single column, so it can be used directly as a `#[derive(Mapped)]`
+//! field type.
+//!
+//! ```ignore
+//! #[derive(Debug, Clone, Copy, PartialEq, MappedEnum)]
+//! enum Status {
+//!     Active,
+//!     Inactive,
+//!     #[mapped_enum(rename = "banned_user")]
+//!     Banned,
+//! }
+//! ```
+//!
+//! generates `impl From<Status> for Value` and `impl FromValue for
+//! Status`. By default each variant maps to its snake_case name as text
+//! (`Active` -> `"active"`) — override one with `#[mapped_enum(rename =
+//! "...")]` on that variant. `#[mapped_enum(as_int)]` on the enum itself
+//! switches the whole thing to store each variant's own discriminant
+//! (`v as i64`) instead of text; unlike the text form, this doesn't
+//! survive the enum's variants being reordered or renumbered later, since
+//! the stored value is just a bare integer with no record of which
+//! variant it meant.
 
 use heck::ToSnakeCase;
 use proc_macro::TokenStream;
@@ -88,6 +113,14 @@ use syn::{parse_macro_input, Data, DeriveInput, Fields, Token};
 pub fn derive_mapped(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(input)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+#[proc_macro_derive(MappedEnum, attributes(mapped_enum))]
+pub fn derive_mapped_enum(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    expand_mapped_enum(input)
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }
@@ -888,6 +921,167 @@ fn expand_belongs_to(
                 .await
             }
         }
+    })
+}
+
+/// A single unit variant's own mapped text form (default: its snake_case
+/// name, overridable per-variant with `#[mapped_enum(rename = "...")]`).
+struct EnumVariantInfo {
+    ident: syn::Ident,
+    text: String,
+}
+
+/// `#[derive(MappedEnum)]`: maps a fieldless enum onto a single `Value`
+/// (`Value::Text` by default, one variant's snake_case name per case;
+/// `Value::I64` — each variant's own discriminant — if the enum carries
+/// `#[mapped_enum(as_int)]`), so it can be used directly as a
+/// `#[derive(Mapped)]` field type.
+fn expand_mapped_enum(input: DeriveInput) -> syn::Result<TokenStream2> {
+    let enum_ident = &input.ident;
+
+    let Data::Enum(data) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "#[derive(MappedEnum)] only supports enums",
+        ));
+    };
+
+    let mut as_int = false;
+    for attr in &input.attrs {
+        if attr.path().is_ident("mapped_enum") {
+            attr.parse_nested_meta(|meta| {
+                if meta.path.is_ident("as_int") {
+                    as_int = true;
+                    Ok(())
+                } else {
+                    Err(meta.error("unsupported #[mapped_enum(...)] attribute; expected `as_int`"))
+                }
+            })?;
+        }
+    }
+
+    let mut variants = Vec::with_capacity(data.variants.len());
+    for variant in &data.variants {
+        if !matches!(variant.fields, Fields::Unit) {
+            return Err(syn::Error::new_spanned(
+                &variant.ident,
+                "#[derive(MappedEnum)] only supports fieldless (unit) variants",
+            ));
+        }
+
+        let mut text = variant.ident.to_string().to_snake_case();
+        for attr in &variant.attrs {
+            if attr.path().is_ident("mapped_enum") {
+                attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("rename") {
+                        let lit: syn::LitStr = meta.value()?.parse()?;
+                        text = lit.value();
+                        Ok(())
+                    } else {
+                        Err(meta.error(
+                            "unsupported #[mapped_enum(...)] variant attribute; expected \
+                             `rename = \"...\"`",
+                        ))
+                    }
+                })?;
+            }
+        }
+
+        variants.push(EnumVariantInfo {
+            ident: variant.ident.clone(),
+            text,
+        });
+    }
+
+    let core = core_crate_path();
+
+    let (from_impl, from_value_impl) = if as_int {
+        let to_int_arms = variants.iter().map(|v| {
+            let ident = &v.ident;
+            quote! { #enum_ident::#ident => #enum_ident::#ident as i64 }
+        });
+        let from_int_checks = variants.iter().map(|v| {
+            let ident = &v.ident;
+            quote! {
+                if *i == (#enum_ident::#ident as i64) {
+                    return ::std::result::Result::Ok(#enum_ident::#ident);
+                }
+            }
+        });
+
+        (
+            quote! {
+                impl ::std::convert::From<#enum_ident> for #core::Value {
+                    fn from(v: #enum_ident) -> Self {
+                        #core::Value::I64(match v { #(#to_int_arms),* })
+                    }
+                }
+            },
+            quote! {
+                impl #core::FromValue for #enum_ident {
+                    fn from_value(value: &#core::Value) -> ::std::result::Result<Self, ::std::string::String> {
+                        match value {
+                            #core::Value::I64(i) => {
+                                #(#from_int_checks)*
+                                ::std::result::Result::Err(::std::format!(
+                                    "unknown {} discriminant: {i}",
+                                    ::std::stringify!(#enum_ident),
+                                ))
+                            }
+                            other => ::std::result::Result::Err(::std::format!(
+                                "expected an integer for {}, got {other}",
+                                ::std::stringify!(#enum_ident),
+                            )),
+                        }
+                    }
+                }
+            },
+        )
+    } else {
+        let to_text_arms = variants.iter().map(|v| {
+            let ident = &v.ident;
+            let text = &v.text;
+            quote! { #enum_ident::#ident => #text }
+        });
+        let from_text_arms = variants.iter().map(|v| {
+            let ident = &v.ident;
+            let text = &v.text;
+            quote! { #text => ::std::result::Result::Ok(#enum_ident::#ident) }
+        });
+
+        (
+            quote! {
+                impl ::std::convert::From<#enum_ident> for #core::Value {
+                    fn from(v: #enum_ident) -> Self {
+                        #core::Value::Text(match v { #(#to_text_arms),* }.to_string())
+                    }
+                }
+            },
+            quote! {
+                impl #core::FromValue for #enum_ident {
+                    fn from_value(value: &#core::Value) -> ::std::result::Result<Self, ::std::string::String> {
+                        match value {
+                            #core::Value::Text(s) => match s.as_str() {
+                                #(#from_text_arms,)*
+                                other => ::std::result::Result::Err(::std::format!(
+                                    "unknown {} variant: {other:?}",
+                                    ::std::stringify!(#enum_ident),
+                                )),
+                            },
+                            other => ::std::result::Result::Err(::std::format!(
+                                "expected text for {}, got {other}",
+                                ::std::stringify!(#enum_ident),
+                            )),
+                        }
+                    }
+                }
+            },
+        )
+    };
+
+    Ok(quote! {
+        #from_impl
+        #from_value_impl
     })
 }
 
