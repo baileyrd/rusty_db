@@ -195,10 +195,15 @@ async fn wider_column_types_decode_correctly() -> rusty_db::Result<()> {
         rows[0].get_by_name::<BigDecimal>("weight")?,
         "3.5".parse::<BigDecimal>().unwrap()
     );
-    assert_eq!(rows[0].get_by_name::<String>("created_on")?, "2024-01-15");
+    // A native Postgres DATE/TIMESTAMPTZ column decodes as Value::Date/
+    // Value::Timestamp directly, not text.
     assert_eq!(
-        rows[0].get_by_name::<String>("created_at")?,
-        "2024-01-15T10:30:00+00:00"
+        rows[0].get_by_name::<NaiveDate>("created_on")?,
+        "2024-01-15".parse::<NaiveDate>().unwrap()
+    );
+    assert_eq!(
+        rows[0].get_by_name::<DateTime<Utc>>("created_at")?,
+        "2024-01-15T10:30:00Z".parse::<DateTime<Utc>>().unwrap()
     );
     // A native Postgres JSONB column decodes as Value::Json, not text.
     assert_eq!(

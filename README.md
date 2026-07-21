@@ -285,7 +285,7 @@ engine.execute(&user.update()).await?;   // only generated when a field is #[tab
 engine.execute(&user.delete_query()).await?;
 ```
 
-Field types are limited to whatever `Value` already converts from (`bool`, `i64`, `i32`, `f64`, `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, `Json`, and `Option<_>` of those) — there's no arbitrary custom-type support yet. A field additionally marked `#[table(version)]` (requires `#[table(primary_key)]` too) turns on optimistic locking — see below.
+Field types are limited to whatever `Value` already converts from (`bool`, `i64`, `i32`, `f64`, `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, `Json`, `NaiveDate`, `NaiveTime`, `NaiveDateTime`, `DateTime<Utc>`, and `Option<_>` of those) — plus any type deriving `MappedEnum`/`MappedNewtype`, or implementing `Into<Value>`/`FromValue` by hand (see "Custom types" below). A field additionally marked `#[table(version)]` (requires `#[table(primary_key)]` too) turns on optimistic locking — see below.
 
 ### UUID values
 
@@ -356,6 +356,32 @@ engine.execute(&event.insert()).await?;
 ```
 
 Postgres has native `JSON`/`JSONB` types and round-trips this variant directly over its binary wire format. SQLite has no JSON type at all (a JSON column there is really just `TEXT`), so it decodes a JSON column back as plain `Value::Text`. MySQL/MariaDB's own `JSON` type is a stranger case: it reports as one of MySQL's `BLOB`-family types at the wire-protocol level even though the bytes themselves are plain UTF-8 JSON text, so it decodes back as `Value::Bytes` instead of `Value::Text`. `FromValue for Json` parses both of those forms, so a mapped struct's `Json` field round-trips correctly on every backend, just without Postgres's native wire format on the other two.
+
+### Temporal values
+
+Four more dedicated variants — `Value::Date`/`Value::Time`/`Value::DateTime`/`Value::Timestamp` — back `chrono`'s `NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>` (all four re-exported, same as `Uuid`/`BigDecimal`/`Json` above):
+
+```rust
+#[derive(Mapped)]
+#[table(name = "events")]
+struct Event {
+    #[table(primary_key)]
+    id: i64,
+    day: NaiveDate,
+    logged_at: NaiveDateTime,
+    happened_at: DateTime<Utc>,
+}
+
+let event = Event {
+    id: 1,
+    day: "2024-01-15".parse().unwrap(),
+    logged_at: "2024-01-15T10:30:00".parse().unwrap(),
+    happened_at: "2024-01-15T10:30:00Z".parse().unwrap(),
+};
+engine.execute(&event.insert()).await?;
+```
+
+`NaiveDateTime` (`Value::DateTime`) is the timezone-naive "wall clock" reading SQLAlchemy's own `DateTime` has — no attached offset at all. `DateTime<Utc>` (`Value::Timestamp`) is a genuine UTC-normalized instant. Postgres and MySQL/MariaDB both have native column types for all four and round-trip each variant directly over their own binary wire formats — `DATE`/`TIME`/`TIMESTAMP` (Postgres) or `DATE`/`TIME`/`DATETIME` (MySQL/MariaDB) decode as `Value::Date`/`Value::Time`/`Value::DateTime`; Postgres's `TIMESTAMPTZ` and MySQL/MariaDB's `TIMESTAMP` (which, unlike its plain `DATETIME`, MySQL itself always stores and reports as UTC) both decode as `Value::Timestamp` instead — same split, by name rather than by wire format, since `DATETIME` and `TIMESTAMP` are actually the same packed bytes on MySQL's wire protocol. SQLite has no native temporal type of its own at all, so all four flatten to `Value::Text` there (each one's own ISO 8601/RFC 3339 form) — `FromValue` for each of the four chrono types parses that text form back, so a mapped struct's temporal fields round-trip correctly on every backend, just without a native wire format on SQLite specifically. `FromValue for DateTime<Utc>` also accepts a `Value::DateTime` (treating it as already being in UTC, the same assumption MySQL's own `TIMESTAMP` makes), and `FromValue for NaiveDateTime` accepts a `Value::Timestamp` right back (dropping its always-UTC offset) — so either Rust type still decodes correctly even against the "wrong" one of the two column types.
 
 ### Enum columns
 
@@ -824,7 +850,7 @@ Unlike `Migrator::up`, which commits each migration independently, `session.migr
 
 ## Status
 
-This covers Core (query builder, connections, first-class `Uuid`/`BigDecimal`/`Json` value types), a thin mapping layer (`#[derive(Mapped)]`, `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]` for custom field types, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder, connections, first-class `Uuid`/`BigDecimal`/`Json`/temporal (`NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`) value types), a thin mapping layer (`#[derive(Mapped)]`, `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]` for custom field types, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 `tests/concurrent_sessions.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover multiple `Session`s sharing one `Engine`/connection pool at the same time — `Session` is intentionally `!Send` (it hands out `Rc`s for the identity map), so these run via `tokio::task::LocalSet`/`spawn_local` rather than `tokio::spawn`, which is the standard way to get genuinely concurrent, interleaved execution of `!Send` futures on one thread. They cover independent commits landing correctly under a burst of concurrent sessions, one session's flushed-but-uncommitted write staying invisible to a concurrent reader on a separate connection (deterministically ordered via a `oneshot` channel, not timing), and two sessions never sharing identity-map state for the same row. Same skip-if-unreachable behavior as the Postgres/MySQL smoke tests; each test uses its own table to avoid colliding with other tests running concurrently against the same live server.
 
@@ -847,6 +873,8 @@ It also covers cascade rules (`delete_cascading`): deleting a user with `cascade
 `tests/decimal_value.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `Value::Decimal`/`BigDecimal`: a mapped struct's `BigDecimal` field (including an `Option<BigDecimal>` one) round-trips correctly on every backend, and — Postgres-only — a native `NUMERIC` column decodes as `Value::Decimal` directly rather than `Value::Text`.
 
 `tests/json_value.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `Value::Json`/`Json`: a mapped struct's `Json` field (including an `Option<Json>` one) round-trips correctly on every backend, and — Postgres-only — a native `JSONB` column decodes as `Value::Json` directly rather than `Value::Text`. Getting this working on MySQL/MariaDB surfaced a real quirk: its `JSON` columns report as one of MySQL's own `BLOB`-family types at the wire-protocol level, so they decode as `Value::Bytes`, not `Value::Text` the way `DECIMAL`/`UUID`-as-text columns do elsewhere on that backend — `FromValue for Json` accepts that form too (via UTF-8 first, then JSON parsing), so a `Json` field round-trips there without the caller ever needing to know about the difference.
+
+`tests/temporal_value.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `Value::Date`/`Value::Time`/`Value::DateTime`/`Value::Timestamp`: a mapped struct's four temporal fields round-trip correctly on every backend; on SQLite specifically, a `NaiveDateTime` field parses back correctly regardless of whether the stored text is space- or `T`-separated, and (as a standalone conversion-logic check, not a database one, since SQLite can't tell the two apart at decode time to begin with) `Value::DateTime`/`Value::Timestamp` fall back to each other correctly. Postgres and MySQL each get a test confirming all four decode as their native variant directly rather than `Value::Text` — MySQL's specifically confirms its `DATETIME`/`TIMESTAMP` split decodes as `Value::DateTime`/`Value::Timestamp` respectively despite being identical bytes on the wire.
 
 `tests/mapped_enum.rs` (SQLite) covers `#[derive(MappedEnum)]`: a text-mode enum field round-trips through a mapped struct, including a `#[mapped_enum(rename = "...")]`'d variant storing its overridden text rather than the default snake_case name; an unrenamed variant stores its plain snake_case name; an `as_int`-mode enum field round-trips using each variant's own discriminant, including an explicit `= N` one; and a stored value with no matching variant (an unrecognized string, in text mode) is a decode error rather than a silent fallback. No `_postgres`/`_mysql` counterparts — the generated `From`/`FromValue` impls are pure Rust-side conversions to/from `Value::Text`/`Value::I64`, both already exercised per-driver everywhere else, with nothing left that's actually driver-specific to prove again.
 

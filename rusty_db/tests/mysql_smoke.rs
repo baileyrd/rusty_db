@@ -161,10 +161,14 @@ async fn wider_column_types_decode_correctly() -> rusty_db::Result<()> {
     assert_eq!(rows.len(), 1);
     // INT UNSIGNED decodes via the unsigned path.
     assert_eq!(rows[0].get_by_name::<i64>("id")?, 1);
-    // DECIMAL goes through the unchecked-string fallback; DATE has its own
-    // chrono-backed decode path (see row_from_mysql).
+    // DECIMAL goes through the unchecked-string fallback; a native MySQL
+    // DATE column decodes as Value::Date directly, not text (see
+    // row_from_mysql).
     assert_eq!(rows[0].get_by_name::<String>("weight")?, "3.50");
-    assert_eq!(rows[0].get_by_name::<String>("created_on")?, "2024-01-15");
+    assert_eq!(
+        rows[0].get_by_name::<NaiveDate>("created_on")?,
+        "2024-01-15".parse::<NaiveDate>().unwrap()
+    );
     assert_eq!(rows[0].get_by_name::<Option<String>>("notes")?, None);
 
     engine

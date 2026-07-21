@@ -392,9 +392,7 @@ fn row_from_postgres(row: &PgRow) -> Result<Row> {
                 .unwrap_or(Value::Null),
             // These are all sent in Postgres's own binary wire formats, not
             // text (sqlx always requests binary result format), so each
-            // needs its own typed decode; formatted to text afterward,
-            // since `Value` has no dedicated temporal variant (unlike
-            // `UUID`/`NUMERIC`/`JSON` below, which do).
+            // needs its own typed decode.
             "NUMERIC" => row
                 .try_get::<Option<BigDecimal>, _>(i)
                 .map_err(to_core_err)?
@@ -403,22 +401,22 @@ fn row_from_postgres(row: &PgRow) -> Result<Row> {
             "DATE" => row
                 .try_get::<Option<NaiveDate>, _>(i)
                 .map_err(to_core_err)?
-                .map(|v| Value::Text(v.to_string()))
+                .map(Value::Date)
                 .unwrap_or(Value::Null),
             "TIME" => row
                 .try_get::<Option<NaiveTime>, _>(i)
                 .map_err(to_core_err)?
-                .map(|v| Value::Text(v.to_string()))
+                .map(Value::Time)
                 .unwrap_or(Value::Null),
             "TIMESTAMP" => row
                 .try_get::<Option<NaiveDateTime>, _>(i)
                 .map_err(to_core_err)?
-                .map(|v| Value::Text(v.to_string()))
+                .map(Value::DateTime)
                 .unwrap_or(Value::Null),
             "TIMESTAMPTZ" => row
                 .try_get::<Option<DateTime<Utc>>, _>(i)
                 .map_err(to_core_err)?
-                .map(|v| Value::Text(v.to_rfc3339()))
+                .map(Value::Timestamp)
                 .unwrap_or(Value::Null),
             "UUID" => row
                 .try_get::<Option<Uuid>, _>(i)
@@ -458,6 +456,10 @@ macro_rules! bind_params {
                 Value::Uuid(u) => query.bind(*u),
                 Value::Decimal(d) => query.bind(d.clone()),
                 Value::Json(j) => query.bind(j.clone()),
+                Value::Date(d) => query.bind(*d),
+                Value::Time(t) => query.bind(*t),
+                Value::DateTime(dt) => query.bind(*dt),
+                Value::Timestamp(ts) => query.bind(*ts),
             };
         }
         query
