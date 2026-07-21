@@ -568,6 +568,34 @@ let users_by_id: HashMap<i64, User> = Order::load_user(&engine, &orders).await?;
 
 `has_many`'s loader name is the pluralized (naive `+s`) snake_case child type (`load_orders`); `belongs_to`'s is the singular snake_case parent type (`load_user`). Both are generated from, and callable directly as, `rusty_db::relations::load_many`/`load_one` if you'd rather not use the attributes (e.g. for a relationship keyed by something other than the primary key). There's no lazy-loading proxy or identity map here — relationships are always loaded explicitly, in a batch, by calling one of these functions.
 
+`#[has_one(Child, foreign_key = "...")]` is the same direction as `has_many` (keyed by `Self`'s own primary key, referenced by the child's `foreign_key` column), but for a relationship expected to have at most one matching row per parent — today's only alternative, a `belongs_to` pointed the wrong way, gives you neither the right ergonomics (you'd still get a `Vec`-shaped or backwards-keyed result) nor any check that the relationship is really 1:1:
+
+```rust
+#[derive(Mapped)]
+#[table(name = "users")]
+#[has_one(Profile, foreign_key = "user_id")]
+struct User {
+    #[table(primary_key)]
+    id: i64,
+    name: String,
+}
+
+#[derive(Mapped)]
+#[table(name = "profiles")]
+struct Profile {
+    #[table(primary_key)]
+    id: i64,
+    user_id: i64,
+    bio: String,
+}
+
+let users: Vec<User> = engine.fetch_all_as(&Select::from(&User::table())).await?;
+let profiles_by_user: HashMap<i64, Profile> = User::load_profile(&engine, &users).await?;
+// a user with no profile just has no entry in the map
+```
+
+The loader is named after the singular snake_case child type (`load_profile`, not pluralized like `has_many`'s), and returns `Child` directly rather than `Vec<Child>`. If a second `Profile` row ever turns up referencing the same user, the loader returns `Err(Error::Conflict)` instead of silently keeping (or silently dropping) one of them — exactly the validation SQLAlchemy's own `uselist=False` gives you and a `has_many`/reversed-`belongs_to` workaround can't. Generated from, and callable directly as, `rusty_db::relations::load_has_one`.
+
 ### Migrations
 
 `Engine::migrator()` (or `Migrator::new(&engine)`) runs versioned schema migrations, tracking which have applied in a bookkeeping table (`_rusty_db_migrations` by default). Migrations are plain SQL — the query builder covers DML, not DDL, and DDL syntax diverges more across databases than DML does, so there's no attempt to make a migration portable for you:
@@ -611,7 +639,7 @@ Unlike `Migrator::up`, which commits each migration independently, `session.migr
 
 ## Status
 
-This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/belongs-to eager loading), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder, connections), a thin mapping layer (`#[derive(Mapped)]`, joins, has-many/has-one/belongs-to eager loading), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 `tests/concurrent_sessions.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover multiple `Session`s sharing one `Engine`/connection pool at the same time — `Session` is intentionally `!Send` (it hands out `Rc`s for the identity map), so these run via `tokio::task::LocalSet`/`spawn_local` rather than `tokio::spawn`, which is the standard way to get genuinely concurrent, interleaved execution of `!Send` futures on one thread. They cover independent commits landing correctly under a burst of concurrent sessions, one session's flushed-but-uncommitted write staying invisible to a concurrent reader on a separate connection (deterministically ordered via a `oneshot` channel, not timing), and two sessions never sharing identity-map state for the same row. Same skip-if-unreachable behavior as the Postgres/MySQL smoke tests; each test uses its own table to avoid colliding with other tests running concurrently against the same live server.
 
@@ -622,6 +650,8 @@ This covers Core (query builder, connections), a thin mapping layer (`#[derive(M
 `tests/two_phase_commit.rs` (SQLite) confirms `begin_two_phase`/`commit_prepared`/`rollback_prepared` report `Error::Unsupported` there, since SQLite has no concept of a transaction prepared independently of its connection; `_postgres`/`_mysql` exercise the real thing against a live server — a prepared-but-not-yet-committed write stays invisible, `commit_prepared` makes it visible, `rollback_prepared` discards it instead — with `commit_prepared`/`rollback_prepared` always issued from a connection distinct from the one that prepared, since a real coordinator resolving a distributed transaction typically isn't the same connection (or even the same process) that prepared it. Getting MySQL/MariaDB's `XA` transactions working correctly through a pooled connection took two fixes beyond the query builder itself: `XA COMMIT`/`XA ROLLBACK` don't reliably resolve a transaction prepared on a different connection when sent through `sqlx`'s prepared-statement protocol (works fine as plain text SQL, the same wire format the `mysql` CLI uses — an `execute_unprepared` `Connection` method, MySQL-only override, sends these as raw text instead), and a connection that just ran `XA PREPARE` is left unable to run anything else at all until it resolves its own prepared transaction, so `Transaction::prepare` closes that connection outright afterward instead of returning it to the pool for reuse (which would otherwise break whoever got it next).
 
 `tests/replica_set.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `ReplicaSet`: reads round-robin across healthy replicas (verified by seeding each stand-in replica with its own marker row and checking which one a read actually returned, rather than peeking at any internal routing state); a down replica fails over to the next healthy one instead of surfacing an error; every replica being down falls back to the primary; a `ReplicaSet` with zero replicas configured always uses the primary; and writes (`execute`, `Session`) always land on the primary regardless of replica health. Since real database replication is a server-side feature this crate can't spin up in a sandbox, a "down" replica/primary is simulated with a minimal fake `Driver` whose `connect()` always returns `Error::Connection` — the same failure shape a genuinely unreachable server produces — rather than by actually taking a live server down mid-suite; the Postgres/MySQL versions otherwise use real, separate tables on the live servers as replica stand-ins.
+
+`tests/relations.rs` (SQLite) now also covers `#[has_one(...)]`: a batch of parents where only some have a matching child comes back with entries only for those that do (same "no entry at all" shape `has_many` already had for a childless parent); and a parent with *two* matching child rows — a relationship that isn't actually one-to-one — returns `Error::Conflict` rather than silently keeping or dropping one of them.
 
 `tests/query_timeout.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover `with_timeout`: an operation finishing inside its timeout succeeds normally; a genuinely slow/blocked operation is cancelled and returns `Error::Timeout` instead of hanging; a cancelled operation leaves the pool usable afterward rather than stuck; a timeout on one call has no lingering effect on later calls; and aborting a task running a slow operation (`JoinHandle::abort`, the other standard way to cancel a Rust future) cancels it the same way a timeout would. The SQLite version gets a genuinely blocked (not simulated) query via real lock contention — holding SQLite's write lock on one connection while a second connection attempts a conflicting write, which sqlx's SQLite driver retries against its own 5-second `busy_timeout` rather than erroring immediately. The Postgres/MySQL versions use their real, built-in `pg_sleep()`/`SLEEP()` functions for a genuinely slow query instead.
 
