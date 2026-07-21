@@ -7,6 +7,7 @@ use crate::mapping::FromRow;
 use crate::migration::Migrator;
 use crate::query::ToSql;
 use crate::row::Row;
+use crate::schema::TableSchema;
 use crate::session::Session;
 use crate::value::Value;
 
@@ -99,6 +100,21 @@ impl Engine {
     /// A migration runner backed by this engine (see `Migrator`).
     pub fn migrator(&self) -> Migrator<'_> {
         Migrator::new(self)
+    }
+
+    /// List every user table in the database, in name order (schema
+    /// introspection/reflection). `Err(Error::Unsupported)` if the
+    /// underlying driver doesn't implement this.
+    pub async fn list_tables(&self) -> Result<Vec<String>> {
+        self.driver.list_tables().await
+    }
+
+    /// Look up one table's columns straight from the database's own
+    /// catalog; `Ok(None)` if no such table exists.
+    /// `Err(Error::Unsupported)` if the underlying driver doesn't
+    /// implement this.
+    pub async fn table_schema(&self, table: &str) -> Result<Option<TableSchema>> {
+        self.driver.table_schema(table).await
     }
 }
 

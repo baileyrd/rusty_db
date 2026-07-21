@@ -25,6 +25,9 @@ pub enum Error {
 
     #[error("migration error: {0}")]
     Migration(String),
+
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 /// Identifies a column either by its position or its name, for error reporting.
