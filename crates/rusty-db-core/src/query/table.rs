@@ -191,6 +191,41 @@ impl Column {
         Expr::Column(self.clone()).max()
     }
 
+    /// `LOWER(self)`.
+    pub fn lower(&self) -> Expr {
+        Expr::Column(self.clone()).lower()
+    }
+
+    /// `UPPER(self)`.
+    pub fn upper(&self) -> Expr {
+        Expr::Column(self.clone()).upper()
+    }
+
+    /// String concatenation — see `Expr::concat`.
+    pub fn concat(&self, other: Expr) -> Expr {
+        Expr::Column(self.clone()).concat(other)
+    }
+
+    /// `self + other`.
+    pub fn add(&self, other: Expr) -> Expr {
+        Expr::Column(self.clone()).add(other)
+    }
+
+    /// `self - other`.
+    pub fn sub(&self, other: Expr) -> Expr {
+        Expr::Column(self.clone()).sub(other)
+    }
+
+    /// `self * other`.
+    pub fn mul(&self, other: Expr) -> Expr {
+        Expr::Column(self.clone()).mul(other)
+    }
+
+    /// `self / other`.
+    pub fn div(&self, other: Expr) -> Expr {
+        Expr::Column(self.clone()).div(other)
+    }
+
     pub fn asc(&self) -> (Column, bool) {
         (self.clone(), true)
     }

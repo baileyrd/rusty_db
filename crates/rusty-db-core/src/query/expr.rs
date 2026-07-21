@@ -55,6 +55,28 @@ impl AggFunc {
     }
 }
 
+/// `+`/`-`/`*`/`/`, all ANSI-standard and identical across every dialect
+/// this crate supports, so (like `AggFunc`, unlike `BinOp::ILike`)
+/// rendering these needs no `Dialect` hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl ArithOp {
+    fn as_sql(self) -> &'static str {
+        match self {
+            ArithOp::Add => "+",
+            ArithOp::Sub => "-",
+            ArithOp::Mul => "*",
+            ArithOp::Div => "/",
+        }
+    }
+}
+
 /// A boolean/scalar SQL expression tree, built up from `Column`s and
 /// literal values, rendered to portable SQL by a `Dialect`.
 #[derive(Debug, Clone)]
@@ -80,6 +102,24 @@ pub enum Expr {
     CountAll,
     /// `COUNT(expr)`/`SUM(expr)`/`AVG(expr)`/`MIN(expr)`/`MAX(expr)`.
     Agg(AggFunc, Box<Expr>),
+    /// `LOWER(expr)`.
+    Lower(Box<Expr>),
+    /// `UPPER(expr)`.
+    Upper(Box<Expr>),
+    /// String concatenation. See `Dialect::concat_uses_double_pipe` for
+    /// why this needs a per-dialect rendering choice, unlike the rest of
+    /// this crate's ANSI-standard function/operator variants.
+    Concat(Box<Expr>, Box<Expr>),
+    /// `expr1 <op> expr2` (`+`/`-`/`*`/`/`).
+    Arith(Box<Expr>, ArithOp, Box<Expr>),
+    /// `CURRENT_TIMESTAMP` — identical on every dialect this crate
+    /// supports (`func.now()`'s counterpart).
+    Now,
+    /// `COALESCE(expr1, expr2, ...)` — the first non-null value.
+    Coalesce(Vec<Expr>),
+    /// `CASE WHEN cond1 THEN result1 [WHEN cond2 THEN result2 ...] [ELSE
+    /// otherwise] END`. Built via `Case`, not constructed directly.
+    Case(Vec<(Expr, Expr)>, Option<Box<Expr>>),
 }
 
 impl From<Column> for Expr {
@@ -169,6 +209,39 @@ impl Expr {
         self.binop(BinOp::ILike, pattern)
     }
 
+    fn binop_expr(self, op: BinOp, other: Expr) -> Self {
+        Expr::BinOp(Box::new(self), op, Box::new(other))
+    }
+
+    /// `self = other`, comparing this expression against another
+    /// expression — `Expr::now()`, an aggregate, another column, ... —
+    /// rather than a literal value (see `.eq(...)` for that) or
+    /// specifically another column (see `Column::eq_col`, which this
+    /// generalizes to any `Expr` on either side).
+    pub fn eq_expr(self, other: Expr) -> Self {
+        self.binop_expr(BinOp::Eq, other)
+    }
+
+    pub fn ne_expr(self, other: Expr) -> Self {
+        self.binop_expr(BinOp::NotEq, other)
+    }
+
+    pub fn lt_expr(self, other: Expr) -> Self {
+        self.binop_expr(BinOp::Lt, other)
+    }
+
+    pub fn lte_expr(self, other: Expr) -> Self {
+        self.binop_expr(BinOp::LtEq, other)
+    }
+
+    pub fn gt_expr(self, other: Expr) -> Self {
+        self.binop_expr(BinOp::Gt, other)
+    }
+
+    pub fn gte_expr(self, other: Expr) -> Self {
+        self.binop_expr(BinOp::GtEq, other)
+    }
+
     pub fn and(self, other: Expr) -> Self {
         match self {
             Expr::And(mut clauses) => {
@@ -250,6 +323,61 @@ impl Expr {
         Expr::Agg(AggFunc::Max, Box::new(self))
     }
 
+    /// `LOWER(self)`.
+    pub fn lower(self) -> Self {
+        Expr::Lower(Box::new(self))
+    }
+
+    /// `UPPER(self)`.
+    pub fn upper(self) -> Self {
+        Expr::Upper(Box::new(self))
+    }
+
+    /// String concatenation (`self || other` on Postgres/SQLite,
+    /// `CONCAT(self, other)` on MySQL/MariaDB — see
+    /// `Dialect::concat_uses_double_pipe`).
+    pub fn concat(self, other: Expr) -> Self {
+        Expr::Concat(Box::new(self), Box::new(other))
+    }
+
+    fn arith(self, op: ArithOp, other: Expr) -> Self {
+        Expr::Arith(Box::new(self), op, Box::new(other))
+    }
+
+    /// `self + other`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn add(self, other: Expr) -> Self {
+        self.arith(ArithOp::Add, other)
+    }
+
+    /// `self - other`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn sub(self, other: Expr) -> Self {
+        self.arith(ArithOp::Sub, other)
+    }
+
+    /// `self * other`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn mul(self, other: Expr) -> Self {
+        self.arith(ArithOp::Mul, other)
+    }
+
+    /// `self / other`.
+    #[allow(clippy::should_implement_trait)]
+    pub fn div(self, other: Expr) -> Self {
+        self.arith(ArithOp::Div, other)
+    }
+
+    /// `CURRENT_TIMESTAMP`.
+    pub fn now() -> Self {
+        Expr::Now
+    }
+
+    /// `COALESCE(exprs[0], exprs[1], ...)` — the first non-null value.
+    pub fn coalesce(exprs: impl IntoIterator<Item = Expr>) -> Self {
+        Expr::Coalesce(exprs.into_iter().collect())
+    }
+
     /// Render this expression to SQL, pushing any literal values into
     /// `params` in the order their placeholders appear.
     pub fn render(&self, dialect: &dyn Dialect, params: &mut Vec<Value>) -> String {
@@ -309,7 +437,89 @@ impl Expr {
             Expr::Agg(func, inner) => {
                 format!("{}({})", func.as_sql(), inner.render(dialect, params))
             }
+            Expr::Lower(inner) => format!("LOWER({})", inner.render(dialect, params)),
+            Expr::Upper(inner) => format!("UPPER({})", inner.render(dialect, params)),
+            Expr::Concat(lhs, rhs) => {
+                let lhs = lhs.render(dialect, params);
+                let rhs = rhs.render(dialect, params);
+                if dialect.concat_uses_double_pipe() {
+                    format!("{lhs} || {rhs}")
+                } else {
+                    format!("CONCAT({lhs}, {rhs})")
+                }
+            }
+            Expr::Arith(lhs, op, rhs) => {
+                format!(
+                    "{} {} {}",
+                    lhs.render(dialect, params),
+                    op.as_sql(),
+                    rhs.render(dialect, params)
+                )
+            }
+            Expr::Now => "CURRENT_TIMESTAMP".to_string(),
+            Expr::Coalesce(exprs) => {
+                let rendered: Vec<String> =
+                    exprs.iter().map(|e| e.render(dialect, params)).collect();
+                format!("COALESCE({})", rendered.join(", "))
+            }
+            Expr::Case(arms, otherwise) => {
+                let mut sql = "CASE".to_string();
+                for (condition, then) in arms {
+                    sql.push_str(" WHEN ");
+                    sql.push_str(&condition.render(dialect, params));
+                    sql.push_str(" THEN ");
+                    sql.push_str(&then.render(dialect, params));
+                }
+                if let Some(otherwise) = otherwise {
+                    sql.push_str(" ELSE ");
+                    sql.push_str(&otherwise.render(dialect, params));
+                }
+                sql.push_str(" END");
+                sql
+            }
         }
+    }
+}
+
+/// A `CASE WHEN ... THEN ... [ELSE ...] END` expression, built up one arm
+/// at a time and converted into an `Expr` via `Into`/`From`.
+///
+/// ```
+/// # use rusty_db_core::{Case, Expr, Select, SelectExpr, Table};
+/// let orders = Table::new("orders");
+/// let tier = Case::new()
+///     .when(orders.col("amount").gt(100_i64), Expr::lit("gold"))
+///     .when(orders.col("amount").gt(50_i64), Expr::lit("silver"))
+///     .otherwise(Expr::lit("bronze"));
+/// let query = Select::from(&orders).columns([SelectExpr::from(tier).alias("tier")]);
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct Case {
+    arms: Vec<(Expr, Expr)>,
+    otherwise: Option<Box<Expr>>,
+}
+
+impl Case {
+    pub fn new() -> Self {
+        Case::default()
+    }
+
+    /// `WHEN condition THEN then`.
+    pub fn when(mut self, condition: Expr, then: Expr) -> Self {
+        self.arms.push((condition, then));
+        self
+    }
+
+    /// `ELSE otherwise`.
+    pub fn otherwise(mut self, otherwise: Expr) -> Self {
+        self.otherwise = Some(Box::new(otherwise));
+        self
+    }
+}
+
+impl From<Case> for Expr {
+    fn from(case: Case) -> Self {
+        Expr::Case(case.arms, case.otherwise)
     }
 }
 

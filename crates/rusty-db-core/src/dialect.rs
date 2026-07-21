@@ -31,6 +31,16 @@ pub trait Dialect: Send + Sync {
         "LIKE"
     }
 
+    /// Whether this dialect's `||` operator means string concatenation.
+    /// True on Postgres and SQLite; MySQL/MariaDB's `||` means logical
+    /// `OR` under the default `sql_mode` (`PIPES_AS_CONCAT` would change
+    /// that, but isn't the default, so this crate can't assume it's set) —
+    /// `Expr`'s `.concat(...)` uses this to choose between rendering
+    /// `a || b` and `CONCAT(a, b)`.
+    fn concat_uses_double_pipe(&self) -> bool {
+        true
+    }
+
     /// Whether this dialect supports two-phase (prepared) commit — a
     /// transaction that's durably prepared on one call and only later,
     /// possibly from an entirely different connection, either finalized or
@@ -143,6 +153,10 @@ impl Dialect for MySqlDialect {
 
     fn placeholder(&self, _position: usize) -> String {
         "?".to_string()
+    }
+
+    fn concat_uses_double_pipe(&self) -> bool {
+        false
     }
 
     fn supports_two_phase_commit(&self) -> bool {

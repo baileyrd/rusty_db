@@ -1,5 +1,5 @@
 use super::*;
-use crate::dialect::{NumberedDialect, QuestionMarkDialect};
+use crate::dialect::{MySqlDialect, NumberedDialect, QuestionMarkDialect};
 use crate::value::Value;
 
 #[test]
@@ -452,4 +452,162 @@ fn set_operation_params_are_numbered_sequentially_across_both_arms_on_postgres()
         r#"SELECT "orders"."id" FROM "orders" WHERE "orders"."amount" > $1 UNION SELECT "refunds"."id" FROM "refunds" WHERE "refunds"."amount" > $2"#
     );
     assert_eq!(params, vec![Value::I64(10), Value::I64(20)]);
+}
+
+#[test]
+fn lower_and_upper_render_as_function_calls() {
+    let users = Table::new("users");
+    let (sql, _) = Select::from(&users)
+        .filter(users.col("name").lower().eq("ada"))
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT * FROM "users" WHERE LOWER("users"."name") = ?"#
+    );
+
+    let (sql, _) = Select::from(&users)
+        .filter(users.col("name").upper().eq("ADA"))
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT * FROM "users" WHERE UPPER("users"."name") = ?"#
+    );
+}
+
+#[test]
+fn concat_renders_double_pipe_on_postgres_and_sqlite_but_concat_call_on_mysql() {
+    let users = Table::new("users");
+    let query = Select::from(&users).columns([SelectExpr::from(
+        users
+            .col("first_name")
+            .concat(Expr::lit(" "))
+            .concat(Expr::col(users.col("last_name"))),
+    )
+    .alias("full_name")]);
+
+    let (pg_sql, _) = query.clone().to_sql(&NumberedDialect);
+    assert_eq!(
+        pg_sql,
+        r#"SELECT "users"."first_name" || $1 || "users"."last_name" AS "full_name" FROM "users""#
+    );
+
+    let (sqlite_sql, _) = query.clone().to_sql(&QuestionMarkDialect);
+    assert!(sqlite_sql.contains(r#""users"."first_name" || ? || "users"."last_name""#));
+
+    let (mysql_sql, _) = query.to_sql(&MySqlDialect);
+    assert!(mysql_sql
+        .contains("CONCAT(CONCAT(`users`.`first_name`, ?), `users`.`last_name`) AS `full_name`"));
+}
+
+#[test]
+fn arithmetic_operators_render_correctly() {
+    let orders = Table::new("orders");
+    let (sql, params) = Select::from(&orders)
+        .columns([SelectExpr::from(orders.col("amount").mul(Expr::lit(1.1_f64))).alias("with_tax")])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT "orders"."amount" * ? AS "with_tax" FROM "orders""#
+    );
+    assert_eq!(params, vec![Value::F64(1.1)]);
+
+    let (sql, _) = Select::from(&orders)
+        .columns([SelectExpr::from(
+            orders.col("amount").add(Expr::col(orders.col("tax"))),
+        )])
+        .to_sql(&QuestionMarkDialect);
+    assert!(sql.contains(r#""orders"."amount" + "orders"."tax""#));
+
+    let (sql, _) = Select::from(&orders)
+        .columns([SelectExpr::from(
+            orders.col("amount").sub(Expr::col(orders.col("discount"))),
+        )])
+        .to_sql(&QuestionMarkDialect);
+    assert!(sql.contains(r#""orders"."amount" - "orders"."discount""#));
+
+    let (sql, _) = Select::from(&orders)
+        .columns([SelectExpr::from(
+            orders.col("total").div(Expr::col(orders.col("count"))),
+        )])
+        .to_sql(&QuestionMarkDialect);
+    assert!(sql.contains(r#""orders"."total" / "orders"."count""#));
+}
+
+#[test]
+fn now_renders_as_current_timestamp_on_every_dialect() {
+    let events = Table::new("events");
+    let (sql, _) = Select::from(&events)
+        .columns([SelectExpr::from(Expr::now()).alias("now")])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"SELECT CURRENT_TIMESTAMP AS "now" FROM "events""#);
+}
+
+#[test]
+fn expr_to_expr_comparisons_let_now_be_used_directly_in_a_filter() {
+    let events = Table::new("events");
+    let (sql, _) = Select::from(&events)
+        .filter(Expr::col(events.col("created_at")).lt_expr(Expr::now()))
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT * FROM "events" WHERE "events"."created_at" < CURRENT_TIMESTAMP"#
+    );
+}
+
+#[test]
+fn coalesce_renders_every_argument() {
+    let users = Table::new("users");
+    let (sql, _) = Select::from(&users)
+        .columns([SelectExpr::from(Expr::coalesce([
+            Expr::col(users.col("nickname")),
+            Expr::col(users.col("name")),
+            Expr::lit("anonymous"),
+        ]))
+        .alias("display_name")])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT COALESCE("users"."nickname", "users"."name", ?) AS "display_name" FROM "users""#
+    );
+}
+
+#[test]
+fn case_renders_every_arm_and_the_else_clause() {
+    let orders = Table::new("orders");
+    let tier = Case::new()
+        .when(orders.col("amount").gt(100_i64), Expr::lit("gold"))
+        .when(orders.col("amount").gt(50_i64), Expr::lit("silver"))
+        .otherwise(Expr::lit("bronze"));
+
+    let (sql, params) = Select::from(&orders)
+        .columns([SelectExpr::from(tier).alias("tier")])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT CASE WHEN "orders"."amount" > ? THEN ? WHEN "orders"."amount" > ? THEN ? ELSE ? END AS "tier" FROM "orders""#
+    );
+    assert_eq!(
+        params,
+        vec![
+            Value::I64(100),
+            Value::Text("gold".to_string()),
+            Value::I64(50),
+            Value::Text("silver".to_string()),
+            Value::Text("bronze".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn case_without_an_else_clause_omits_it() {
+    let orders = Table::new("orders");
+    let status = Case::new().when(orders.col("amount").gt(0_i64), Expr::lit("has_amount"));
+
+    let (sql, _) = Select::from(&orders)
+        .columns([SelectExpr::from(status)])
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"SELECT CASE WHEN "orders"."amount" > ? THEN ? END FROM "orders""#
+    );
 }
