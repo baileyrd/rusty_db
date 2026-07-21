@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sqlx::pool::PoolConnection;
-use sqlx::postgres::{PgPoolOptions, PgRow};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgRow};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{BigDecimal, JsonValue, Uuid};
-use sqlx::{Column as _, Postgres, Row as _, TypeInfo as _};
+use sqlx::{Column as _, Connection as _, Postgres, Row as _, TypeInfo as _};
 
 use rusty_db_core::dialect::NumberedDialect;
 use rusty_db_core::{
@@ -72,10 +72,18 @@ impl PostgresDriver {
                 })
             });
         }
-        let pool = options
-            .connect(url)
-            .await
-            .map_err(|e| Error::Connection(e.to_string()))?;
+        let pool = match config.statement_cache_capacity {
+            Some(capacity) => {
+                let connect_options: PgConnectOptions = url
+                    .parse()
+                    .map_err(|e: sqlx::Error| Error::Connection(e.to_string()))?;
+                options
+                    .connect_with(connect_options.statement_cache_capacity(capacity))
+                    .await
+            }
+            None => options.connect(url).await,
+        }
+        .map_err(|e| Error::Connection(e.to_string()))?;
         Ok(Self {
             pool,
             metrics: Arc::new(PoolMetrics::new()),
@@ -723,4 +731,8 @@ impl Executor for PostgresConnection {
     }
 }
 
-impl Connection for PostgresConnection {}
+impl Connection for PostgresConnection {
+    fn cached_statement_count(&self) -> usize {
+        self.conn.cached_statements_size()
+    }
+}

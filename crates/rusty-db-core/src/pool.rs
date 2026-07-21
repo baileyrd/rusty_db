@@ -23,6 +23,11 @@ pub struct PoolConfig {
     /// SQL run every time a connection is checked back in (about to go
     /// idle in the pool). See `Self::with_after_release`.
     pub after_release: Option<Arc<str>>,
+    /// How many distinct prepared statements each connection caches
+    /// (LRU-evicted past this) before re-preparing a query shape it's
+    /// already seen. `None` uses the underlying driver's default (100).
+    /// See `Self::with_statement_cache_capacity`.
+    pub statement_cache_capacity: Option<usize>,
 }
 
 impl PoolConfig {
@@ -34,6 +39,7 @@ impl PoolConfig {
             on_connect: None,
             before_acquire: None,
             after_release: None,
+            statement_cache_capacity: None,
         }
     }
 
@@ -63,6 +69,20 @@ impl PoolConfig {
     /// have changed before the connection is reused by someone else.
     pub fn with_after_release(mut self, sql: impl Into<String>) -> Self {
         self.after_release = Some(Arc::from(sql.into()));
+        self
+    }
+
+    /// Cache up to `capacity` distinct prepared statements per connection
+    /// (LRU-evicted past that), instead of the underlying driver's default
+    /// of 100 — a `baked query`-equivalent: a query shape's rendered SQL
+    /// only needs parsing/planning once per connection, not on every
+    /// execution, as long as it stays in cache. Raise this for a workload
+    /// with many distinct, repeatedly-run query shapes (past the default's
+    /// LRU capacity, otherwise-cached statements would keep getting
+    /// evicted and re-prepared); lower it to bound per-connection memory
+    /// when only a handful of shapes ever repeat.
+    pub fn with_statement_cache_capacity(mut self, capacity: usize) -> Self {
+        self.statement_cache_capacity = Some(capacity);
         self
     }
 }
