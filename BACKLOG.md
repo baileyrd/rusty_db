@@ -55,7 +55,9 @@ loading with cascade delete/orphan rules; hand-written versioned
 migrations; schema introspection (columns/types/nullability/PK/foreign
 keys/indexes/unique constraints/check constraints/column defaults);
 logical backup/restore; read replicas; TLS; query timeouts; connection-pool
-observability. See `README.md` for the full tour with examples.
+observability; and connection-level event hooks (`PoolConfig::with_on_connect`/
+`.with_before_acquire`/`.with_after_release`). See `README.md` for the full
+tour with examples.
 
 ---
 
@@ -118,9 +120,6 @@ observability. See `README.md` for the full tour with examples.
   shape) — nothing at the rusty_db layer controls or exposes this; sqlx
   may do some of its own prepared-statement caching underneath, but it
   isn't surfaced or tunable here. **M**
-- **Connection-level event hooks** (on-connect/on-checkout/on-checkin
-  callbacks — e.g. to set a session variable on every new connection) —
-  absent; `pool_stats()` covers observability but not behavioral hooks. **M**
 
 ## Topology / deployment
 
