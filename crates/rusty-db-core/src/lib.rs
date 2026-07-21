@@ -45,6 +45,6 @@ pub use row::Row;
 pub use schema::{
     CheckConstraint, ColumnInfo, ForeignKey, IndexInfo, TableSchema, UniqueConstraint,
 };
-pub use session::{Savepoint, Session};
+pub use session::{Savepoint, Session, SessionQuery};
 pub use timeout::with_timeout;
 pub use value::{FromValue, Value};

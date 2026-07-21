@@ -428,6 +428,29 @@ let active = session.load_active::<User>().await?; // every row except ones mark
 
 `Mapped::not_deleted_filter()` gives you the same `<column> = false` condition for building into your own queries (`Select::from(&table).filter(User::not_deleted_filter().unwrap())`) — it needs no per-type code generation, since it's built entirely from `TABLE_NAME` and the `SOFT_DELETE_COLUMN` const at the trait-default level. `delete_query()` itself is untouched — always a real `DELETE` — so calling it directly still gives you a genuine hard delete on a soft-deletable type if you ever need one. A type with no `#[table(soft_delete)]` field is completely unaffected: `delete` stays a real delete, and `get`/`load_active` (equivalent to `load_all` here) see every row.
 
+### Fluent queries
+
+`session.query::<T>()` is a fluent, type-bound alternative to building a `Select::from(&T::table())` yourself and passing it to `load_all` — `.filter`/`.order_by`/`.limit`/`.offset` mirror `Select`'s own builder methods, and `.active_only()` mirrors `load_active`'s soft-delete filtering (a no-op for a type with no `#[table(soft_delete)]` column):
+
+```rust
+let table = User::table();
+let recent_active = session
+    .query::<User>()
+    .filter(table.col("active").eq(true))
+    .order_by(table.col("id").desc())
+    .limit(10)
+    .all()
+    .await?; // Vec<Rc<RefCell<User>>>
+
+let first_match = session
+    .query::<User>()
+    .filter(table.col("name").eq("ada"))
+    .first()
+    .await?; // Option<Rc<RefCell<User>>>
+```
+
+`.all()`/`.first()` (which just adds `LIMIT 1`) run the query (autoflushing first, same as `load_all`/`get`) and decode results through the session's identity map exactly the same way — a row already cached comes back as the same handle, in-memory changes and all.
+
 ### Identity map
 
 `Session::get`/`load_all` cache decoded rows by `(type, primary key)`: loading the same row twice through the same session returns the exact same `Rc<RefCell<T>>` handle rather than two independently-decoded copies, and mutations made through one handle are visible through any other handle to that row — including handles you fetch *after* the mutation, since the identity map wins over what's actually in the database:
@@ -574,6 +597,8 @@ Index reflection (`schema.indexes`) rounds out the same test files: a `UNIQUE`-b
 `tests/bulk_update_delete.rs` (SQLite) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two round-trip tests, since the identity-map-bypass/audit-log/rollback behavior is `Session`-level logic that doesn't depend on which driver is underneath) cover `Session::bulk_update`/`bulk_delete`: a filter-scoped update/delete changes/removes every matching row in one statement (`pending_len()` stays `1` regardless of how many rows match); an already-cached identity-mapped instance stays exactly as it was in memory after a `bulk_update` touches its row (the database itself is genuinely updated, confirmed by re-fetching through a fresh `Session`); `bulk_delete` is always a real, hard `DELETE` even against a `#[table(soft_delete)]` type, bypassing the soft-delete column entirely; both are recorded the same way ordinary `add`/`update`/`delete` writes are when audit logging is enabled; and a failing write queued in the same batch (a duplicate primary key) rolls the bulk write back too, since they share one all-or-nothing transaction.
 
 `tests/savepoints.rs` (SQLite, 6 tests) and its `_postgres`/`_mysql` counterparts (a reduced version there — just the two tests that most directly prove `SAVEPOINT`/`ROLLBACK TO SAVEPOINT`/`RELEASE SAVEPOINT` actually work against a real server, since the rest is `Session`-level logic independent of the driver underneath) cover `Session::savepoint`/`rollback_to_savepoint`/`release_savepoint`: rolling back to a savepoint undoes a sub-unit of work (whether already flushed or still only queued) without aborting the rest of the transaction, which keeps committing normally afterward; releasing a savepoint keeps its effects and lets the transaction continue; savepoints nest, rolling back an inner one independently of an outer one still open around it; and both an unreleased savepoint and a full `Session::rollback()` behave correctly regardless of whether a savepoint is still open — standard SQL behavior this crate doesn't need to do anything special to get right, beyond generating unique, safe (unquoted) savepoint names so nested savepoints within one session never collide.
+
+`tests/session_query.rs` (SQLite) covers `Session::query`/`SessionQuery`: `.filter`/`.order_by` narrow and order the result set; `.limit`/`.offset` page through it; `.first()` returns just the first matching row (`None` when nothing matches); results come back through the identity map exactly like `load_all`'s do, including reflecting an in-memory change made through a handle fetched a different way; and `.active_only()` excludes soft-deleted rows for a `#[table(soft_delete)]` type, the same as `load_active`. No `_postgres`/`_mysql` counterparts — this is `Session`-level logic built entirely on `load_all` and `Select`'s own filter/order/limit/offset, both already exercised per-driver elsewhere.
 
 ## Running tests
 
