@@ -63,6 +63,16 @@ pub trait Connection: Executor {
     async fn close(self: Box<Self>) -> Result<()> {
         Ok(())
     }
+
+    /// How many distinct prepared statements are currently cached on this
+    /// specific physical connection (see
+    /// `PoolConfig::with_statement_cache_capacity`) — a per-connection
+    /// number, not a pool-wide one (unlike `Engine::pool_stats()`), since
+    /// each connection keeps its own statement cache. Defaults to `0` for
+    /// a driver/test double with no statement cache to report.
+    fn cached_statement_count(&self) -> usize {
+        0
+    }
 }
 
 /// A source of `Connection`s for one database plus the `Dialect` needed to
