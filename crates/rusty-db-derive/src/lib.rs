@@ -44,6 +44,10 @@
 //! - one `load_<parent>` async method per `#[belongs_to(Parent, foreign_key
 //!   = "...")]` attribute, batch-loading the referenced `Parent` rows for a
 //!   slice of `Self` (see `rusty_db_core::relations::load_one`)
+//! - one `load_<target>s` async method per `#[many_to_many(Target, through
+//!   = "...", local_key = "...", foreign_key = "...")]` attribute,
+//!   batch-loading every `Target` row joined to `Self` through a join
+//!   table (see `rusty_db_core::relations::load_many_to_many`)
 //!
 //! A field additionally marked `#[table(version)]` (requires
 //! `#[table(primary_key)]` too) turns on optimistic locking: `update`'s
@@ -74,7 +78,7 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Token};
 
-#[proc_macro_derive(Mapped, attributes(table, has_many, has_one, belongs_to))]
+#[proc_macro_derive(Mapped, attributes(table, has_many, has_one, belongs_to, many_to_many))]
 pub fn derive_mapped(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(input)
@@ -118,6 +122,72 @@ impl Parse for RelationSpec {
     }
 }
 
+/// `#[many_to_many(Target, through = "...", local_key = "...", foreign_key
+/// = "...")]`'s shape: a join table (`through`) with a column referencing
+/// this struct (`local_key`) and a column referencing `Target`
+/// (`foreign_key`). The three named parameters may appear in any order.
+struct ManyToManySpec {
+    target: syn::Path,
+    through: syn::LitStr,
+    local_key: syn::LitStr,
+    foreign_key: syn::LitStr,
+}
+
+impl Parse for ManyToManySpec {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let target: syn::Path = input.parse()?;
+        input.parse::<Token![,]>()?;
+
+        let mut through: Option<syn::LitStr> = None;
+        let mut local_key: Option<syn::LitStr> = None;
+        let mut foreign_key: Option<syn::LitStr> = None;
+
+        loop {
+            let key: syn::Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            let value: syn::LitStr = input.parse()?;
+            if key == "through" {
+                through = Some(value);
+            } else if key == "local_key" {
+                local_key = Some(value);
+            } else if key == "foreign_key" {
+                foreign_key = Some(value);
+            } else {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    "expected `through`, `local_key`, or `foreign_key`",
+                ));
+            }
+            if input.is_empty() {
+                break;
+            }
+            input.parse::<Token![,]>()?;
+        }
+
+        Ok(ManyToManySpec {
+            target,
+            through: through.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "#[many_to_many(...)] requires `through = \"...\"`",
+                )
+            })?,
+            local_key: local_key.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "#[many_to_many(...)] requires `local_key = \"...\"`",
+                )
+            })?,
+            foreign_key: foreign_key.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "#[many_to_many(...)] requires `foreign_key = \"...\"`",
+                )
+            })?,
+        })
+    }
+}
+
 fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let struct_ident = &input.ident;
 
@@ -138,6 +208,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let mut has_many: Vec<RelationSpec> = Vec::new();
     let mut has_one: Vec<RelationSpec> = Vec::new();
     let mut belongs_to: Vec<RelationSpec> = Vec::new();
+    let mut many_to_many: Vec<ManyToManySpec> = Vec::new();
     for attr in &input.attrs {
         if attr.path().is_ident("table") {
             attr.parse_nested_meta(|meta| {
@@ -156,6 +227,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             has_one.push(attr.parse_args::<RelationSpec>()?);
         } else if attr.path().is_ident("belongs_to") {
             belongs_to.push(attr.parse_args::<RelationSpec>()?);
+        } else if attr.path().is_ident("many_to_many") {
+            many_to_many.push(attr.parse_args::<ManyToManySpec>()?);
         }
     }
     let table_name = table_name.unwrap_or_else(|| struct_ident.to_string().to_snake_case());
@@ -371,6 +444,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         .map(|spec| expand_belongs_to(struct_ident, &core, &fields, spec))
         .collect::<syn::Result<Vec<_>>>()?;
 
+    let many_to_many_impls = many_to_many
+        .iter()
+        .map(|spec| expand_many_to_many(struct_ident, &core, primary_key, spec))
+        .collect::<syn::Result<Vec<_>>>()?;
+
     Ok(quote! {
         impl #core::Mapped for #struct_ident {
             const TABLE_NAME: &'static str = #table_name;
@@ -411,6 +489,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         #(#has_many_impls)*
         #(#has_one_impls)*
         #(#belongs_to_impls)*
+        #(#many_to_many_impls)*
     })
 }
 
@@ -507,6 +586,62 @@ fn expand_has_one(
                     engine,
                     parents.iter().map(|p| ::std::clone::Clone::clone(&p.#pk_ident)),
                     #fk_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// `#[many_to_many(Target, through = "...", local_key = "...", foreign_key
+/// = "...")]` generates a batched loader keyed by `Self`'s own primary key,
+/// fetching every `Target` row joined to it through the `through` table in
+/// a single query (a real SQL `JOIN`, not two round trips).
+fn expand_many_to_many(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &ManyToManySpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[many_to_many(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_ident = &pk.ident;
+    let pk_ty = &pk.ty;
+    let target = &spec.target;
+    let through = &spec.through;
+    let local_key = &spec.local_key;
+    let foreign_key = &spec.foreign_key;
+
+    let target_name = target
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}s", target_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// Batched eager load of every `#target` row related to these
+            /// `#struct_ident`s through the `#through` join table, in a
+            /// single extra query (a real SQL `JOIN`, not select-in).
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                parents: &[#struct_ident],
+            ) -> #core::Result<::std::collections::HashMap<#pk_ty, ::std::vec::Vec<#target>>> {
+                let target_key_column = <#target as #core::Mapped>::PRIMARY_KEY.expect(
+                    "#[many_to_many(...)] target must have a #[table(primary_key)] field",
+                );
+                #core::relations::load_many_to_many::<#target, #pk_ty>(
+                    engine,
+                    parents.iter().map(|p| ::std::clone::Clone::clone(&p.#pk_ident)),
+                    #through,
+                    #local_key,
+                    #foreign_key,
+                    target_key_column,
                 )
                 .await
             }

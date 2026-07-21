@@ -33,6 +33,28 @@ struct Profile {
     bio: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Mapped)]
+#[table(name = "posts")]
+#[many_to_many(
+    Tag,
+    through = "post_tags",
+    local_key = "post_id",
+    foreign_key = "tag_id"
+)]
+struct Post {
+    #[table(primary_key)]
+    id: i64,
+    title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Mapped)]
+#[table(name = "tags")]
+struct Tag {
+    #[table(primary_key)]
+    id: i64,
+    name: String,
+}
+
 async fn engine_with_schema() -> rusty_db::Result<Engine> {
     let engine = SqliteDriver::engine("sqlite::memory:").await?;
     engine
@@ -56,6 +78,30 @@ async fn engine_with_schema() -> rusty_db::Result<Engine> {
         .await?
         .execute(
             "CREATE TABLE profiles (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, bio TEXT NOT NULL)",
+            &[],
+        )
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL)",
+            &[],
+        )
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            &[],
+        )
+        .await?;
+    engine
+        .connect()
+        .await?
+        .execute(
+            "CREATE TABLE post_tags (post_id INTEGER NOT NULL, tag_id INTEGER NOT NULL)",
             &[],
         )
         .await?;
@@ -288,6 +334,87 @@ async fn has_one_reports_a_conflict_when_a_parent_has_more_than_one_matching_row
 
     let result = User::load_profile(&engine, std::slice::from_ref(&ada)).await;
     assert!(matches!(result, Err(rusty_db::Error::Conflict(_))));
+
+    Ok(())
+}
+
+async fn insert_post_tag(engine: &Engine, post_id: i64, tag_id: i64) -> rusty_db::Result<()> {
+    let post_tags = Table::new("post_tags");
+    engine
+        .execute(
+            &Insert::into_table(&post_tags)
+                .value("post_id", post_id)
+                .value("tag_id", tag_id),
+        )
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn many_to_many_batches_targets_joined_through_a_join_table() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let rust_post = Post {
+        id: 1,
+        title: "Why Rust".to_string(),
+    };
+    let db_post = Post {
+        id: 2,
+        title: "Databases 101".to_string(),
+    };
+    // A third post with no tags at all, to prove the map just has no entry for it.
+    let untagged_post = Post {
+        id: 3,
+        title: "Untagged".to_string(),
+    };
+    engine.execute(&rust_post.insert()).await?;
+    engine.execute(&db_post.insert()).await?;
+    engine.execute(&untagged_post.insert()).await?;
+
+    let rust_tag = Tag {
+        id: 1,
+        name: "rust".to_string(),
+    };
+    let db_tag = Tag {
+        id: 2,
+        name: "databases".to_string(),
+    };
+    let systems_tag = Tag {
+        id: 3,
+        name: "systems".to_string(),
+    };
+    engine.execute(&rust_tag.insert()).await?;
+    engine.execute(&db_tag.insert()).await?;
+    engine.execute(&systems_tag.insert()).await?;
+
+    // rust_post: rust + systems: db_post: rust + databases.
+    insert_post_tag(&engine, rust_post.id, rust_tag.id).await?;
+    insert_post_tag(&engine, rust_post.id, systems_tag.id).await?;
+    insert_post_tag(&engine, db_post.id, rust_tag.id).await?;
+    insert_post_tag(&engine, db_post.id, db_tag.id).await?;
+
+    let posts = vec![rust_post.clone(), db_post.clone(), untagged_post.clone()];
+    let tags_by_post: HashMap<i64, Vec<Tag>> = Post::load_tags(&engine, &posts).await?;
+
+    assert_eq!(tags_by_post.len(), 2); // untagged_post has no entry at all
+    let mut rust_post_tags = tags_by_post.get(&rust_post.id).unwrap().clone();
+    rust_post_tags.sort_by_key(|t| t.id);
+    assert_eq!(rust_post_tags, vec![rust_tag.clone(), systems_tag.clone()]);
+    let mut db_post_tags = tags_by_post.get(&db_post.id).unwrap().clone();
+    db_post_tags.sort_by_key(|t| t.id);
+    assert_eq!(db_post_tags, vec![rust_tag.clone(), db_tag.clone()]);
+    assert!(!tags_by_post.contains_key(&untagged_post.id));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn many_to_many_returns_empty_map_for_empty_input() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let no_posts: Vec<Post> = Vec::new();
+    let tags_by_post: HashMap<i64, Vec<Tag>> = Post::load_tags(&engine, &no_posts).await?;
+    assert!(tags_by_post.is_empty());
 
     Ok(())
 }
