@@ -896,3 +896,165 @@ fn window_with_neither_clause_renders_an_empty_over() {
         .to_sql(&QuestionMarkDialect);
     assert_eq!(sql, r#"SELECT COUNT(*) OVER () AS "n" FROM "orders""#);
 }
+
+#[test]
+fn create_table_renders_columns_constraints_and_a_composite_primary_key() {
+    let create = CreateTable::new("users")
+        .if_not_exists()
+        .column("tenant_id", ColumnType::I64)
+        .primary_key()
+        .column("id", ColumnType::I64)
+        .primary_key()
+        .column("email", ColumnType::VarChar(255))
+        .not_null()
+        .unique()
+        .column("bio", ColumnType::Text)
+        .column("created_at", ColumnType::TimestampTz)
+        .default_raw("CURRENT_TIMESTAMP")
+        .foreign_key(["tenant_id"], "tenants", ["id"])
+        .check("email <> ''");
+
+    let (sql, params) = create.to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"CREATE TABLE IF NOT EXISTS "users" ("tenant_id" INTEGER NOT NULL, "id" INTEGER NOT NULL, "email" VARCHAR(255) NOT NULL UNIQUE, "bio" TEXT, "created_at" TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY ("tenant_id", "id"), FOREIGN KEY ("tenant_id") REFERENCES "tenants" ("id"), CHECK (email <> ''))"#
+    );
+    assert!(params.is_empty());
+}
+
+#[test]
+fn create_table_renders_an_autoincrementing_primary_key_inline_per_dialect() {
+    let sqlite = CreateTable::new("users")
+        .column("id", ColumnType::I64)
+        .primary_key()
+        .autoincrement()
+        .column("name", ColumnType::Text);
+    let (sql, _) = sqlite.to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"CREATE TABLE "users" ("id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT)"#
+    );
+
+    let postgres = CreateTable::new("users")
+        .column("id", ColumnType::I64)
+        .primary_key()
+        .autoincrement()
+        .column("name", ColumnType::Text);
+    let (sql, _) = postgres.to_sql(&NumberedDialect);
+    assert_eq!(
+        sql,
+        r#"CREATE TABLE "users" ("id" BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, "name" TEXT)"#
+    );
+
+    let mysql = CreateTable::new("users")
+        .column("id", ColumnType::I64)
+        .primary_key()
+        .autoincrement()
+        .column("name", ColumnType::Text);
+    let (sql, _) = mysql.to_sql(&MySqlDialect);
+    assert_eq!(
+        sql,
+        "CREATE TABLE `users` (`id` BIGINT AUTO_INCREMENT PRIMARY KEY, `name` TEXT)"
+    );
+}
+
+#[test]
+#[should_panic(expected = "only supported on a ColumnType::I64 column")]
+fn autoincrement_on_a_non_integer_column_panics() {
+    let create = CreateTable::new("users")
+        .column("id", ColumnType::Text)
+        .primary_key()
+        .autoincrement();
+    let _ = create.to_sql(&QuestionMarkDialect);
+}
+
+#[test]
+fn column_type_sql_covers_every_dialect_native_vs_fallback_split() {
+    let types_and_sqlite = [
+        (ColumnType::Bool, "BOOLEAN"),
+        (ColumnType::Uuid, "TEXT"),
+        (ColumnType::Json, "TEXT"),
+        (ColumnType::Bytes, "BLOB"),
+        (
+            ColumnType::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+            "NUMERIC(10,2)",
+        ),
+    ];
+    for (ty, expected) in &types_and_sqlite {
+        assert_eq!(&QuestionMarkDialect.column_type_sql(ty), expected);
+    }
+
+    assert_eq!(NumberedDialect.column_type_sql(&ColumnType::Uuid), "UUID");
+    assert_eq!(NumberedDialect.column_type_sql(&ColumnType::Json), "JSONB");
+    assert_eq!(NumberedDialect.column_type_sql(&ColumnType::Bytes), "BYTEA");
+    assert_eq!(
+        NumberedDialect.column_type_sql(&ColumnType::DateTime),
+        "TIMESTAMP"
+    );
+    assert_eq!(
+        NumberedDialect.column_type_sql(&ColumnType::TimestampTz),
+        "TIMESTAMPTZ"
+    );
+
+    assert_eq!(MySqlDialect.column_type_sql(&ColumnType::Uuid), "CHAR(36)");
+    assert_eq!(MySqlDialect.column_type_sql(&ColumnType::Json), "JSON");
+    assert_eq!(
+        MySqlDialect.column_type_sql(&ColumnType::Decimal {
+            precision: 5,
+            scale: 1
+        }),
+        "DECIMAL(5,1)"
+    );
+}
+
+#[test]
+fn drop_table_only_adds_if_exists_when_requested() {
+    let (sql, _) = DropTable::new("users").to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"DROP TABLE "users""#);
+
+    let (sql, _) = DropTable::new("users")
+        .if_exists()
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"DROP TABLE IF EXISTS "users""#);
+}
+
+#[test]
+fn create_index_renders_unique_and_if_not_exists() {
+    let (sql, _) =
+        CreateIndex::new("idx_users_email", "users", ["email"]).to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"CREATE INDEX "idx_users_email" ON "users" ("email")"#
+    );
+
+    let (sql, _) = CreateIndex::new("idx_users_name", "users", ["last_name", "first_name"])
+        .unique()
+        .if_not_exists()
+        .to_sql(&NumberedDialect);
+    assert_eq!(
+        sql,
+        r#"CREATE UNIQUE INDEX IF NOT EXISTS "idx_users_name" ON "users" ("last_name", "first_name")"#
+    );
+}
+
+#[test]
+fn drop_index_needs_the_table_name_only_on_mysql() {
+    let (sqlite_sql, _) = DropIndex::new("idx_users_email", "users").to_sql(&QuestionMarkDialect);
+    assert_eq!(sqlite_sql, r#"DROP INDEX "idx_users_email""#);
+
+    let (pg_sql, _) = DropIndex::new("idx_users_email", "users")
+        .if_exists()
+        .to_sql(&NumberedDialect);
+    assert_eq!(pg_sql, r#"DROP INDEX IF EXISTS "idx_users_email""#);
+
+    let (mysql_sql, _) = DropIndex::new("idx_users_email", "users")
+        .if_exists()
+        .to_sql(&MySqlDialect);
+    assert_eq!(
+        mysql_sql,
+        "DROP INDEX IF EXISTS `idx_users_email` ON `users`"
+    );
+}

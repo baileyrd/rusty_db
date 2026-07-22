@@ -8,6 +8,31 @@ pub trait Dialect: Send + Sync {
     /// Human-readable name, e.g. "postgres", "sqlite".
     fn name(&self) -> &'static str;
 
+    /// The `CREATE TABLE` column-type text for a portable `ColumnType` —
+    /// e.g. `ColumnType::Uuid` renders as `UUID` on Postgres (a native
+    /// type) but `TEXT`/`CHAR(36)` on SQLite/MySQL (which have none), the
+    /// same native-vs-fallback split already documented on `Value`'s own
+    /// variants.
+    fn column_type_sql(&self, ty: &crate::query::ColumnType) -> String;
+
+    /// The full inline column-definition suffix (type plus every
+    /// constraint keyword) for a single-column, auto-incrementing integer
+    /// primary key — e.g. SQLite's `INTEGER PRIMARY KEY AUTOINCREMENT`,
+    /// Postgres's `BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY`,
+    /// MySQL's `BIGINT AUTO_INCREMENT PRIMARY KEY`. This is the one place
+    /// autoincrement changes more than which keyword follows the column's
+    /// own type, so it owns the whole suffix rather than composing from
+    /// smaller per-dialect pieces.
+    fn autoincrement_primary_key_sql(&self) -> &'static str;
+
+    /// Whether this dialect's `DROP INDEX` needs `ON <table>` to identify
+    /// the index (MySQL/MariaDB, where an index name is only unique within
+    /// its table) or not (Postgres/SQLite, where index names are already
+    /// unique on their own and `DROP INDEX` takes just the name).
+    fn drop_index_needs_table_name(&self) -> bool {
+        false
+    }
+
     /// Quote an identifier (table/column name) for safe inclusion in SQL.
     fn quote_ident(&self, ident: &str) -> String {
         format!("\"{}\"", ident.replace('"', "\"\""))
@@ -122,6 +147,29 @@ impl Dialect for NumberedDialect {
     fn supports_two_phase_commit(&self) -> bool {
         true
     }
+
+    fn column_type_sql(&self, ty: &crate::query::ColumnType) -> String {
+        use crate::query::ColumnType::*;
+        match ty {
+            Bool => "BOOLEAN".to_string(),
+            I64 => "BIGINT".to_string(),
+            F64 => "DOUBLE PRECISION".to_string(),
+            Text => "TEXT".to_string(),
+            VarChar(n) => format!("VARCHAR({n})"),
+            Bytes => "BYTEA".to_string(),
+            Uuid => "UUID".to_string(),
+            Decimal { precision, scale } => format!("NUMERIC({precision},{scale})"),
+            Json => "JSONB".to_string(),
+            Date => "DATE".to_string(),
+            Time => "TIME".to_string(),
+            DateTime => "TIMESTAMP".to_string(),
+            TimestampTz => "TIMESTAMPTZ".to_string(),
+        }
+    }
+
+    fn autoincrement_primary_key_sql(&self) -> &'static str {
+        "BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY"
+    }
 }
 
 /// `?` style placeholders (SQLite).
@@ -135,6 +183,32 @@ impl Dialect for QuestionMarkDialect {
 
     fn placeholder(&self, _position: usize) -> String {
         "?".to_string()
+    }
+
+    fn column_type_sql(&self, ty: &crate::query::ColumnType) -> String {
+        use crate::query::ColumnType::*;
+        match ty {
+            Bool => "BOOLEAN".to_string(),
+            I64 => "INTEGER".to_string(),
+            F64 => "REAL".to_string(),
+            Text => "TEXT".to_string(),
+            VarChar(n) => format!("VARCHAR({n})"),
+            Bytes => "BLOB".to_string(),
+            // SQLite has no native UUID type; stored as hyphenated text,
+            // matching `Value::Uuid`'s own documented fallback there.
+            Uuid => "TEXT".to_string(),
+            Decimal { precision, scale } => format!("NUMERIC({precision},{scale})"),
+            // No native JSON type either; stored as serialized text.
+            Json => "TEXT".to_string(),
+            Date => "DATE".to_string(),
+            Time => "TIME".to_string(),
+            DateTime => "DATETIME".to_string(),
+            TimestampTz => "TIMESTAMP".to_string(),
+        }
+    }
+
+    fn autoincrement_primary_key_sql(&self) -> &'static str {
+        "INTEGER PRIMARY KEY AUTOINCREMENT"
     }
 }
 
@@ -178,5 +252,36 @@ impl Dialect for MySqlDialect {
 
     fn rollback_prepared_sql(&self, gid: &str) -> String {
         format!("XA ROLLBACK '{}'", escape_sql_string_literal(gid))
+    }
+
+    fn column_type_sql(&self, ty: &crate::query::ColumnType) -> String {
+        use crate::query::ColumnType::*;
+        match ty {
+            Bool => "BOOLEAN".to_string(),
+            I64 => "BIGINT".to_string(),
+            F64 => "DOUBLE".to_string(),
+            Text => "TEXT".to_string(),
+            VarChar(n) => format!("VARCHAR({n})"),
+            Bytes => "BLOB".to_string(),
+            // MySQL/MariaDB have no native UUID type; stored as fixed-width
+            // text, matching `Value::Uuid`'s own documented fallback there.
+            Uuid => "CHAR(36)".to_string(),
+            Decimal { precision, scale } => format!("DECIMAL({precision},{scale})"),
+            Json => "JSON".to_string(),
+            Date => "DATE".to_string(),
+            Time => "TIME".to_string(),
+            DateTime => "DATETIME".to_string(),
+            // MySQL's TIMESTAMP (unlike DATETIME) is stored/normalized as
+            // UTC, matching the naive-vs-UTC-instant split above.
+            TimestampTz => "TIMESTAMP".to_string(),
+        }
+    }
+
+    fn autoincrement_primary_key_sql(&self) -> &'static str {
+        "BIGINT AUTO_INCREMENT PRIMARY KEY"
+    }
+
+    fn drop_index_needs_table_name(&self) -> bool {
+        true
     }
 }
