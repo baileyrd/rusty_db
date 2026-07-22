@@ -23,23 +23,24 @@
 //! also generate a `_via_subquery`-suffixed convenience method around
 //! each of these.
 //!
-//! `load_many_joined` is a third strategy — SQLAlchemy calls this
-//! `joinedload` — for the `has_many` shape only so far. Unlike the two
-//! above, it doesn't add a second query at all: parents and their
-//! matching children come back from a single `LEFT JOIN` query, one row
-//! per matched child (or one row with every child column `NULL` for a
-//! parent with none). That's a materially different shape than
-//! `load_many`/`load_many_via_subquery` return — those always start from
-//! an already-fetched (or independently queried) parent batch — so
-//! `load_many_joined` fetches *and* returns the parents itself, not just
-//! the children, and has to deduplicate the repeated parent rows a join
-//! naturally produces. It also has to solve a problem the other two
-//! strategies never hit: `Parent`'s and `Child`'s own column names can
+//! `load_many_joined`/`load_has_one_joined` are a third strategy —
+//! SQLAlchemy calls this `joinedload` — for the `has_many`/`has_one`
+//! shapes so far. Unlike the two above, it doesn't add a second query at
+//! all: parents and their matching children come back from a single
+//! `LEFT JOIN` query, one row per matched child (or one row with every
+//! child column `NULL` for a parent with none). That's a materially
+//! different shape than `load_many`/`load_many_via_subquery` return —
+//! those always start from an already-fetched (or independently queried)
+//! parent batch — so these fetch *and* return the parents themselves, not
+//! just the children, and have to deduplicate the repeated parent rows a
+//! join naturally produces. They also have to solve a problem the other
+//! two strategies never hit: `Parent`'s and `Child`'s own column names can
 //! collide (both mapping an `id` primary key, say), so every selected
 //! column gets an internal, uniquely prefixed alias, invisible to the
 //! caller, that `FromRow` decodes back through.
-//! Not (yet) generalized to `has_one`/`belongs_to`/`many_to_many`, or
-//! wired into `#[has_many(...)]` as an opt-in strategy — call it directly.
+//! Not (yet) generalized to `belongs_to`/`many_to_many`, or wired into
+//! `#[has_many(...)]`/`#[has_one(...)]` as an opt-in strategy — call
+//! these directly.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -462,6 +463,67 @@ where
     Child: Mapped + FromRow,
     PK: Into<Value> + FromValue + Eq + Hash + Clone,
 {
+    let (parents, matches) =
+        fetch_joined::<Parent, Child, PK>(engine, filter, parent_pk_column, fk_column).await?;
+
+    let mut children: HashMap<PK, Vec<Child>> = HashMap::new();
+    for (key, child) in matches {
+        children.entry(key).or_default().push(child);
+    }
+
+    Ok((parents, children))
+}
+
+/// Has-one eager load via the "joined" strategy — see `load_many_joined`
+/// for what `filter`/the column-aliasing/no-match detection mean, and
+/// `load_has_one` for the one-to-one conflict check this shares:
+/// `Err(Error::Conflict)` if more than one `Child` row ends up matching
+/// the same parent, instead of silently keeping (or dropping) one of them.
+pub async fn load_has_one_joined<Parent, Child, PK>(
+    engine: &Engine,
+    filter: Option<Expr>,
+    parent_pk_column: &str,
+    fk_column: &str,
+) -> Result<(Vec<Parent>, HashMap<PK, Child>)>
+where
+    Parent: Mapped + FromRow,
+    Child: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash + Clone,
+{
+    let (parents, matches) =
+        fetch_joined::<Parent, Child, PK>(engine, filter, parent_pk_column, fk_column).await?;
+
+    let mut by_key: HashMap<PK, Child> = HashMap::new();
+    for (key, child) in matches {
+        if by_key.insert(key, child).is_some() {
+            return Err(Error::Conflict(format!(
+                "has_one: more than one {:?} row shares the same {fk_column:?} value, \
+                 so this isn't actually a one-to-one relationship",
+                Child::TABLE_NAME
+            )));
+        }
+    }
+
+    Ok((parents, by_key))
+}
+
+/// Shared machinery for every `*_joined` function above: builds and runs
+/// the single `LEFT JOIN` query, and decodes its rows into the
+/// deduplicated parent list plus a flat `(PK, Child)` list of every
+/// actual match (a parent with no matching child contributes nothing to
+/// it) — left for each public function above to group/conflict-check
+/// however its own return shape needs.
+async fn fetch_joined<Parent, Child, PK>(
+    engine: &Engine,
+    filter: Option<Expr>,
+    parent_pk_column: &str,
+    fk_column: &str,
+) -> Result<(Vec<Parent>, Vec<(PK, Child)>)>
+where
+    Parent: Mapped + FromRow,
+    Child: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash + Clone,
+{
     let parent_table = Table::new(Parent::TABLE_NAME);
     let child_table = Table::new(Child::TABLE_NAME);
 
@@ -489,7 +551,7 @@ where
 
     let mut parents = Vec::new();
     let mut seen_parent_keys: HashSet<PK> = HashSet::new();
-    let mut children: HashMap<PK, Vec<Child>> = HashMap::new();
+    let mut matches = Vec::new();
 
     for row in engine.fetch_all(&query).await? {
         let parent_row = prefixed_sub_row(&row, JOINED_PARENT_PREFIX);
@@ -507,9 +569,9 @@ where
         let fk_value: Value = child_row.get_by_name(fk_column)?;
         if !matches!(fk_value, Value::Null) {
             let child = Child::from_row(&child_row)?;
-            children.entry(parent_key).or_default().push(child);
+            matches.push((parent_key, child));
         }
     }
 
-    Ok((parents, children))
+    Ok((parents, matches))
 }
