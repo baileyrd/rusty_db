@@ -71,25 +71,33 @@ logical backup/restore; read replicas; TLS; query timeouts; connection-pool
 observability; connection-level event hooks (`PoolConfig::with_on_connect`/
 `.with_before_acquire`/`.with_after_release`); a tunable per-connection
 statement-cache capacity (`PoolConfig::with_statement_cache_capacity`);
-streaming query results (`Engine::fetch_stream`/`fetch_stream_as`); and
+streaming query results (`Engine::fetch_stream`/`fetch_stream_as`);
 automap-style `#[derive(Mapped)]` struct generation from live schema
-reflection (`Engine::automap_table`/`automap_all`). See `README.md` for
-the full tour with examples.
+reflection (`Engine::automap_table`/`automap_all`); and Alembic-style
+autogenerate diffing a set of `#[derive(Mapped)]` types' expected shape
+against a live database, generating `CreateTable`/`AlterTable` DDL for
+review (`Engine::autogenerate_migration`, `TableSpec`) — v1 only diffs
+column presence, never a rename, a type change, or a whole table to drop
+(see the "Autogenerate v2" item below). See `README.md` for the full tour
+with examples.
 
 ---
 
 ## Schema / DDL / reflection
 
-- **Alembic-style autogenerate** — diff a mapped model's shape against the
-  live database and generate the migration for you, instead of every
-  migration being fully hand-written. Reflection is now rich enough
-  (columns/FKs/indexes/unique/check constraints/defaults) to diff against,
-  and the DDL builder (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`/
-  `AlterTable`) now exists to emit the generated migration's statements —
-  though it still doesn't cover renaming a column/table or altering an
-  existing column's type/constraints (only `ADD`/`DROP COLUMN`), which
-  autogenerate's diff will sometimes need to emit; this is the single
-  largest remaining gap in the migrations story. **XL**
+- **Autogenerate v2** — `Engine::autogenerate_migration`'s v1 diff
+  deliberately only detects column presence: never a rename (reported as
+  an unrelated drop-then-add, losing the column's data if both are run),
+  never a type change (no portable representation to compare a live
+  column's dialect-native `type_name` against `ColumnType` without
+  reimplementing `automap::rust_type_for`'s heuristic in reverse, per
+  dialect), and never a whole table to drop (no way to tell "not
+  currently tracked" from "meant to be deleted" from the `expected` list
+  alone) — see its own module doc for the full reasoning. Closing any of
+  these needs either a richer per-dialect diffing heuristic or an
+  explicit, opt-in surface for what can't be inferred safely (e.g. a
+  caller-supplied "this was renamed from X" hint, or an explicit "yes,
+  really drop this" allowlist rather than inferring it). **M**
 
 ## Mapping / derive macro (`#[derive(Mapped)]`)
 
