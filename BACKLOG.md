@@ -48,7 +48,9 @@ soft-delete column, custom column/table names, plus `#[derive(MappedEnum)]`
 and `#[derive(MappedNewtype)]` for mapping a Rust enum or newtype onto a
 column; a `Session` unit-of-work with an identity map, autoflush, bulk
 insert, `bulk_update`/`bulk_delete`, audit logging, optimistic locking,
-soft deletes, lifecycle hooks, `expire_on_commit` semantics, savepoints/
+soft deletes, mapping-level column defaults (`#[table(default = "...")]`,
+distinct from the database-side column defaults schema introspection
+reflects below), lifecycle hooks, `expire_on_commit` semantics, savepoints/
 nested transactions, two-phase commit, and a fluent `session.query::<T>()`
 API; `has_many`/`belongs_to`/`has_one`/`many_to_many` select-in eager
 loading with cascade delete/orphan rules; hand-written versioned
@@ -86,9 +88,6 @@ the full tour with examples.
   `update`, `delete`, optimistic locking, soft deletes, relationships) is
   built assuming a single scalar key. This is a foundational, cross-cutting
   change, not a bolt-on. **XL**
-- **Column defaults expressed at the mapping layer** (`#[table(default =
-  ...)]`, distinct from a DB-side `DEFAULT`) so `Session::add` can omit a
-  field and still insert a sensible value. **M**
 - **Lifecycle hooks/validators** (`before_insert`/`after_update`/a
   `#[validates(...)]`-equivalent) — nothing in `Session` or the derive
   macro runs application code around a write today. **L**
