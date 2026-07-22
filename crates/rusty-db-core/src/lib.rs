@@ -35,7 +35,7 @@ pub use connection::{Connection, Driver, Executor};
 pub use dialect::Dialect;
 pub use engine::{Engine, Transaction};
 pub use error::{Error, Result};
-pub use mapping::{Entity, FromRow, Identifiable, Mapped};
+pub use mapping::{Entity, FromRow, Identifiable, Lifecycle, Mapped};
 pub use migration::{AppliedMigration, Migration, Migrator};
 pub use pool::{PoolConfig, PoolMetrics, PoolStats};
 pub use query::{

@@ -7,7 +7,7 @@ use std::rc::Rc;
 use crate::audit::{self, AuditEntry, AuditOperation};
 use crate::engine::{Engine, Transaction};
 use crate::error::{Error, Result};
-use crate::mapping::{Entity, FromRow, Identifiable, Mapped};
+use crate::mapping::{Entity, FromRow, Identifiable, Lifecycle, Mapped};
 use crate::migration::{self, Migration};
 use crate::query::{BulkInsert, Column, Delete, Expr, Insert, Select, Table, ToSql, Update};
 use crate::value::Value;
@@ -25,6 +25,13 @@ struct PendingWrite {
     operation: AuditOperation,
     query: Box<dyn ToSql + Send>,
     requires_row_affected: bool,
+    /// Set by `add_mut`/`update_mut`/`delete_mut` to a closure calling the
+    /// entity's `Lifecycle::after_insert`/`after_update`/`after_delete` on
+    /// a snapshot taken at queue time — run once this specific write
+    /// actually succeeds during `flush` (never for one that fails and
+    /// rolls back). `None` for every write queued by `add`/`update`/
+    /// `delete` (unhooked, exactly as before this feature existed).
+    after_write: Option<Box<dyn FnOnce()>>,
 }
 
 /// A unit of work: queues writes made through `add`/`update`/`delete`, and
@@ -217,6 +224,7 @@ impl Session {
             operation: AuditOperation::Insert,
             query: Box::new(entity.insert()),
             requires_row_affected: false,
+            after_write: None,
         });
     }
 
@@ -235,6 +243,7 @@ impl Session {
             operation: AuditOperation::Insert,
             query: Box::new(bulk),
             requires_row_affected: false,
+            after_write: None,
         });
     }
 
@@ -252,6 +261,7 @@ impl Session {
             operation: AuditOperation::Update,
             query: Box::new(entity.update()),
             requires_row_affected: T::VERSION_COLUMN.is_some(),
+            after_write: None,
         });
     }
 
@@ -272,28 +282,89 @@ impl Session {
         let key = (TypeId::of::<T>(), entity.primary_key_value().to_string());
         self.identity_map.remove(&key);
 
-        let query: Box<dyn ToSql + Send> = match T::SOFT_DELETE_COLUMN {
-            Some(soft_delete_column) => {
-                let pk_column = T::PRIMARY_KEY.expect(
-                    "#[table(soft_delete)] requires a #[table(primary_key)] field too \
-                     (enforced when #[derive(Mapped)] expands)",
-                );
-                let table = Table::new(T::TABLE_NAME);
-                Box::new(
-                    Update::table(&table)
-                        .set(soft_delete_column, true)
-                        .filter(table.col(pk_column).eq(entity.primary_key_value())),
-                )
-            }
-            None => Box::new(entity.delete_query()),
-        };
-
         self.pending.push(PendingWrite {
             table: T::TABLE_NAME,
             operation: AuditOperation::Delete,
-            query,
+            query: delete_query_for(entity),
             requires_row_affected: T::VERSION_COLUMN.is_some(),
+            after_write: None,
         });
+    }
+
+    /// Like `add`, but also runs `T`'s `Lifecycle` hooks around the write:
+    /// `entity.before_insert()` (able to mutate `entity` before its data is
+    /// captured into the `INSERT`), then `entity.validate()` — returning
+    /// its error immediately and queuing nothing at all if it fails —
+    /// before queuing the insert. `entity.after_insert()` then runs once
+    /// this specific write actually succeeds during the next flush (never
+    /// for one that fails and rolls back), on a snapshot of `entity` taken
+    /// right after `before_insert`/`validate` ran (needs `T: Clone` for
+    /// that snapshot, since flush happens later than this call).
+    ///
+    /// `add` itself is completely unaffected by this method existing —
+    /// unhooked, infallible, exactly as it always was — for every type
+    /// that doesn't implement `Lifecycle` or doesn't need these hooks.
+    pub fn add_mut<T: Entity + Lifecycle + Clone + 'static>(
+        &mut self,
+        entity: &mut T,
+    ) -> Result<()> {
+        entity.before_insert();
+        entity.validate()?;
+        let snapshot = entity.clone();
+        self.pending.push(PendingWrite {
+            table: T::TABLE_NAME,
+            operation: AuditOperation::Insert,
+            query: Box::new(entity.insert()),
+            requires_row_affected: false,
+            after_write: Some(Box::new(move || snapshot.after_insert())),
+        });
+        Ok(())
+    }
+
+    /// Like `update`, but also runs `T`'s `Lifecycle` hooks around the
+    /// write — see `add_mut` for the exact `before`/`validate`/`after`
+    /// sequencing (identical here, just for `update` instead of `insert`).
+    pub fn update_mut<T: Identifiable + Lifecycle + Clone + 'static>(
+        &mut self,
+        entity: &mut T,
+    ) -> Result<()> {
+        entity.before_update();
+        entity.validate()?;
+        let snapshot = entity.clone();
+        self.pending.push(PendingWrite {
+            table: T::TABLE_NAME,
+            operation: AuditOperation::Update,
+            query: Box::new(entity.update()),
+            requires_row_affected: T::VERSION_COLUMN.is_some(),
+            after_write: Some(Box::new(move || snapshot.after_update())),
+        });
+        Ok(())
+    }
+
+    /// Like `delete`, but also runs `entity.before_delete()` before queuing
+    /// the delete, and `entity.after_delete()` once it actually succeeds
+    /// during the next flush (never for one that fails and rolls back), on
+    /// a snapshot of `entity` taken right after `before_delete` ran.
+    /// Unlike `add_mut`/`update_mut`, `validate()` is never called here —
+    /// nothing about a delete is worth validating.
+    pub fn delete_mut<T: Identifiable + Lifecycle + Clone + 'static>(
+        &mut self,
+        entity: &mut T,
+    ) -> Result<()> {
+        entity.before_delete();
+
+        let key = (TypeId::of::<T>(), entity.primary_key_value().to_string());
+        self.identity_map.remove(&key);
+
+        let snapshot = entity.clone();
+        self.pending.push(PendingWrite {
+            table: T::TABLE_NAME,
+            operation: AuditOperation::Delete,
+            query: delete_query_for(entity),
+            requires_row_affected: T::VERSION_COLUMN.is_some(),
+            after_write: Some(Box::new(move || snapshot.after_delete())),
+        });
+        Ok(())
     }
 
     /// Queue an arbitrary `UPDATE` against `T`'s table — not bound to any
@@ -328,6 +399,7 @@ impl Session {
             operation: AuditOperation::Update,
             query: Box::new(update),
             requires_row_affected: false,
+            after_write: None,
         });
     }
 
@@ -346,6 +418,7 @@ impl Session {
             operation: AuditOperation::Delete,
             query: Box::new(delete),
             requires_row_affected: false,
+            after_write: None,
         });
     }
 
@@ -419,7 +492,17 @@ impl Session {
             }
         }
 
-        self.pending.clear();
+        // Only now, with every write in the batch actually sent
+        // successfully (a failure above already returned, leaving
+        // `self.pending` untouched for a future retry), is it safe to run
+        // each write's `Lifecycle::after_insert`/`after_update`/
+        // `after_delete` (queued by `add_mut`/`update_mut`/`delete_mut`) —
+        // these are arbitrary application closures, not part of this
+        // transaction, so nothing about them could be undone by a
+        // rollback triggered by a later item in the same batch.
+        for after_write in self.pending.drain(..).filter_map(|write| write.after_write) {
+            after_write();
+        }
 
         for hook in &mut self.after_flush_hooks {
             hook();
@@ -834,4 +917,24 @@ fn downcast_cached<T: 'static>(cached: &Rc<dyn Any>) -> Rc<RefCell<T>> {
         .clone()
         .downcast::<RefCell<T>>()
         .expect("identity map key collision: TypeId matched but the cached value didn't")
+}
+
+/// Shared by `delete`/`delete_mut`: a `#[table(soft_delete)]` type gets a
+/// marker `UPDATE` instead of `entity`'s own (always-hard) `delete_query()`.
+fn delete_query_for<T: Identifiable>(entity: &T) -> Box<dyn ToSql + Send> {
+    match T::SOFT_DELETE_COLUMN {
+        Some(soft_delete_column) => {
+            let pk_column = T::PRIMARY_KEY.expect(
+                "#[table(soft_delete)] requires a #[table(primary_key)] field too \
+                 (enforced when #[derive(Mapped)] expands)",
+            );
+            let table = Table::new(T::TABLE_NAME);
+            Box::new(
+                Update::table(&table)
+                    .set(soft_delete_column, true)
+                    .filter(table.col(pk_column).eq(entity.primary_key_value())),
+            )
+        }
+        None => Box::new(entity.delete_query()),
+    }
 }

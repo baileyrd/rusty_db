@@ -51,10 +51,10 @@ pub mod prelude {
     pub use rusty_db_core::{
         with_timeout, AuditEntry, AuditOperation, BigDecimal, BoxStream, BulkInsert, Case, Column,
         ColumnInfo, Cte, DatabaseDump, DateTime, Delete, Engine, Entity, Expr, FromRow,
-        Identifiable, Insert, Join, JoinKind, Json, Mapped, Migration, Migrator, NaiveDate,
-        NaiveDateTime, NaiveTime, PoolConfig, PoolStats, ReplicaSet, Row, Savepoint, Select,
-        SelectExpr, Session, SessionQuery, SetOperation, StreamExt, Table, TableDump, TableSchema,
-        ToSql, Transaction, Update, Utc, Uuid, Value, Window,
+        Identifiable, Insert, Join, JoinKind, Json, Lifecycle, Mapped, Migration, Migrator,
+        NaiveDate, NaiveDateTime, NaiveTime, PoolConfig, PoolStats, ReplicaSet, Row, Savepoint,
+        Select, SelectExpr, Session, SessionQuery, SetOperation, StreamExt, Table, TableDump,
+        TableSchema, ToSql, Transaction, Update, Utc, Uuid, Value, Window,
     };
 
     // `Mapped` above is the trait (type namespace); this is the derive
