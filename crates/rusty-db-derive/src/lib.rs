@@ -313,8 +313,10 @@ impl Parse for ManyToManySpec {
 
 /// `#[hybrid(name = "...", expr = "...", ty = "...")]`'s shape — a
 /// struct-level, repeatable attribute (SQLAlchemy's `hybrid_property`
-/// equivalent for arithmetic over this struct's own sibling fields). `ty`
-/// is optional: inferred from the first field the expression references
+/// equivalent for arithmetic, and a single top-level comparison of two
+/// such arithmetic expressions, over this struct's own sibling fields).
+/// `ty` is optional: inferred as `bool` for a comparison expression, or
+/// from the first field the expression references
 /// when omitted.
 struct HybridSpec {
     name: syn::LitStr,
@@ -1310,7 +1312,7 @@ fn expand_belongs_to_via_subquery(
     })
 }
 
-/// A parsed `#[hybrid(...)]` arithmetic expression token.
+/// A parsed `#[hybrid(...)]` expression token.
 #[derive(Debug, Clone, PartialEq)]
 enum HybridToken {
     Ident(String),
@@ -1321,6 +1323,12 @@ enum HybridToken {
     Slash,
     LParen,
     RParen,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    EqEq,
+    NotEq,
 }
 
 fn tokenize_hybrid_expr(src: &str) -> Result<Vec<HybridToken>, String> {
@@ -1352,6 +1360,7 @@ fn tokenize_hybrid_expr(src: &str) -> Result<Vec<HybridToken>, String> {
             }
             tokens.push(HybridToken::Number(number));
         } else {
+            chars.next();
             let token = match c {
                 '+' => HybridToken::Plus,
                 '-' => HybridToken::Minus,
@@ -1359,6 +1368,22 @@ fn tokenize_hybrid_expr(src: &str) -> Result<Vec<HybridToken>, String> {
                 '/' => HybridToken::Slash,
                 '(' => HybridToken::LParen,
                 ')' => HybridToken::RParen,
+                '<' => {
+                    if chars.next_if_eq(&'=').is_some() {
+                        HybridToken::Le
+                    } else {
+                        HybridToken::Lt
+                    }
+                }
+                '>' => {
+                    if chars.next_if_eq(&'=').is_some() {
+                        HybridToken::Ge
+                    } else {
+                        HybridToken::Gt
+                    }
+                }
+                '=' if chars.next_if_eq(&'=').is_some() => HybridToken::EqEq,
+                '!' if chars.next_if_eq(&'=').is_some() => HybridToken::NotEq,
                 other => {
                     return Err(format!(
                         "unexpected character {other:?} in hybrid expression"
@@ -1366,7 +1391,6 @@ fn tokenize_hybrid_expr(src: &str) -> Result<Vec<HybridToken>, String> {
                 }
             };
             tokens.push(token);
-            chars.next();
         }
     }
     Ok(tokens)
@@ -1380,19 +1404,39 @@ enum HybridOp {
     Div,
 }
 
+/// `<`/`<=`/`>`/`>=`/`==`/`!=` — always compares two arithmetic
+/// sub-expressions and produces a `bool`, so (unlike `HybridOp`) it can
+/// only ever appear once, at the very top of an expression: `HybridNode`
+/// deliberately has no boolean combinators (`&&`/`||`) to chain more than
+/// one, and comparisons can't be nested inside an arithmetic
+/// sub-expression or parenthesized group, the same restriction Rust's own
+/// grammar puts on chained comparisons like `a < b < c`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HybridCompareOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
 /// The parsed shape of a `#[hybrid(expr = "...")]` string: a small
-/// arithmetic tree over field names, integer/float literals, `+`/`-`/`*`/
-/// `/`, and parentheses for grouping — deliberately nothing richer (no
-/// comparisons, no function calls), since this is meant to render
-/// identically as both a plain Rust expression and a portable `Expr` tree,
-/// and that only holds for the arithmetic ANSI-SQL already shares with
-/// Rust.
+/// expression tree over field names, integer/float literals, `+`/`-`/`*`/
+/// `/`, parentheses for grouping, and — at most once, at the top level —
+/// a `<`/`<=`/`>`/`>=`/`==`/`!=` comparison of two such arithmetic
+/// sub-expressions. Deliberately nothing richer still (no string
+/// functions, `CASE`/`COALESCE`, boolean combinators, or references to a
+/// joined table's columns), since this is meant to render identically as
+/// both a plain Rust expression and a portable `Expr` tree, and that only
+/// holds for the arithmetic/comparison ANSI-SQL already shares with Rust.
 #[derive(Debug, Clone)]
 enum HybridNode {
     Field(String),
     IntLit(i64),
     FloatLit(f64),
     Op(Box<HybridNode>, HybridOp, Box<HybridNode>),
+    Compare(Box<HybridNode>, HybridCompareOp, Box<HybridNode>),
 }
 
 struct HybridParser<'a> {
@@ -1403,11 +1447,32 @@ struct HybridParser<'a> {
 impl<'a> HybridParser<'a> {
     fn parse(tokens: &'a [HybridToken]) -> Result<HybridNode, String> {
         let mut parser = HybridParser { tokens, pos: 0 };
-        let node = parser.parse_expr()?;
+        let node = parser.parse_comparison()?;
         if parser.pos != parser.tokens.len() {
             return Err("unexpected trailing tokens in hybrid expression".to_string());
         }
         Ok(node)
+    }
+
+    /// The true top-level entry point: an arithmetic expression, optionally
+    /// followed by exactly one comparison operator and a second arithmetic
+    /// expression. Never recurses back into itself, so a comparison can
+    /// only ever appear once, at the top — matching `HybridCompareOp`'s own
+    /// doc.
+    fn parse_comparison(&mut self) -> Result<HybridNode, String> {
+        let lhs = self.parse_expr()?;
+        let op = match self.tokens.get(self.pos) {
+            Some(HybridToken::Lt) => HybridCompareOp::Lt,
+            Some(HybridToken::Le) => HybridCompareOp::Le,
+            Some(HybridToken::Gt) => HybridCompareOp::Gt,
+            Some(HybridToken::Ge) => HybridCompareOp::Ge,
+            Some(HybridToken::EqEq) => HybridCompareOp::Eq,
+            Some(HybridToken::NotEq) => HybridCompareOp::Ne,
+            _ => return Ok(lhs),
+        };
+        self.pos += 1;
+        let rhs = self.parse_expr()?;
+        Ok(HybridNode::Compare(Box::new(lhs), op, Box::new(rhs)))
     }
 
     fn parse_expr(&mut self) -> Result<HybridNode, String> {
@@ -1501,7 +1566,7 @@ fn hybrid_field_names(node: &HybridNode) -> Vec<String> {
     match node {
         HybridNode::Field(name) => vec![name.clone()],
         HybridNode::IntLit(_) | HybridNode::FloatLit(_) => Vec::new(),
-        HybridNode::Op(lhs, _, rhs) => {
+        HybridNode::Op(lhs, _, rhs) | HybridNode::Compare(lhs, _, rhs) => {
             let mut names = hybrid_field_names(lhs);
             names.extend(hybrid_field_names(rhs));
             names
@@ -1541,6 +1606,18 @@ fn hybrid_rust_tokens(node: &HybridNode, fields: &[FieldInfo]) -> TokenStream2 {
                 HybridOp::Div => quote! { (#lhs / #rhs) },
             }
         }
+        HybridNode::Compare(lhs, op, rhs) => {
+            let lhs = hybrid_rust_tokens(lhs, fields);
+            let rhs = hybrid_rust_tokens(rhs, fields);
+            match op {
+                HybridCompareOp::Lt => quote! { (#lhs < #rhs) },
+                HybridCompareOp::Le => quote! { (#lhs <= #rhs) },
+                HybridCompareOp::Gt => quote! { (#lhs > #rhs) },
+                HybridCompareOp::Ge => quote! { (#lhs >= #rhs) },
+                HybridCompareOp::Eq => quote! { (#lhs == #rhs) },
+                HybridCompareOp::Ne => quote! { (#lhs != #rhs) },
+            }
+        }
     }
 }
 
@@ -1568,6 +1645,18 @@ fn hybrid_sql_tokens(node: &HybridNode, core: &TokenStream2, fields: &[FieldInfo
                 HybridOp::Sub => quote! { (#lhs).sub(#rhs) },
                 HybridOp::Mul => quote! { (#lhs).mul(#rhs) },
                 HybridOp::Div => quote! { (#lhs).div(#rhs) },
+            }
+        }
+        HybridNode::Compare(lhs, op, rhs) => {
+            let lhs = hybrid_sql_tokens(lhs, core, fields);
+            let rhs = hybrid_sql_tokens(rhs, core, fields);
+            match op {
+                HybridCompareOp::Lt => quote! { (#lhs).lt_expr(#rhs) },
+                HybridCompareOp::Le => quote! { (#lhs).lte_expr(#rhs) },
+                HybridCompareOp::Gt => quote! { (#lhs).gt_expr(#rhs) },
+                HybridCompareOp::Ge => quote! { (#lhs).gte_expr(#rhs) },
+                HybridCompareOp::Eq => quote! { (#lhs).eq_expr(#rhs) },
+                HybridCompareOp::Ne => quote! { (#lhs).ne_expr(#rhs) },
             }
         }
     }
@@ -1621,6 +1710,7 @@ fn expand_hybrid(
 
     let ty = match &spec.ty {
         Some(ty) => ty.clone(),
+        None if matches!(node, HybridNode::Compare(..)) => syn::parse_quote!(bool),
         None => {
             let first = referenced.first().expect("checked non-empty above");
             fields
@@ -2206,5 +2296,82 @@ mod tests {
     fn a_pure_literal_expression_references_no_fields() {
         let node = parse_hybrid_expr("2 * (3 + 4)").unwrap();
         assert!(hybrid_field_names(&node).is_empty());
+    }
+
+    #[test]
+    fn every_comparison_operator_tokenizes_and_parses() {
+        for (src, expected) in [
+            ("price < 10", HybridCompareOp::Lt),
+            ("price <= 10", HybridCompareOp::Le),
+            ("price > 10", HybridCompareOp::Gt),
+            ("price >= 10", HybridCompareOp::Ge),
+            ("price == 10", HybridCompareOp::Eq),
+            ("price != 10", HybridCompareOp::Ne),
+        ] {
+            match parse_hybrid_expr(src).unwrap() {
+                HybridNode::Compare(_, op, _) => assert_eq!(op, expected, "for {src:?}"),
+                other => panic!("expected a comparison for {src:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_comparisons_operands_can_be_arbitrary_arithmetic() {
+        // `price * quantity > 100` — both sides of the comparison are
+        // themselves full arithmetic sub-expressions, not just bare fields.
+        match parse_hybrid_expr("price * quantity > 100").unwrap() {
+            HybridNode::Compare(lhs, HybridCompareOp::Gt, rhs) => {
+                assert!(matches!(*lhs, HybridNode::Op(_, HybridOp::Mul, _)));
+                assert!(matches!(*rhs, HybridNode::IntLit(100)));
+            }
+            other => panic!("expected a comparison, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_equals_sign_is_rejected_not_silently_treated_as_assignment() {
+        assert!(tokenize_hybrid_expr("price = 10").is_err());
+    }
+
+    #[test]
+    fn chained_comparisons_are_rejected() {
+        // `a < b < c` isn't meaningful the way it might look — same
+        // restriction Rust's own grammar puts on it.
+        let tokens = tokenize_hybrid_expr("a < b < c").unwrap();
+        assert!(HybridParser::parse(&tokens).is_err());
+    }
+
+    #[test]
+    fn a_comparison_defaults_to_a_bool_return_type_not_the_operands_type() {
+        let fields = vec![field("price", "price", "i64")];
+        let node = parse_hybrid_expr("price > 100").unwrap();
+        assert!(matches!(node, HybridNode::Compare(..)));
+        // The actual `ty` inference lives in `expand_hybrid`, which this
+        // unit test doesn't invoke directly (it needs a full `HybridSpec` +
+        // struct context) — but the Rust/SQL rendering below is what that
+        // inferred `bool` return type is built from, so cover those here.
+        let rust = rust_tokens_for("price > 100", &fields);
+        assert!(rust.contains('>'));
+        let sql = sql_tokens_for("price > 100", &fields);
+        assert!(sql.contains("gt_expr"));
+    }
+
+    #[test]
+    fn every_comparison_operator_renders_the_matching_expr_method() {
+        let fields = vec![field("price", "price", "i64")];
+        for (src, method) in [
+            ("price < 10", "lt_expr"),
+            ("price <= 10", "lte_expr"),
+            ("price > 10", "gt_expr"),
+            ("price >= 10", "gte_expr"),
+            ("price == 10", "eq_expr"),
+            ("price != 10", "ne_expr"),
+        ] {
+            let sql = sql_tokens_for(src, &fields);
+            assert!(
+                sql.contains(method),
+                "expected {src:?} to render `{method}`, got: {sql}"
+            );
+        }
     }
 }

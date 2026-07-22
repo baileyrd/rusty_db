@@ -16,6 +16,7 @@ use rusty_db::prelude::*;
     expr = "(price * quantity) - discount",
     ty = "i64"
 )]
+#[hybrid(name = "is_expensive", expr = "price > 50")]
 struct LineItem {
     #[table(primary_key)]
     id: i64,
@@ -160,6 +161,56 @@ async fn an_explicit_ty_and_parenthesized_expression_are_both_honored() -> rusty
     let mut actual: Vec<i64> = rows.iter().map(|i| i.id).collect();
     actual.sort();
     assert_eq!(actual, expected);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_comparison_hybrid_computes_a_bool_on_the_rust_side() -> rusty_db::Result<()> {
+    let cheap = LineItem {
+        id: 1,
+        price: 10,
+        quantity: 1,
+        discount: 0,
+    };
+    let expensive = LineItem {
+        id: 2,
+        price: 100,
+        quantity: 1,
+        discount: 0,
+    };
+    assert!(!cheap.is_expensive());
+    assert!(expensive.is_expensive());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_comparison_hybrids_sql_side_filters_the_same_rows_the_rust_side_would_keep(
+) -> rusty_db::Result<()> {
+    let engine = file_engine("comparison_filter").await?;
+    let items = sample_items();
+    seed(&engine, &items).await?;
+
+    // is_expensive_expr() is already a complete boolean condition (unlike
+    // total_expr(), a bare arithmetic Expr that still needs `.gt(...)`
+    // applied) — it's used directly as the filter, no further comparison
+    // chained onto it.
+    let rows: Vec<LineItem> = engine
+        .fetch_all_as(&Select::from(&LineItem::table()).filter(LineItem::is_expensive_expr()))
+        .await?;
+
+    let expected: Vec<i64> = items
+        .iter()
+        .filter(|i| i.is_expensive())
+        .map(|i| i.id)
+        .collect();
+    let mut actual: Vec<i64> = rows.iter().map(|i| i.id).collect();
+    actual.sort();
+    assert_eq!(actual, expected);
+    // The sample data actually has both an expensive and a non-expensive
+    // item, so this test would catch a filter that's silently a no-op
+    // (e.g. always true or always false) too.
+    assert!(!expected.is_empty() && expected.len() < items.len());
 
     Ok(())
 }
