@@ -647,22 +647,39 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let has_many_impls = has_many
         .iter()
-        .map(|spec| expand_has_many(struct_ident, &core, primary_key, spec))
+        .map(|spec| {
+            let select_in = expand_has_many(struct_ident, &core, primary_key, spec)?;
+            let subquery = expand_has_many_via_subquery(struct_ident, &core, primary_key, spec)?;
+            Ok(quote! { #select_in #subquery })
+        })
         .collect::<syn::Result<Vec<_>>>()?;
 
     let has_one_impls = has_one
         .iter()
-        .map(|spec| expand_has_one(struct_ident, &core, primary_key, spec))
+        .map(|spec| {
+            let select_in = expand_has_one(struct_ident, &core, primary_key, spec)?;
+            let subquery = expand_has_one_via_subquery(struct_ident, &core, primary_key, spec)?;
+            Ok(quote! { #select_in #subquery })
+        })
         .collect::<syn::Result<Vec<_>>>()?;
 
     let belongs_to_impls = belongs_to
         .iter()
-        .map(|spec| expand_belongs_to(struct_ident, &core, &fields, spec))
+        .map(|spec| {
+            let select_in = expand_belongs_to(struct_ident, &core, &fields, spec)?;
+            let subquery = expand_belongs_to_via_subquery(struct_ident, &core, &fields, spec)?;
+            Ok(quote! { #select_in #subquery })
+        })
         .collect::<syn::Result<Vec<_>>>()?;
 
     let many_to_many_impls = many_to_many
         .iter()
-        .map(|spec| expand_many_to_many(struct_ident, &core, primary_key, spec))
+        .map(|spec| {
+            let select_in = expand_many_to_many(struct_ident, &core, primary_key, spec)?;
+            let subquery =
+                expand_many_to_many_via_subquery(struct_ident, &core, primary_key, spec)?;
+            Ok(quote! { #select_in #subquery })
+        })
         .collect::<syn::Result<Vec<_>>>()?;
 
     let hybrid_impls = hybrids
@@ -772,6 +789,57 @@ fn expand_has_many(
     })
 }
 
+/// "subqueryload"-style alternative to `expand_has_many`'s generated
+/// method: instead of a batch of already-fetched parents, takes a
+/// `Select` picking out the parent primary key, and joins `Child` rows
+/// against it directly (see
+/// `rusty_db_core::relations::load_many_via_subquery`).
+fn expand_has_many_via_subquery(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[has_many(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_column = &pk.column;
+    let pk_ty = &pk.ty;
+    let child = &spec.target;
+    let fk_column = &spec.foreign_key;
+
+    let child_name = child
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}s_via_subquery", child_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "subqueryload"-style eager load of the `#child` rows
+            /// referencing the parents selected by `parent_ids`, which
+            /// must select a single column named `#pk_column` — see
+            /// `rusty_db_core::relations::load_many_via_subquery`.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                parent_ids: #core::Select,
+            ) -> #core::Result<::std::collections::HashMap<#pk_ty, ::std::vec::Vec<#child>>> {
+                #core::relations::load_many_via_subquery::<#child, #pk_ty>(
+                    engine,
+                    parent_ids,
+                    #pk_column,
+                    #fk_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
 /// `#[has_one(Child, foreign_key = "...")]` generates a batched loader keyed
 /// by `Self`'s own primary key (which the child's `foreign_key` column
 /// references) — the same direction as `#[has_many(...)]`, but for a
@@ -826,6 +894,58 @@ fn expand_has_one(
     })
 }
 
+/// "subqueryload"-style alternative to `expand_has_one`'s generated method
+/// — see `expand_has_many_via_subquery` for what `parent_ids` must select,
+/// and `rusty_db_core::relations::load_has_one_via_subquery` for the same
+/// one-to-one conflict check `expand_has_one` shares.
+fn expand_has_one_via_subquery(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[has_one(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_column = &pk.column;
+    let pk_ty = &pk.ty;
+    let child = &spec.target;
+    let fk_column = &spec.foreign_key;
+
+    let child_name = child
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}_via_subquery", child_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "subqueryload"-style eager load of the single `#child` row
+            /// (if any) referencing each parent selected by `parent_ids`,
+            /// which must select a single column named `#pk_column` — see
+            /// `rusty_db_core::relations::load_has_one_via_subquery`.
+            /// `Err(Error::Conflict)` if more than one `#child` row
+            /// references the same parent.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                parent_ids: #core::Select,
+            ) -> #core::Result<::std::collections::HashMap<#pk_ty, #child>> {
+                #core::relations::load_has_one_via_subquery::<#child, #pk_ty>(
+                    engine,
+                    parent_ids,
+                    #pk_column,
+                    #fk_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
 /// `#[many_to_many(Target, through = "...", local_key = "...", foreign_key
 /// = "...")]` generates a batched loader keyed by `Self`'s own primary key,
 /// fetching every `Target` row joined to it through the `through` table in
@@ -871,6 +991,64 @@ fn expand_many_to_many(
                 #core::relations::load_many_to_many::<#target, #pk_ty>(
                     engine,
                     parents.iter().map(|p| ::std::clone::Clone::clone(&p.#pk_ident)),
+                    #through,
+                    #local_key,
+                    #foreign_key,
+                    target_key_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// "subqueryload"-style alternative to `expand_many_to_many`'s generated
+/// method — see `expand_has_many_via_subquery` for what `parent_ids` must
+/// select, and
+/// `rusty_db_core::relations::load_many_to_many_via_subquery` for the rest.
+fn expand_many_to_many_via_subquery(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &ManyToManySpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[many_to_many(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_column = &pk.column;
+    let pk_ty = &pk.ty;
+    let target = &spec.target;
+    let through = &spec.through;
+    let local_key = &spec.local_key;
+    let foreign_key = &spec.foreign_key;
+
+    let target_name = target
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}s_via_subquery", target_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "subqueryload"-style eager load of every `#target` row
+            /// related to the parents selected by `parent_ids`, which must
+            /// select a single column named `#pk_column`, through the
+            /// `#through` join table.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                parent_ids: #core::Select,
+            ) -> #core::Result<::std::collections::HashMap<#pk_ty, ::std::vec::Vec<#target>>> {
+                let target_key_column = <#target as #core::Mapped>::PRIMARY_KEY.expect(
+                    "#[many_to_many(...)] target must have a #[table(primary_key)] field",
+                );
+                #core::relations::load_many_to_many_via_subquery::<#target, #pk_ty>(
+                    engine,
+                    parent_ids,
+                    #pk_column,
                     #through,
                     #local_key,
                     #foreign_key,
@@ -1068,6 +1246,62 @@ fn expand_belongs_to(
                 #core::relations::load_one::<#parent, #fk_ty>(
                     engine,
                     children.iter().map(|c| ::std::clone::Clone::clone(&c.#fk_ident)),
+                    parent_key_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// "subqueryload"-style alternative to `expand_belongs_to`'s generated
+/// method: instead of a batch of already-fetched children, takes a
+/// `Select` picking out the children's own `foreign_key` column, and joins
+/// `Parent` rows against it directly (see
+/// `rusty_db_core::relations::load_one_via_subquery`). Doesn't re-validate
+/// `cascade` — `expand_belongs_to` already rejects it for this attribute,
+/// and runs first (see the `?` chaining at the call site).
+fn expand_belongs_to_via_subquery(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    fields: &[FieldInfo],
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let fk_column_value = spec.foreign_key.value();
+    let fk_field = fields.iter().find(|f| f.column == fk_column_value).ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.foreign_key,
+            format!("no field maps to column {fk_column_value:?}; #[belongs_to(...)]'s foreign_key must name a column on this struct"),
+        )
+    })?;
+    let fk_ty = &fk_field.ty;
+    let fk_column = &spec.foreign_key;
+    let parent = &spec.target;
+
+    let parent_name = parent
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}_via_subquery", parent_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "subqueryload"-style eager load of the `#parent` rows
+            /// referenced by the children selected by `foreign_key_ids`,
+            /// which must select a single column named `#fk_column` — see
+            /// `rusty_db_core::relations::load_one_via_subquery`.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                foreign_key_ids: #core::Select,
+            ) -> #core::Result<::std::collections::HashMap<#fk_ty, #parent>> {
+                let parent_key_column = <#parent as #core::Mapped>::PRIMARY_KEY.expect(
+                    "#[belongs_to(...)] target must have a #[table(primary_key)] field",
+                );
+                #core::relations::load_one_via_subquery::<#parent, #fk_ty>(
+                    engine,
+                    foreign_key_ids,
+                    #fk_column,
                     parent_key_column,
                 )
                 .await
