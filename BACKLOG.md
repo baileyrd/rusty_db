@@ -74,7 +74,12 @@ alternative joining directly against a caller-supplied `Select` wrapped
 as a CTE instead of shipping a parent key list back and forth, also
 callable directly as `rusty_db::relations::load_many_via_subquery`/
 `load_has_one_via_subquery`/`load_one_via_subquery`/
-`load_many_to_many_via_subquery`; hand-written versioned
+`load_many_to_many_via_subquery` — plus, for `has_many` only so far, a
+third "joined" strategy (`rusty_db::relations::load_many_joined`, a
+single `LEFT JOIN` round trip returning both the deduplicated parents and
+their grouped children, safely aliasing around any column-name collision
+between the two — see "`joined` eager-loading strategy" below for what's
+still missing); hand-written versioned
 migrations; schema introspection (columns/types/nullability/PK/foreign
 keys/indexes/unique constraints/check constraints/column defaults);
 logical backup/restore; read replicas; TLS; query timeouts; connection-pool
@@ -143,13 +148,20 @@ missing). See `README.md` for the full tour with examples.
 - **Lazy loading** (an attribute that fetches on first access instead of
   always being eagerly select-in-loaded) — today every relationship is
   eager, which is safe but can over-fetch. **L**
-- **`joined` eager-loading strategy** — SQLAlchemy's other alternative to
-  select-in: fetch parent and child in one query via `LEFT JOIN` instead
-  of a second round trip. Doesn't exist in any form yet; unlike
-  `subqueryload` above, this one changes the *shape* of the parent fetch
-  itself (one row per matched child, needing de-duplication into the
-  eventual `Vec<Parent>`), not just how the second query is built, so it
-  isn't just "another `relations.rs` function" the way subqueryload was. **M**
+- **`joined` eager-loading strategy for `has_one`/`belongs_to`/
+  `many_to_many`** — `rusty_db::relations::load_many_joined` (`has_many`
+  only) fetches parent and child in one query via `LEFT JOIN` instead of
+  a second round trip, returning the deduplicated parents alongside their
+  grouped children, safely aliasing around any column-name collision
+  between the two tables. The other three relationship shapes don't have
+  a joined-strategy equivalent yet. Also still missing: wiring
+  `load_many_joined` into `#[has_many(...)]` as an opt-in strategy the
+  way select-in/subqueryload already are (it's a plain function only,
+  called directly), and its "plain `filter`, not an arbitrary
+  caller-built `Select`" scope — unlike `load_many_via_subquery`, it
+  can't accept a parent-side query with its own joins/CTEs, since it
+  needs an actual `Table` handle to build its `LEFT JOIN` and per-side
+  column aliasing, not just a key column name. **M**
 
 ## Topology / deployment
 
