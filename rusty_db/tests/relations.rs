@@ -747,6 +747,92 @@ async fn many_to_many_via_subquery_matches_the_select_in_result() -> rusty_db::R
 }
 
 #[tokio::test]
+async fn derive_generated_via_subquery_methods_work_end_to_end() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+
+    let ada_order = Order {
+        id: 1,
+        user_id: 1,
+        amount: 100,
+    };
+    let grace_order = Order {
+        id: 2,
+        user_id: 2,
+        amount: 200,
+    };
+    engine.execute(&ada_order.insert()).await?;
+    engine.execute(&grace_order.insert()).await?;
+
+    let ada_profile = Profile {
+        id: 1,
+        user_id: 1,
+        bio: "mathematician".to_string(),
+    };
+    engine.execute(&ada_profile.insert()).await?;
+
+    let rust_post = Post {
+        id: 1,
+        title: "Why Rust".to_string(),
+    };
+    engine.execute(&rust_post.insert()).await?;
+    let rust_tag = Tag {
+        id: 1,
+        name: "rust".to_string(),
+    };
+    engine.execute(&rust_tag.insert()).await?;
+    insert_post_tag(&engine, rust_post.id, rust_tag.id).await?;
+
+    // has_many: User::load_orders_via_subquery.
+    let users_table = User::table();
+    let parent_ids = Select::from(&users_table).columns([users_table.col("id")]);
+    let orders_by_user: HashMap<i64, Vec<Order>> =
+        User::load_orders_via_subquery(&engine, parent_ids).await?;
+    assert_eq!(
+        orders_by_user.get(&ada.id).unwrap(),
+        &vec![ada_order.clone()]
+    );
+    assert_eq!(
+        orders_by_user.get(&grace.id).unwrap(),
+        &vec![grace_order.clone()]
+    );
+
+    // has_one: User::load_profile_via_subquery.
+    let parent_ids = Select::from(&users_table).columns([users_table.col("id")]);
+    let profiles_by_user: HashMap<i64, Profile> =
+        User::load_profile_via_subquery(&engine, parent_ids).await?;
+    assert_eq!(profiles_by_user.get(&ada.id).unwrap(), &ada_profile);
+    assert!(!profiles_by_user.contains_key(&grace.id));
+
+    // belongs_to: Order::load_user_via_subquery.
+    let orders_table = Order::table();
+    let foreign_key_ids = Select::from(&orders_table).columns([orders_table.col("user_id")]);
+    let users_by_id: HashMap<i64, User> =
+        Order::load_user_via_subquery(&engine, foreign_key_ids).await?;
+    assert_eq!(users_by_id.get(&ada.id).unwrap(), &ada);
+    assert_eq!(users_by_id.get(&grace.id).unwrap(), &grace);
+
+    // many_to_many: Post::load_tags_via_subquery.
+    let posts_table = Post::table();
+    let parent_ids = Select::from(&posts_table).columns([posts_table.col("id")]);
+    let tags_by_post: HashMap<i64, Vec<Tag>> =
+        Post::load_tags_via_subquery(&engine, parent_ids).await?;
+    assert_eq!(tags_by_post.get(&rust_post.id).unwrap(), &vec![rust_tag]);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_cascading_deletes_cascade_delete_children_and_the_parent() -> rusty_db::Result<()> {
     let engine = engine_with_schema().await?;
 

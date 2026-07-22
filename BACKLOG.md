@@ -66,14 +66,13 @@ plus a hand-implemented `Lifecycle` trait for entity-level
 `update_mut`/`delete_mut`), `expire_on_commit` semantics, savepoints/
 nested transactions, two-phase commit, and a fluent `session.query::<T>()`
 API; `has_many`/`belongs_to`/`has_one`/`many_to_many` select-in eager
-loading with cascade delete/orphan rules, plus a `subqueryload`-style
-alternative for all four (`rusty_db::relations::load_many_via_subquery`/
+loading (with cascade delete/orphan rules) plus a generated
+`_via_subquery` convenience method for each — a `subqueryload`-style
+alternative joining directly against a caller-supplied `Select` wrapped
+as a CTE instead of shipping a parent key list back and forth, also
+callable directly as `rusty_db::relations::load_many_via_subquery`/
 `load_has_one_via_subquery`/`load_one_via_subquery`/
-`load_many_to_many_via_subquery`, joining directly against a
-caller-supplied `Select` wrapped as a CTE instead of shipping a parent
-key list back and forth — not yet wired into the derive attributes as an
-opt-in strategy, see "Wire subqueryload into the derive attributes"
-below); hand-written versioned
+`load_many_to_many_via_subquery`; hand-written versioned
 migrations; schema introspection (columns/types/nullability/PK/foreign
 keys/indexes/unique constraints/check constraints/column defaults);
 logical backup/restore; read replicas; TLS; query timeouts; connection-pool
@@ -139,14 +138,6 @@ missing). See `README.md` for the full tour with examples.
 - **Lazy loading** (an attribute that fetches on first access instead of
   always being eagerly select-in-loaded) — today every relationship is
   eager, which is safe but can over-fetch. **L**
-- **Wire subqueryload into the derive attributes** — `load_many_via_subquery`/
-  `load_has_one_via_subquery`/`load_one_via_subquery`/
-  `load_many_to_many_via_subquery` exist and work (a `subqueryload`-style
-  alternative to the default select-in strategy, joining directly against
-  a caller-supplied `Select` instead of a literal key list), but only as
-  plain functions called directly — `#[has_many(...)]`/etc. don't yet
-  accept a `strategy = "subquery"` (or similar) to generate a convenience
-  method around them the way the default strategy already gets one. **S**
 - **`joined` eager-loading strategy** — SQLAlchemy's other alternative to
   select-in: fetch parent and child in one query via `LEFT JOIN` instead
   of a second round trip. Doesn't exist in any form yet; unlike
