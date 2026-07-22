@@ -1,6 +1,6 @@
 use super::insert::Insert;
 use super::table::Table;
-use super::{render_value_placeholder, ToSql};
+use super::{render_insert_value, InsertValue, ToSql};
 use crate::dialect::Dialect;
 use crate::error::{Error, Result};
 use crate::value::Value;
@@ -17,7 +17,7 @@ use crate::value::Value;
 pub struct BulkInsert {
     table: Table,
     columns: Vec<String>,
-    rows: Vec<Vec<Value>>,
+    rows: Vec<Vec<InsertValue>>,
 }
 
 impl BulkInsert {
@@ -79,7 +79,7 @@ impl BulkInsert {
     }
 }
 
-fn values_of(assignments: Vec<(String, Value)>) -> Vec<Value> {
+fn values_of(assignments: Vec<(String, InsertValue)>) -> Vec<InsertValue> {
     assignments.into_iter().map(|(_, value)| value).collect()
 }
 
@@ -100,7 +100,7 @@ impl ToSql for BulkInsert {
             .map(|row| {
                 let placeholders = row
                     .iter()
-                    .map(|value| render_value_placeholder(value, dialect, &mut params))
+                    .map(|value| render_insert_value(value, dialect, &mut params))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("({placeholders})")

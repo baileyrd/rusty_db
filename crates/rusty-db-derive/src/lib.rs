@@ -71,6 +71,18 @@
 //! use outside a `Session`. See `Mapped::not_deleted_filter` for building
 //! the same "still active" condition into your own queries.
 //!
+//! A field additionally marked `#[table(default = "...")]` (a raw SQL
+//! fragment, e.g. `"CURRENT_TIMESTAMP"` or `"'pending'"` — distinct from a
+//! database-side column `DEFAULT`, which this crate already reflects but
+//! never applies) makes `insert()` substitute that fragment for the column
+//! whenever this struct's field currently equals `Default::default()` for
+//! its type, so `Session::add` can leave a field at its type's default and
+//! still get a real value in the row. Since Rust has no "unset" field
+//! state, a genuine value equal to the type's default (e.g. an explicit
+//! `0`) is indistinguishable from "left unset" and also gets the default
+//! fragment — not usable on a `#[table(primary_key)]` field (a compile
+//! error), since a primary key's value must always be supplied explicitly.
+//!
 //! Field types must implement `Into<Value>` on an owned clone (i.e. the set
 //! of types `Value` already converts from: `bool`, `i64`, `i32`, `f64`,
 //! `String`, `Vec<u8>`, `Uuid`, `BigDecimal`, `Json`, `NaiveDate`,
@@ -168,6 +180,7 @@ struct FieldInfo {
     primary_key: bool,
     version: bool,
     soft_delete: bool,
+    default: Option<syn::LitStr>,
 }
 
 /// The shared shape of `#[has_many(Target, foreign_key = "...")]`,
@@ -347,6 +360,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         let mut primary_key = false;
         let mut version = false;
         let mut soft_delete = false;
+        let mut default: Option<syn::LitStr> = None;
 
         for attr in &field.attrs {
             if !attr.path().is_ident("table") {
@@ -366,12 +380,25 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 } else if meta.path.is_ident("soft_delete") {
                     soft_delete = true;
                     Ok(())
+                } else if meta.path.is_ident("default") {
+                    let lit: syn::LitStr = meta.value()?.parse()?;
+                    default = Some(lit);
+                    Ok(())
                 } else {
                     Err(meta.error(
-                        "unsupported #[table(...)] field attribute; expected `column = \"...\"`, `primary_key`, `version`, or `soft_delete`",
+                        "unsupported #[table(...)] field attribute; expected `column = \"...\"`, `primary_key`, `version`, `soft_delete`, or `default = \"...\"`",
                     ))
                 }
             })?;
+        }
+
+        if default.is_some() && primary_key {
+            return Err(syn::Error::new_spanned(
+                &ident,
+                "#[table(default = \"...\")] cannot be combined with #[table(primary_key)] — \
+                 a primary key's value must always be supplied explicitly, not left for the \
+                 mapping-level default to fill in",
+            ));
         }
 
         fields.push(FieldInfo {
@@ -381,6 +408,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             primary_key,
             version,
             soft_delete,
+            default,
         });
     }
 
@@ -434,7 +462,14 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let insert_calls = fields.iter().map(|f| {
         let ident = &f.ident;
         let column = &f.column;
-        quote! { .value(#column, ::std::clone::Clone::clone(&self.#ident)) }
+        match &f.default {
+            Some(default_lit) => quote! {
+                .maybe_raw_value(#column, #default_lit, ::std::clone::Clone::clone(&self.#ident))
+            },
+            None => quote! {
+                .value(#column, ::std::clone::Clone::clone(&self.#ident))
+            },
+        }
     });
 
     let primary_key_const = match primary_key {

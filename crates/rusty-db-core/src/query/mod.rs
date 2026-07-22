@@ -55,3 +55,26 @@ pub(crate) fn render_value_placeholder(
         dialect.placeholder(params.len())
     }
 }
+
+/// One `INSERT`/bulk-insert assignment: either a bound `Value` (the normal
+/// case, rendered as a placeholder via `render_value_placeholder`) or a raw
+/// SQL fragment inserted verbatim — used for `#[table(default = "...")]`
+/// mapping-level column defaults, where the fragment is the default
+/// expression itself (e.g. `CURRENT_TIMESTAMP`, `0`, `'pending'`) rather
+/// than a value to bind.
+#[derive(Debug, Clone)]
+pub(crate) enum InsertValue {
+    Bound(Value),
+    Raw(String),
+}
+
+pub(crate) fn render_insert_value(
+    value: &InsertValue,
+    dialect: &dyn Dialect,
+    params: &mut Vec<Value>,
+) -> String {
+    match value {
+        InsertValue::Bound(v) => render_value_placeholder(v, dialect, params),
+        InsertValue::Raw(sql) => sql.clone(),
+    }
+}
