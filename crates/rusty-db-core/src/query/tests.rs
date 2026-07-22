@@ -1058,3 +1058,35 @@ fn drop_index_needs_the_table_name_only_on_mysql() {
         "DROP INDEX IF EXISTS `idx_users_email` ON `users`"
     );
 }
+
+#[test]
+fn alter_table_add_column_renders_type_not_null_and_default() {
+    let (sql, params) =
+        AlterTable::add_column("users", "nickname", ColumnType::Text).to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"ALTER TABLE "users" ADD COLUMN "nickname" TEXT"#);
+    assert!(params.is_empty());
+
+    let (sql, _) = AlterTable::add_column("users", "credits", ColumnType::I64)
+        .not_null()
+        .default_raw("0")
+        .to_sql(&NumberedDialect);
+    assert_eq!(
+        sql,
+        r#"ALTER TABLE "users" ADD COLUMN "credits" BIGINT NOT NULL DEFAULT 0"#
+    );
+}
+
+#[test]
+fn alter_table_drop_column_renders_identically_shaped_sql_on_every_dialect() {
+    let (sqlite_sql, _) = AlterTable::drop_column("users", "nickname").to_sql(&QuestionMarkDialect);
+    assert_eq!(sqlite_sql, r#"ALTER TABLE "users" DROP COLUMN "nickname""#);
+
+    let (mysql_sql, _) = AlterTable::drop_column("users", "nickname").to_sql(&MySqlDialect);
+    assert_eq!(mysql_sql, "ALTER TABLE `users` DROP COLUMN `nickname`");
+}
+
+#[test]
+#[should_panic(expected = "only apply to .add_column(...)")]
+fn alter_table_not_null_after_drop_column_panics() {
+    let _ = AlterTable::drop_column("users", "nickname").not_null();
+}
