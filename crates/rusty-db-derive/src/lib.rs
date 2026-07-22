@@ -454,6 +454,17 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let core = core_crate_path();
 
     let column_lits: Vec<&str> = fields.iter().map(|f| f.column.as_str()).collect();
+    let column_specs = fields.iter().map(|f| {
+        let column = &f.column;
+        let (column_type, nullable) = column_type_and_nullable(&core, &f.ty);
+        quote! {
+            #core::ColumnSpec {
+                name: #column,
+                ty: #column_type,
+                nullable: #nullable,
+            }
+        }
+    });
     let from_row_fields = fields.iter().map(|f| {
         let ident = &f.ident;
         let column = &f.column;
@@ -604,6 +615,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         impl #core::Mapped for #struct_ident {
             const TABLE_NAME: &'static str = #table_name;
             const COLUMNS: &'static [&'static str] = &[#(#column_lits),*];
+            const COLUMN_SPECS: &'static [#core::ColumnSpec] = &[#(#column_specs),*];
             const PRIMARY_KEY: ::std::option::Option<&'static str> = #primary_key_const;
             const VERSION_COLUMN: ::std::option::Option<&'static str> = #version_column_const;
             const SOFT_DELETE_COLUMN: ::std::option::Option<&'static str> = #soft_delete_column_const;
@@ -1199,6 +1211,86 @@ fn expand_mapped_newtype(input: DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
+/// Infers `(ColumnType tokens, nullable)` for a `#[derive(Mapped)]` field's
+/// own Rust type, for the `Mapped::COLUMN_SPECS` const schema autogenerate
+/// diffs against a live database. Unwraps `Option<T>` for nullability,
+/// then matches `T`'s own last path segment against every field type this
+/// derive macro documents support for (see the module doc comment).
+/// Anything unrecognized — a `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]`
+/// custom type, a hand-written `Into<Value>` impl, or a `Vec<T>` array of
+/// anything but `u8` (no portable array column type exists yet) — falls
+/// back to `ColumnType::Text`, mirroring `automap::rust_type_for`'s own
+/// fallback-to-`String` policy in the reverse direction. `BigDecimal`'s
+/// precision/scale is a guess (`38, 10`) since Rust's own `BigDecimal`
+/// carries no static precision/scale to read at macro-expansion time.
+fn column_type_and_nullable(core: &TokenStream2, ty: &syn::Type) -> (TokenStream2, bool) {
+    if let Some(inner) = option_inner_type(ty) {
+        let (tokens, _) = column_type_and_nullable(core, inner);
+        return (tokens, true);
+    }
+    (column_type_tokens(core, ty), false)
+}
+
+fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    args.args.iter().find_map(|arg| match arg {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    })
+}
+
+fn column_type_tokens(core: &TokenStream2, ty: &syn::Type) -> TokenStream2 {
+    match type_last_segment_ident(ty).as_deref() {
+        Some("bool") => quote! { #core::ColumnType::Bool },
+        Some("i64") | Some("i32") => quote! { #core::ColumnType::I64 },
+        Some("f64") | Some("f32") => quote! { #core::ColumnType::F64 },
+        Some("String") => quote! { #core::ColumnType::Text },
+        Some("Uuid") => quote! { #core::ColumnType::Uuid },
+        Some("BigDecimal") => quote! { #core::ColumnType::Decimal { precision: 38, scale: 10 } },
+        Some("Json") => quote! { #core::ColumnType::Json },
+        Some("NaiveDate") => quote! { #core::ColumnType::Date },
+        Some("NaiveTime") => quote! { #core::ColumnType::Time },
+        Some("NaiveDateTime") => quote! { #core::ColumnType::DateTime },
+        Some("DateTime") => quote! { #core::ColumnType::TimestampTz },
+        Some("Vec") if is_vec_u8(ty) => quote! { #core::ColumnType::Bytes },
+        _ => quote! { #core::ColumnType::Text },
+    }
+}
+
+fn type_last_segment_ident(ty: &syn::Type) -> Option<String> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+    type_path.path.segments.last().map(|s| s.ident.to_string())
+}
+
+fn is_vec_u8(ty: &syn::Type) -> bool {
+    let syn::Type::Path(type_path) = ty else {
+        return false;
+    };
+    let Some(segment) = type_path.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Vec" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
+    };
+    args.args.iter().any(|arg| {
+        matches!(arg, syn::GenericArgument::Type(syn::Type::Path(p)) if p.path.is_ident("u8"))
+    })
+}
+
 /// Resolves the path to refer to rusty-db-core's items from the caller's
 /// crate, whether they depend on `rusty-db-core` directly or only on the
 /// `rusty-db` facade crate (which re-exports everything this macro needs).
@@ -1228,4 +1320,108 @@ fn core_crate_path() -> TokenStream2 {
     // Best effort: neither dependency was found under its expected name
     // (e.g. a workspace-internal test); fall back to the default path.
     quote!(::rusty_db_core)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_ty(src: &str) -> syn::Type {
+        syn::parse_str(src).unwrap()
+    }
+
+    fn infer(src: &str) -> (String, bool) {
+        let core = quote! { rusty_db_core };
+        let (tokens, nullable) = column_type_and_nullable(&core, &parse_ty(src));
+        (tokens.to_string(), nullable)
+    }
+
+    #[test]
+    fn infers_every_documented_scalar_field_type() {
+        assert_eq!(
+            infer("bool"),
+            ("rusty_db_core :: ColumnType :: Bool".to_string(), false)
+        );
+        assert_eq!(
+            infer("i64"),
+            ("rusty_db_core :: ColumnType :: I64".to_string(), false)
+        );
+        assert_eq!(
+            infer("i32"),
+            ("rusty_db_core :: ColumnType :: I64".to_string(), false)
+        );
+        assert_eq!(
+            infer("f64"),
+            ("rusty_db_core :: ColumnType :: F64".to_string(), false)
+        );
+        assert_eq!(
+            infer("String"),
+            ("rusty_db_core :: ColumnType :: Text".to_string(), false)
+        );
+        assert_eq!(
+            infer("Uuid"),
+            ("rusty_db_core :: ColumnType :: Uuid".to_string(), false)
+        );
+        assert_eq!(
+            infer("Json"),
+            ("rusty_db_core :: ColumnType :: Json".to_string(), false)
+        );
+        assert_eq!(
+            infer("NaiveDate"),
+            ("rusty_db_core :: ColumnType :: Date".to_string(), false)
+        );
+        assert_eq!(
+            infer("NaiveTime"),
+            ("rusty_db_core :: ColumnType :: Time".to_string(), false)
+        );
+        assert_eq!(
+            infer("NaiveDateTime"),
+            ("rusty_db_core :: ColumnType :: DateTime".to_string(), false)
+        );
+        assert_eq!(
+            infer("DateTime<Utc>"),
+            (
+                "rusty_db_core :: ColumnType :: TimestampTz".to_string(),
+                false
+            )
+        );
+        assert_eq!(
+            infer("Vec<u8>"),
+            ("rusty_db_core :: ColumnType :: Bytes".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn bigdecimal_gets_a_default_precision_and_scale() {
+        let (tokens, _) = infer("BigDecimal");
+        assert_eq!(
+            tokens,
+            "rusty_db_core :: ColumnType :: Decimal { precision : 38 , scale : 10 }"
+        );
+    }
+
+    #[test]
+    fn option_wrapping_marks_nullable_but_keeps_the_inner_types_mapping() {
+        let (tokens, nullable) = infer("Option<String>");
+        assert_eq!(tokens, "rusty_db_core :: ColumnType :: Text");
+        assert!(nullable);
+
+        let (tokens, nullable) = infer("Option<i64>");
+        assert_eq!(tokens, "rusty_db_core :: ColumnType :: I64");
+        assert!(nullable);
+    }
+
+    #[test]
+    fn a_vec_of_anything_but_u8_falls_back_to_text_no_portable_array_type_yet() {
+        let (tokens, nullable) = infer("Vec<i64>");
+        assert_eq!(tokens, "rusty_db_core :: ColumnType :: Text");
+        assert!(!nullable);
+    }
+
+    #[test]
+    fn an_unrecognized_custom_type_falls_back_to_text() {
+        let (tokens, nullable) = infer("MyCustomEnum");
+        assert_eq!(tokens, "rusty_db_core :: ColumnType :: Text");
+        assert!(!nullable);
+    }
 }

@@ -50,12 +50,12 @@ pub use rusty_db_mysql as mysql;
 pub mod prelude {
     pub use rusty_db_core::{
         with_timeout, AlterTable, AuditEntry, AuditOperation, BigDecimal, BoxStream, BulkInsert,
-        Case, Column, ColumnInfo, ColumnType, CreateIndex, CreateTable, Cte, DatabaseDump,
-        DateTime, Delete, DropIndex, DropTable, Engine, Entity, Expr, FromRow, Identifiable,
-        Insert, Join, JoinKind, Json, Lifecycle, Mapped, Migration, Migrator, NaiveDate,
-        NaiveDateTime, NaiveTime, PoolConfig, PoolStats, ReplicaSet, Row, Savepoint, Select,
-        SelectExpr, Session, SessionQuery, SetOperation, StreamExt, Table, TableDump, TableSchema,
-        ToSql, Transaction, Update, Utc, Uuid, Value, Window,
+        Case, Column, ColumnInfo, ColumnSpec, ColumnType, CreateIndex, CreateTable, Cte,
+        DatabaseDump, DateTime, Delete, DropIndex, DropTable, Engine, Entity, Expr, FromRow,
+        Identifiable, Insert, Join, JoinKind, Json, Lifecycle, Mapped, Migration, Migrator,
+        NaiveDate, NaiveDateTime, NaiveTime, PoolConfig, PoolStats, ReplicaSet, Row, Savepoint,
+        Select, SelectExpr, Session, SessionQuery, SetOperation, StreamExt, Table, TableDump,
+        TableSchema, TableSpec, ToSql, Transaction, Update, Utc, Uuid, Value, Window,
     };
 
     // `Mapped` above is the trait (type namespace); this is the derive

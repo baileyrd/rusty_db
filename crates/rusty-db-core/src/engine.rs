@@ -245,6 +245,31 @@ impl Engine {
         Ok(out)
     }
 
+    /// Diffs `expected` (one `crate::autogenerate::TableSpec::of::<T>()`
+    /// per `#[derive(Mapped)]` type to track) against this database's
+    /// live schema, returning the DDL statements (rendered SQL text)
+    /// needed to reconcile them — for review, never executed
+    /// automatically. Only reflects the specific tables named in
+    /// `expected`, not the whole database. See `crate::autogenerate` for
+    /// exactly what is and isn't detected (no whole-table drops, no
+    /// type-change detection, no rename detection).
+    pub async fn autogenerate_migration(
+        &self,
+        expected: &[crate::autogenerate::TableSpec],
+    ) -> Result<Vec<String>> {
+        let mut existing = std::collections::HashMap::new();
+        for table in expected {
+            if let Some(schema) = self.table_schema(&table.name).await? {
+                existing.insert(table.name.clone(), schema);
+            }
+        }
+        Ok(crate::autogenerate::diff(
+            self.dialect(),
+            expected,
+            &existing,
+        ))
+    }
+
     /// A snapshot of the underlying connection pool: how many connections
     /// are open, idle, and in use against `max_connections`, how many
     /// callers are waiting on one right now, and how many acquires have

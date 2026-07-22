@@ -7,7 +7,7 @@ use crate::value::Value;
 /// native-vs-fallback split already documented on `Value`'s own variants
 /// (e.g. `Uuid` is a native column type on Postgres, `TEXT`/`CHAR(36)`
 /// elsewhere).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColumnType {
     Bool,
     I64,

@@ -11,6 +11,7 @@
 //! gets passed to `Engine::new`.
 
 pub mod audit;
+pub mod autogenerate;
 pub mod automap;
 pub mod backup;
 pub mod connection;
@@ -30,12 +31,13 @@ pub mod timeout;
 pub mod value;
 
 pub use audit::{AuditEntry, AuditOperation};
+pub use autogenerate::TableSpec;
 pub use backup::{DatabaseDump, TableDump};
 pub use connection::{Connection, Driver, Executor};
 pub use dialect::Dialect;
 pub use engine::{Engine, Transaction};
 pub use error::{Error, Result};
-pub use mapping::{Entity, FromRow, Identifiable, Lifecycle, Mapped};
+pub use mapping::{ColumnSpec, Entity, FromRow, Identifiable, Lifecycle, Mapped};
 pub use migration::{AppliedMigration, Migration, Migrator};
 pub use pool::{PoolConfig, PoolMetrics, PoolStats};
 pub use query::{

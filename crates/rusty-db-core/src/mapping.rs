@@ -1,7 +1,22 @@
 use crate::error::Result;
-use crate::query::{Delete, Expr, Insert, Table, Update};
+use crate::query::{ColumnType, Delete, Expr, Insert, Table, Update};
 use crate::row::Row;
 use crate::value::Value;
+
+/// One column `#[derive(Mapped)]` knows about for a field's own Rust
+/// type — its name, a portable `ColumnType` inferred from that type, and
+/// whether the field was `Option<_>` (nullable). Doesn't capture anything
+/// declared *beyond* the field's type itself (no uniqueness, foreign
+/// keys, or check constraints — those live only in hand-written DDL);
+/// enough to build a `CreateTable` for a brand-new table, or diff column
+/// presence against a live `TableSchema` (see `autogenerate`), not a
+/// full round-trip of everything `#[table(...)]` can express.
+#[derive(Debug, Clone, Copy)]
+pub struct ColumnSpec {
+    pub name: &'static str,
+    pub ty: ColumnType,
+    pub nullable: bool,
+}
 
 /// Describes the table a struct maps to. Implemented by `#[derive(Mapped)]`
 /// (from `rusty-db-derive`), not meant to be implemented by hand.
@@ -11,6 +26,12 @@ pub trait Mapped {
 
     /// Column names, in field declaration order.
     const COLUMNS: &'static [&'static str];
+
+    /// Each column's portable type + nullability, in field declaration
+    /// order — see `ColumnSpec`. Empty by default (matching every other
+    /// `Mapped` const's graceful-degradation default), populated by
+    /// `#[derive(Mapped)]` for every real generated impl.
+    const COLUMN_SPECS: &'static [ColumnSpec] = &[];
 
     /// The column marked `#[table(primary_key)]`, if any.
     const PRIMARY_KEY: Option<&'static str> = None;
