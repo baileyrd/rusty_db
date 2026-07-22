@@ -42,7 +42,9 @@ async fn generated_ddl_applies_and_converges_on_mysql() -> rusty_db::Result<()> 
         .await?;
 
     let expected = vec![TableSpec::of::<Customer>()];
-    let statements = engine.autogenerate_migration(&expected).await?;
+    let statements = engine
+        .autogenerate_migration(&expected, &AutogenerateOptions::default())
+        .await?;
     assert_eq!(statements.len(), 1);
     assert!(statements[0].contains("JSON"));
 
@@ -63,7 +65,9 @@ async fn generated_ddl_applies_and_converges_on_mysql() -> rusty_db::Result<()> 
     assert_eq!(rows.len(), 1);
 
     assert_eq!(
-        engine.autogenerate_migration(&expected).await?,
+        engine
+            .autogenerate_migration(&expected, &AutogenerateOptions::default())
+            .await?,
         Vec::<String>::new()
     );
 

@@ -283,20 +283,30 @@ struct AddColumnDef {
     default: Option<String>,
 }
 
+// The shared `*Column` postfix is the point, not an accident worth
+// renaming away: every variant genuinely is a column-level operation.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
 enum AlterOperation {
     AddColumn(AddColumnDef),
     DropColumn(String),
+    RenameColumn { old_name: String, new_name: String },
 }
 
 /// Builds a portable `ALTER TABLE` statement — always exactly *one*
-/// operation (`ADD COLUMN` or `DROP COLUMN`), never several combined into
-/// one statement: Postgres and MySQL/MariaDB both allow comma-separating
-/// multiple actions in a single `ALTER TABLE`, but SQLite only ever allows
-/// one action per statement, so combining several would render
-/// differently — or fail outright — per dialect. Modifying several
-/// columns means calling `engine.execute(...)` once per `AlterTable`,
-/// which works identically everywhere.
+/// operation (`ADD COLUMN`, `DROP COLUMN`, or `RENAME COLUMN`), never
+/// several combined into one statement: Postgres and MySQL/MariaDB both
+/// allow comma-separating multiple actions in a single `ALTER TABLE`, but
+/// SQLite only ever allows one action per statement, so combining several
+/// would render differently — or fail outright — per dialect. Modifying
+/// several columns means calling `engine.execute(...)` once per
+/// `AlterTable`, which works identically everywhere.
+///
+/// `RENAME COLUMN <old> TO <new>` happens to be spelled identically on
+/// all three dialects (SQLite since 3.25.0, MySQL/MariaDB since 8.0/10.5.2,
+/// both well below anything this crate otherwise assumes), so
+/// `rename_column` needs no per-dialect branching the way `add_column`'s
+/// type spelling does.
 ///
 /// Adding a `NOT NULL` column with no default to a table that already has
 /// rows is rejected by the database itself (there'd be no value for
@@ -348,10 +358,27 @@ impl AlterTable {
         }
     }
 
+    /// `ALTER TABLE <table> RENAME COLUMN <old_name> TO <new_name>` —
+    /// preserves the column's data, unlike issuing a `drop_column` plus an
+    /// `add_column` for what was actually just a rename.
+    pub fn rename_column(
+        table: impl Into<String>,
+        old_name: impl Into<String>,
+        new_name: impl Into<String>,
+    ) -> Self {
+        AlterTable {
+            table: table.into(),
+            operation: AlterOperation::RenameColumn {
+                old_name: old_name.into(),
+                new_name: new_name.into(),
+            },
+        }
+    }
+
     fn added_column(&mut self) -> &mut AddColumnDef {
         match &mut self.operation {
             AlterOperation::AddColumn(def) => def,
-            AlterOperation::DropColumn(_) => {
+            AlterOperation::DropColumn(_) | AlterOperation::RenameColumn { .. } => {
                 panic!("AlterTable: .not_null()/.default_raw() only apply to .add_column(...)")
             }
         }
@@ -396,6 +423,12 @@ impl ToSql for AlterTable {
                 "ALTER TABLE {} DROP COLUMN {}",
                 dialect.quote_ident(&self.table),
                 dialect.quote_ident(name)
+            ),
+            AlterOperation::RenameColumn { old_name, new_name } => format!(
+                "ALTER TABLE {} RENAME COLUMN {} TO {}",
+                dialect.quote_ident(&self.table),
+                dialect.quote_ident(old_name),
+                dialect.quote_ident(new_name)
             ),
         };
         (sql, Vec::new())

@@ -8,32 +8,44 @@
 //! one side of an existing table.
 //!
 //! Deliberately conservative, in the same "starting point, not a
-//! replacement" spirit as `automap`:
-//! - **Never proposes dropping a whole table.** A table this diff
-//!   doesn't recognize might not be tracked by the caller's `expected`
-//!   list at all (a different part of the same app, this crate's own
-//!   migration/audit-log bookkeeping tables, a schema shared with
-//!   something else) — there's no way to tell "not currently mapped"
-//!   from "meant to be deleted" from this list alone, so removing a
-//!   `#[derive(Mapped)]` type's own table needs a hand-written
-//!   `DropTable` migration.
-//! - **Only diffs column presence, never type.** A live column's
-//!   `type_name` is dialect-native, verbatim text (see `schema.rs`) with
-//!   no portable representation to compare `ColumnType` against without
-//!   reimplementing `automap::rust_type_for`'s heuristic in reverse, per
-//!   dialect — changing a field's type without renaming it produces no
-//!   suggested statement at all; review type-level changes by hand.
-//! - **Never detects a rename.** Renaming a field is reported as one
-//!   unrelated `AlterTable::drop_column` plus one unrelated
-//!   `AlterTable::add_column` — running both, in that order, loses the
-//!   column's data rather than preserving it. This is the same
+//! replacement" spirit as `automap` — and, for the two things below that
+//! genuinely can't be inferred from `expected`/`existing` alone, the fix
+//! isn't a smarter heuristic but an explicit, opt-in `AutogenerateOptions`
+//! the caller fills in by hand:
+//! - **Never proposes dropping a whole table, unless explicitly
+//!   allow-listed.** A table this diff doesn't recognize might not be
+//!   tracked by the caller's `expected` list at all (a different part of
+//!   the same app, this crate's own migration/audit-log bookkeeping
+//!   tables, a schema shared with something else) — there's no way to
+//!   tell "not currently mapped" from "meant to be deleted" from this
+//!   list alone. `AutogenerateOptions::allow_drop_tables` is exactly that
+//!   missing say-so: name a table there and, if it's live but absent from
+//!   `expected`, a `DropTable` is proposed for it; leave it off (the
+//!   default) and an unrecognized live table is left completely alone.
+//! - **Never detects a rename, unless explicitly hinted.** Renaming a
+//!   field is otherwise reported as one unrelated `AlterTable::drop_column`
+//!   plus one unrelated `AlterTable::add_column` — running both, in that
+//!   order, loses the column's data rather than preserving it, the same
 //!   rename-blindness Alembic's own autogenerate is well known for.
+//!   `AutogenerateOptions::renamed_columns` lets the caller say "this
+//!   table's column was renamed from X to Y" up front, producing a single
+//!   data-preserving `AlterTable::rename_column` instead — but only when
+//!   the hint actually matches what's live (the old name still present,
+//!   the new name expected but not yet live); a stale or irrelevant hint
+//!   is simply ignored rather than forced.
+//!
+//! Still entirely unaddressed: **diffing column type**. A live column's
+//! `type_name` is dialect-native, verbatim text (see `schema.rs`) with no
+//! portable representation to compare `ColumnType` against without
+//! reimplementing `automap::rust_type_for`'s heuristic in reverse, per
+//! dialect — changing a field's type without renaming it produces no
+//! suggested statement at all; review type-level changes by hand.
 
 use std::collections::HashMap;
 
 use crate::dialect::Dialect;
 use crate::mapping::{ColumnSpec, Mapped};
-use crate::query::{AlterTable, CreateTable, ToSql};
+use crate::query::{AlterTable, CreateTable, DropTable, ToSql};
 use crate::schema::TableSchema;
 
 /// One table's expected shape, built from a `#[derive(Mapped)]` type's
@@ -57,19 +69,64 @@ impl TableSpec {
     }
 }
 
+/// Explicit, opt-in inputs to `diff`/`Engine::autogenerate_migration` for
+/// the two things it can't safely infer from `expected`/`existing` alone
+/// — see the module doc for why each needs a caller's say-so rather than
+/// a heuristic. Both default to empty, giving back exactly v1's
+/// conservative behavior.
+#[derive(Debug, Clone, Default)]
+pub struct AutogenerateOptions {
+    /// `(table, old_column_name, new_column_name)` hints. Only acted on
+    /// when the hint actually matches what's live: `old_column_name` is
+    /// still a live column of `table` and `new_column_name` is expected
+    /// but not already live — otherwise it's silently ignored rather than
+    /// forced onto a shape it no longer describes.
+    pub renamed_columns: Vec<(String, String, String)>,
+    /// Table names allowed to be proposed for a whole `DropTable` if
+    /// they're live but absent from `expected`. A live table *not* named
+    /// here is always left alone, regardless of what `expected` contains.
+    pub allow_drop_tables: Vec<String>,
+}
+
+impl AutogenerateOptions {
+    fn renamed_column_for<'a>(
+        &'a self,
+        table: &str,
+        live_columns: &std::collections::HashSet<&str>,
+        expected_columns: &std::collections::HashSet<&str>,
+    ) -> HashMap<&'a str, &'a str> {
+        self.renamed_columns
+            .iter()
+            .filter(|(t, old_name, new_name)| {
+                t == table
+                    && live_columns.contains(old_name.as_str())
+                    && expected_columns.contains(new_name.as_str())
+                    && !live_columns.contains(new_name.as_str())
+            })
+            .map(|(_, old_name, new_name)| (old_name.as_str(), new_name.as_str()))
+            .collect()
+    }
+}
+
 /// Generates the DDL (as rendered SQL text, in the order it should run)
 /// needed to bring `existing` in line with `expected` — see the module
-/// doc for exactly what is and isn't detected. `existing` is keyed by
-/// table name; a table in `expected` with no entry in `existing` is
-/// treated as not existing yet (a brand-new `CreateTable`).
+/// doc for exactly what is and isn't detected, and what `options` lets a
+/// caller opt into beyond that. `existing` is keyed by table name; a
+/// table in `expected` with no entry in `existing` is treated as not
+/// existing yet (a brand-new `CreateTable`). `existing` may also contain
+/// tables absent from `expected` — those are only ever considered for
+/// `options.allow_drop_tables`, never anything else.
 pub fn diff(
     dialect: &dyn Dialect,
     expected: &[TableSpec],
     existing: &HashMap<String, TableSchema>,
+    options: &AutogenerateOptions,
 ) -> Vec<String> {
     let mut statements = Vec::new();
+    let mut expected_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for table in expected {
+        expected_names.insert(table.name.as_str());
         match existing.get(&table.name) {
             None => {
                 let mut create = CreateTable::new(&table.name);
@@ -87,8 +144,23 @@ pub fn diff(
             Some(live) => {
                 let live_columns: std::collections::HashSet<&str> =
                     live.columns.iter().map(|c| c.name.as_str()).collect();
+                let expected_columns: std::collections::HashSet<&str> =
+                    table.columns.iter().map(|c| c.name).collect();
+                let renamed_from =
+                    options.renamed_column_for(&table.name, &live_columns, &expected_columns);
+                let renamed_to: HashMap<&str, &str> =
+                    renamed_from.iter().map(|(&old, &new)| (new, old)).collect();
+
+                for (&old_name, &new_name) in &renamed_from {
+                    statements.push(
+                        AlterTable::rename_column(&table.name, old_name, new_name)
+                            .to_sql(dialect)
+                            .0,
+                    );
+                }
+
                 for col in &table.columns {
-                    if !live_columns.contains(col.name) {
+                    if !live_columns.contains(col.name) && !renamed_to.contains_key(col.name) {
                         let mut alter = AlterTable::add_column(&table.name, col.name, col.ty);
                         if !col.nullable {
                             alter = alter.not_null();
@@ -97,10 +169,10 @@ pub fn diff(
                     }
                 }
 
-                let expected_columns: std::collections::HashSet<&str> =
-                    table.columns.iter().map(|c| c.name).collect();
                 for live_col in &live.columns {
-                    if !expected_columns.contains(live_col.name.as_str()) {
+                    if !expected_columns.contains(live_col.name.as_str())
+                        && !renamed_from.contains_key(live_col.name.as_str())
+                    {
                         statements.push(
                             AlterTable::drop_column(&table.name, &live_col.name)
                                 .to_sql(dialect)
@@ -109,6 +181,14 @@ pub fn diff(
                     }
                 }
             }
+        }
+    }
+
+    for table_name in existing.keys() {
+        if !expected_names.contains(table_name.as_str())
+            && options.allow_drop_tables.iter().any(|t| t == table_name)
+        {
+            statements.push(DropTable::new(table_name).to_sql(dialect).0);
         }
     }
 
@@ -160,7 +240,12 @@ mod tests {
         )];
         let existing = HashMap::new();
 
-        let statements = diff(&QuestionMarkDialect, &expected, &existing);
+        let statements = diff(
+            &QuestionMarkDialect,
+            &expected,
+            &existing,
+            &AutogenerateOptions::default(),
+        );
         assert_eq!(statements.len(), 1);
         assert_eq!(
             statements[0],
@@ -189,7 +274,12 @@ mod tests {
         );
 
         assert_eq!(
-            diff(&QuestionMarkDialect, &expected, &existing),
+            diff(
+                &QuestionMarkDialect,
+                &expected,
+                &existing,
+                &AutogenerateOptions::default(),
+            ),
             Vec::<String>::new()
         );
     }
@@ -217,7 +307,12 @@ mod tests {
             },
         );
 
-        let statements = diff(&QuestionMarkDialect, &expected, &existing);
+        let statements = diff(
+            &QuestionMarkDialect,
+            &expected,
+            &existing,
+            &AutogenerateOptions::default(),
+        );
         assert_eq!(
             statements,
             vec![r#"ALTER TABLE "users" ADD COLUMN "nickname" TEXT"#.to_string()]
@@ -244,7 +339,12 @@ mod tests {
             },
         );
 
-        let statements = diff(&QuestionMarkDialect, &expected, &existing);
+        let statements = diff(
+            &QuestionMarkDialect,
+            &expected,
+            &existing,
+            &AutogenerateOptions::default(),
+        );
         assert_eq!(
             statements,
             vec![r#"ALTER TABLE "users" DROP COLUMN "legacy_flag""#.to_string()]
@@ -284,7 +384,146 @@ mod tests {
         );
 
         assert_eq!(
-            diff(&QuestionMarkDialect, &expected, &existing),
+            diff(
+                &QuestionMarkDialect,
+                &expected,
+                &existing,
+                &AutogenerateOptions::default(),
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_matching_rename_hint_produces_a_rename_column_instead_of_drop_plus_add() {
+        let expected = vec![table_spec(
+            "users",
+            vec![
+                spec("id", ColumnType::I64, false),
+                spec("display_name", ColumnType::Text, false),
+            ],
+            Some("id"),
+        )];
+        let mut existing = HashMap::new();
+        existing.insert(
+            "users".to_string(),
+            TableSchema {
+                name: "users".to_string(),
+                columns: vec![live_column("id", false), live_column("nickname", false)],
+                unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                indexes: Vec::new(),
+            },
+        );
+        let options = AutogenerateOptions {
+            renamed_columns: vec![(
+                "users".to_string(),
+                "nickname".to_string(),
+                "display_name".to_string(),
+            )],
+            allow_drop_tables: Vec::new(),
+        };
+
+        let statements = diff(&QuestionMarkDialect, &expected, &existing, &options);
+        assert_eq!(
+            statements,
+            vec![r#"ALTER TABLE "users" RENAME COLUMN "nickname" TO "display_name""#.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_stale_rename_hint_is_ignored_and_falls_back_to_drop_plus_add() {
+        // The hint claims "foo was renamed to bar", but "foo" isn't actually
+        // live anymore (maybe it really was already renamed, or the hint is
+        // just wrong) — it shouldn't be forced onto a shape that no longer
+        // matches; ordinary add/drop diffing takes over instead.
+        let expected = vec![table_spec(
+            "users",
+            vec![
+                spec("id", ColumnType::I64, false),
+                spec("bar", ColumnType::Text, false),
+            ],
+            Some("id"),
+        )];
+        let mut existing = HashMap::new();
+        existing.insert(
+            "users".to_string(),
+            TableSchema {
+                name: "users".to_string(),
+                columns: vec![live_column("id", false), live_column("baz", false)],
+                unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                indexes: Vec::new(),
+            },
+        );
+        let options = AutogenerateOptions {
+            renamed_columns: vec![("users".to_string(), "foo".to_string(), "bar".to_string())],
+            allow_drop_tables: Vec::new(),
+        };
+
+        let mut statements = diff(&QuestionMarkDialect, &expected, &existing, &options);
+        statements.sort();
+        assert_eq!(
+            statements,
+            vec![
+                r#"ALTER TABLE "users" ADD COLUMN "bar" TEXT NOT NULL"#.to_string(),
+                r#"ALTER TABLE "users" DROP COLUMN "baz""#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_allow_listed_table_absent_from_expected_gets_a_drop_table() {
+        let expected: Vec<TableSpec> = Vec::new();
+        let mut existing = HashMap::new();
+        existing.insert(
+            "legacy_sessions".to_string(),
+            TableSchema {
+                name: "legacy_sessions".to_string(),
+                columns: vec![live_column("id", false)],
+                unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                indexes: Vec::new(),
+            },
+        );
+        let options = AutogenerateOptions {
+            renamed_columns: Vec::new(),
+            allow_drop_tables: vec!["legacy_sessions".to_string()],
+        };
+
+        let statements = diff(&QuestionMarkDialect, &expected, &existing, &options);
+        assert_eq!(
+            statements,
+            vec![r#"DROP TABLE "legacy_sessions""#.to_string()]
+        );
+    }
+
+    #[test]
+    fn a_live_table_absent_from_expected_and_not_allow_listed_is_left_alone() {
+        let expected: Vec<TableSpec> = Vec::new();
+        let mut existing = HashMap::new();
+        existing.insert(
+            "legacy_sessions".to_string(),
+            TableSchema {
+                name: "legacy_sessions".to_string(),
+                columns: vec![live_column("id", false)],
+                unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                indexes: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            diff(
+                &QuestionMarkDialect,
+                &expected,
+                &existing,
+                &AutogenerateOptions::default(),
+            ),
             Vec::<String>::new()
         );
     }

@@ -78,9 +78,12 @@ automap-style `#[derive(Mapped)]` struct generation from live schema
 reflection (`Engine::automap_table`/`automap_all`); Alembic-style
 autogenerate diffing a set of `#[derive(Mapped)]` types' expected shape
 against a live database, generating `CreateTable`/`AlterTable` DDL for
-review (`Engine::autogenerate_migration`, `TableSpec`) — v1 only diffs
-column presence, never a rename, a type change, or a whole table to drop
-(see the "Autogenerate v2" item below); and `ShardRouter`, routing to one
+review (`Engine::autogenerate_migration`, `TableSpec`), with
+`AutogenerateOptions` opting into a caller-hinted column rename
+(`AlterTable::rename_column`, spelled identically on all three dialects)
+or an explicitly allow-listed whole-table drop, beyond the conservative
+add/drop-column default — still never a type change either way (see
+"Autogenerate type-change detection" below); and `ShardRouter`, routing to one
 of several `Engine`s by hashing a caller-supplied key, via either naive
 modulo hashing (`ShardRouter::new`) or a consistent-hash ring
 (`ShardRouter::new_consistent`, remapping only a minority of keys when
@@ -91,19 +94,20 @@ missing). See `README.md` for the full tour with examples.
 
 ## Schema / DDL / reflection
 
-- **Autogenerate v2** — `Engine::autogenerate_migration`'s v1 diff
-  deliberately only detects column presence: never a rename (reported as
-  an unrelated drop-then-add, losing the column's data if both are run),
-  never a type change (no portable representation to compare a live
-  column's dialect-native `type_name` against `ColumnType` without
-  reimplementing `automap::rust_type_for`'s heuristic in reverse, per
-  dialect), and never a whole table to drop (no way to tell "not
-  currently tracked" from "meant to be deleted" from the `expected` list
-  alone) — see its own module doc for the full reasoning. Closing any of
-  these needs either a richer per-dialect diffing heuristic or an
-  explicit, opt-in surface for what can't be inferred safely (e.g. a
-  caller-supplied "this was renamed from X" hint, or an explicit "yes,
-  really drop this" allowlist rather than inferring it). **M**
+- **Autogenerate type-change detection** — `Engine::autogenerate_migration`
+  now closes the rename and whole-table-drop gaps via explicit, opt-in
+  `AutogenerateOptions` (a caller-supplied rename hint, an allow-listed
+  drop), but still never detects a column's *type* changing: a live
+  column's `type_name` is dialect-native, verbatim text with no portable
+  representation to compare `ColumnType` against without reimplementing
+  `automap::rust_type_for`'s heuristic in reverse, per dialect — changing
+  a field's type without renaming it produces no suggested statement at
+  all. Closing this needs either that reverse heuristic (per dialect) or
+  its own opt-in surface (e.g. a caller-supplied "this column's new type
+  is X" hint, mirroring how renames are already handled) — plus, once a
+  type change is detected at all, a real `AlterTable` operation to render
+  it as (`ALTER COLUMN ... TYPE ...`/`MODIFY COLUMN`/SQLite's
+  table-rebuild dance), which doesn't exist yet either. **M**
 
 ## Mapping / derive macro (`#[derive(Mapped)]`)
 

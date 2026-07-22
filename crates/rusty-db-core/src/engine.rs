@@ -249,13 +249,16 @@ impl Engine {
     /// per `#[derive(Mapped)]` type to track) against this database's
     /// live schema, returning the DDL statements (rendered SQL text)
     /// needed to reconcile them — for review, never executed
-    /// automatically. Only reflects the specific tables named in
-    /// `expected`, not the whole database. See `crate::autogenerate` for
-    /// exactly what is and isn't detected (no whole-table drops, no
-    /// type-change detection, no rename detection).
+    /// automatically. Only reflects the tables named in `expected` plus
+    /// any named in `options.allow_drop_tables`, never the whole
+    /// database. See `crate::autogenerate` for exactly what is and isn't
+    /// detected, and what `AutogenerateOptions` lets a caller opt into
+    /// (column renames, whole-table drops) beyond the conservative
+    /// default (still no type-change detection either way).
     pub async fn autogenerate_migration(
         &self,
         expected: &[crate::autogenerate::TableSpec],
+        options: &crate::autogenerate::AutogenerateOptions,
     ) -> Result<Vec<String>> {
         let mut existing = std::collections::HashMap::new();
         for table in expected {
@@ -263,10 +266,19 @@ impl Engine {
                 existing.insert(table.name.clone(), schema);
             }
         }
+        for table_name in &options.allow_drop_tables {
+            if existing.contains_key(table_name) {
+                continue;
+            }
+            if let Some(schema) = self.table_schema(table_name).await? {
+                existing.insert(table_name.clone(), schema);
+            }
+        }
         Ok(crate::autogenerate::diff(
             self.dialect(),
             expected,
             &existing,
+            options,
         ))
     }
 
