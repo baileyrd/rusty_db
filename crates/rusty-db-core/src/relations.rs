@@ -6,6 +6,23 @@
 //! convenience methods around. Both take a batch of already-fetched rows
 //! and issue exactly one extra query for the whole batch, rather than one
 //! query per row (the N+1 problem).
+//!
+//! The `*_via_subquery` functions further down are a second strategy for
+//! the same four relationship shapes — SQLAlchemy calls this
+//! `subqueryload`. Rather than collecting a batch of already-fetched
+//! parent keys into Rust and shipping them back as a literal `IN (...)`
+//! list (what every function above does), the caller instead hands over a
+//! `Select` — however it's filtered/joined — that picks out the *parent*
+//! side's key column, and the matching row is found by joining against
+//! that `Select` directly, wrapped as a `WITH` CTE (see `Cte`/
+//! `Select::with`), letting the database compute the matching set
+//! server-side in one round trip instead of two. This is the same trick
+//! that gives this crate `IN (subquery)` support and a genuine `FROM`
+//! subquery for free, without a new "derived table" primitive: a CTE is
+//! already just a named, referenceable result set.
+//!
+//! Not (yet) wired into `#[has_many(...)]`/etc. as an opt-in `strategy`
+//! the way the plain functions above are — call these directly.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -13,7 +30,8 @@ use std::hash::Hash;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::mapping::{FromRow, Mapped};
-use crate::query::{Select, Table};
+use crate::query::{Cte, Select, Table};
+use crate::row::Row;
 use crate::value::{FromValue, Value};
 
 /// Has-many eager load: given the primary keys of a batch of
@@ -177,4 +195,200 @@ where
     }
 
     Ok(by_key)
+}
+
+const SUBQUERY_CTE_NAME: &str = "_rusty_db_eager_load_ids";
+
+/// Shared machinery for every `*_via_subquery` function below: wraps
+/// `ids` as a `WITH _rusty_db_eager_load_ids AS (...)` CTE, hands
+/// `build_query` a `Table` reference to that CTE (referenceable exactly
+/// like any other table — `cte.col(...)` — since that's all a CTE
+/// reference ever is), and runs whatever `Select` it builds.
+async fn query_via_subquery(
+    engine: &Engine,
+    ids: Select,
+    build_query: impl FnOnce(&Table) -> Select,
+) -> Result<Vec<Row>> {
+    let cte_table = Table::new(SUBQUERY_CTE_NAME);
+    let cte = Cte::new(SUBQUERY_CTE_NAME, ids);
+    let query = build_query(&cte_table).with([cte]);
+    engine.fetch_all(&query).await
+}
+
+/// Has-many eager load via the "subqueryload" strategy: like `load_many`,
+/// but instead of a batch of already-fetched parent keys, takes
+/// `parent_ids` — a `Select` selecting just one column, named
+/// `parent_pk_column`, filtered/joined however the caller wants the
+/// parent batch chosen (e.g. `Select::from(&users).columns([users.col("id")]).filter(...)`).
+/// `Child` rows are found by joining directly against `parent_ids`
+/// (wrapped as a CTE) rather than shipping a literal key list back and
+/// forth — better suited when the parent batch is large or itself the
+/// result of a nontrivial query; for an already-in-hand list of keys,
+/// `load_many` avoids the extra CTE/join machinery.
+pub async fn load_many_via_subquery<Child, PK>(
+    engine: &Engine,
+    parent_ids: Select,
+    parent_pk_column: &str,
+    fk_column: &str,
+) -> Result<HashMap<PK, Vec<Child>>>
+where
+    Child: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash,
+{
+    let child_table = Table::new(Child::TABLE_NAME);
+
+    let rows = query_via_subquery(engine, parent_ids, |cte| {
+        Select::from(&child_table)
+            .join(
+                cte,
+                child_table
+                    .col(fk_column)
+                    .eq_col(&cte.col(parent_pk_column)),
+            )
+            .columns(Child::COLUMNS.iter().map(|c| child_table.col(*c)))
+    })
+    .await?;
+
+    let mut grouped: HashMap<PK, Vec<Child>> = HashMap::new();
+    for row in rows {
+        let key: PK = row.get_by_name(fk_column)?;
+        let child = Child::from_row(&row)?;
+        grouped.entry(key).or_default().push(child);
+    }
+
+    Ok(grouped)
+}
+
+/// Has-one eager load via the "subqueryload" strategy — see
+/// `load_many_via_subquery` for what `parent_ids`/`parent_pk_column` mean,
+/// and `load_has_one` for the one-to-one conflict check this shares.
+pub async fn load_has_one_via_subquery<Child, PK>(
+    engine: &Engine,
+    parent_ids: Select,
+    parent_pk_column: &str,
+    fk_column: &str,
+) -> Result<HashMap<PK, Child>>
+where
+    Child: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash,
+{
+    let child_table = Table::new(Child::TABLE_NAME);
+
+    let rows = query_via_subquery(engine, parent_ids, |cte| {
+        Select::from(&child_table)
+            .join(
+                cte,
+                child_table
+                    .col(fk_column)
+                    .eq_col(&cte.col(parent_pk_column)),
+            )
+            .columns(Child::COLUMNS.iter().map(|c| child_table.col(*c)))
+    })
+    .await?;
+
+    let mut by_key: HashMap<PK, Child> = HashMap::new();
+    for row in rows {
+        let key: PK = row.get_by_name(fk_column)?;
+        let child = Child::from_row(&row)?;
+        if by_key.insert(key, child).is_some() {
+            return Err(Error::Conflict(format!(
+                "has_one: more than one {:?} row shares the same {fk_column:?} value, \
+                 so this isn't actually a one-to-one relationship",
+                Child::TABLE_NAME
+            )));
+        }
+    }
+
+    Ok(by_key)
+}
+
+/// Belongs-to (many-to-one) eager load via the "subqueryload" strategy:
+/// like `load_one`, but instead of a batch of already-fetched children's
+/// foreign key values, takes `foreign_key_ids` — a `Select` selecting
+/// just one column, named `fk_column`, scoped to whatever child batch the
+/// caller cares about. `Parent` rows are found by joining directly
+/// against `foreign_key_ids` (wrapped as a CTE) rather than shipping a
+/// literal key list back and forth.
+pub async fn load_one_via_subquery<Parent, PK>(
+    engine: &Engine,
+    foreign_key_ids: Select,
+    fk_column: &str,
+    parent_key_column: &str,
+) -> Result<HashMap<PK, Parent>>
+where
+    Parent: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash,
+{
+    let parent_table = Table::new(Parent::TABLE_NAME);
+
+    let rows = query_via_subquery(engine, foreign_key_ids, |cte| {
+        Select::from(&parent_table)
+            .join(
+                cte,
+                parent_table
+                    .col(parent_key_column)
+                    .eq_col(&cte.col(fk_column)),
+            )
+            .columns(Parent::COLUMNS.iter().map(|c| parent_table.col(*c)))
+    })
+    .await?;
+
+    let mut by_key: HashMap<PK, Parent> = HashMap::new();
+    for row in rows {
+        let key: PK = row.get_by_name(parent_key_column)?;
+        let parent = Parent::from_row(&row)?;
+        by_key.insert(key, parent);
+    }
+
+    Ok(by_key)
+}
+
+/// Many-to-many eager load via the "subqueryload" strategy — see
+/// `load_many_to_many` for what `through_table`/`local_key_column`/
+/// `foreign_key_column`/`target_key_column` mean; `parent_ids`/
+/// `parent_pk_column` are the same as `load_many_via_subquery`'s.
+pub async fn load_many_to_many_via_subquery<Target, PK>(
+    engine: &Engine,
+    parent_ids: Select,
+    parent_pk_column: &str,
+    through_table: &str,
+    local_key_column: &str,
+    foreign_key_column: &str,
+    target_key_column: &str,
+) -> Result<HashMap<PK, Vec<Target>>>
+where
+    Target: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash,
+{
+    let target = Table::new(Target::TABLE_NAME);
+    let through = Table::new(through_table);
+
+    let rows = query_via_subquery(engine, parent_ids, |cte| {
+        let mut select_columns = vec![through.col(local_key_column)];
+        select_columns.extend(Target::COLUMNS.iter().map(|c| target.col(*c)));
+        Select::from(&target)
+            .join(
+                &through,
+                target
+                    .col(target_key_column)
+                    .eq_col(&through.col(foreign_key_column)),
+            )
+            .join(
+                cte,
+                through
+                    .col(local_key_column)
+                    .eq_col(&cte.col(parent_pk_column)),
+            )
+            .columns(select_columns)
+    })
+    .await?;
+
+    let mut grouped: HashMap<PK, Vec<Target>> = HashMap::new();
+    for row in rows {
+        let key: PK = row.get_by_name(local_key_column)?;
+        let target_row = Target::from_row(&row)?;
+        grouped.entry(key).or_default().push(target_row);
+    }
+
+    Ok(grouped)
 }
