@@ -81,9 +81,11 @@ against a live database, generating `CreateTable`/`AlterTable` DDL for
 review (`Engine::autogenerate_migration`, `TableSpec`) — v1 only diffs
 column presence, never a rename, a type change, or a whole table to drop
 (see the "Autogenerate v2" item below); and `ShardRouter`, routing to one
-of several `Engine`s by hashing a caller-supplied key (naive modulo
-hashing, not consistent hashing — see the "Consistent hashing / live
-resharding" item below). See `README.md` for the full tour with examples.
+of several `Engine`s by hashing a caller-supplied key, via either naive
+modulo hashing (`ShardRouter::new`) or a consistent-hash ring
+(`ShardRouter::new_consistent`, remapping only a minority of keys when
+the shard count grows — see "Live resharding" below for what's still
+missing). See `README.md` for the full tour with examples.
 
 ---
 
@@ -134,14 +136,15 @@ resharding" item below). See `README.md` for the full tour with examples.
 
 ## Topology / deployment
 
-- **Consistent hashing / live resharding** for `ShardRouter` — routing is
-  naive modulo hashing (`hash(key) % shard_count()`), so growing or
-  shrinking the shard list remaps most keys and needs a migration step of
-  your own; there's no `add_shard`/`remove_shard`, no online rebalancing,
-  and no multi-primary-per-shard topology (each shard is a single
-  `Engine`, so a shard with its own read replicas needs its own
-  `ReplicaSet` composed in separately, which `ShardRouter` doesn't do for
-  you). **L**
+- **Live resharding** for `ShardRouter` — `ShardRouter::new_consistent`
+  now bounds how many keys a *new* router with a different shard count
+  remaps, but there's still no `add_shard`/`remove_shard` on an existing
+  router, no online rebalancing, and — the actually hard part — nothing
+  moves a remapped key's existing rows from its old shard to its new one;
+  that's still entirely a migration step of your own. Also no
+  multi-primary-per-shard topology (each shard is a single `Engine`, so a
+  shard with its own read replicas needs its own `ReplicaSet` composed in
+  separately, which `ShardRouter` doesn't do for you). **L**
 - **Additional backends** (Oracle, MSSQL, or a generic ODBC-style driver) —
   only SQLite/Postgres/MySQL exist; each new backend is roughly "another
   driver crate," bounded but not small. **XL** (per backend)
