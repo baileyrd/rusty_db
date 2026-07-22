@@ -1,12 +1,12 @@
 use super::table::Table;
-use super::{render_value_placeholder, ToSql};
+use super::{render_insert_value, InsertValue, ToSql};
 use crate::dialect::Dialect;
 use crate::value::Value;
 
 #[derive(Debug, Clone)]
 pub struct Insert {
     table: Table,
-    assignments: Vec<(String, Value)>,
+    assignments: Vec<(String, InsertValue)>,
     returning: Vec<String>,
 }
 
@@ -20,8 +20,41 @@ impl Insert {
     }
 
     pub fn value(mut self, column: impl Into<String>, value: impl Into<Value>) -> Self {
-        self.assignments.push((column.into(), value.into()));
+        self.assignments
+            .push((column.into(), InsertValue::Bound(value.into())));
         self
+    }
+
+    /// Assigns a column a raw SQL fragment (e.g. `CURRENT_TIMESTAMP`)
+    /// inserted verbatim, rather than a bound parameter.
+    pub fn raw_value(mut self, column: impl Into<String>, raw_sql: impl Into<String>) -> Self {
+        self.assignments
+            .push((column.into(), InsertValue::Raw(raw_sql.into())));
+        self
+    }
+
+    /// Used by `#[table(default = "...")]`: assigns `raw_default` (a raw SQL
+    /// fragment) if `value` equals `T::default()`, or binds `value` itself
+    /// otherwise. Since Rust has no "unset" field state, this is the only
+    /// way to tell "the caller left this at its default" from "the caller
+    /// deliberately set it to the same value the type defaults to" — the two
+    /// are indistinguishable, so a genuine value equal to `T::default()`
+    /// (e.g. an explicit `0`) is treated as "unset" and gets the mapping's
+    /// default expression instead of the value itself.
+    pub fn maybe_raw_value<T>(
+        self,
+        column: impl Into<String>,
+        raw_default: impl Into<String>,
+        value: T,
+    ) -> Self
+    where
+        T: PartialEq + Default + Into<Value>,
+    {
+        if value == T::default() {
+            self.raw_value(column, raw_default)
+        } else {
+            self.value(column, value)
+        }
     }
 
     /// Request columns back via `RETURNING` (only honored by dialects where
@@ -34,7 +67,7 @@ impl Insert {
     /// This insert's table and its `(column, value)` assignments, in the
     /// order `.value(...)` was called — used by `BulkInsert::combine` to
     /// merge several single-row `Insert`s into one multi-row statement.
-    pub(crate) fn into_parts(self) -> (Table, Vec<(String, Value)>) {
+    pub(crate) fn into_parts(self) -> (Table, Vec<(String, InsertValue)>) {
         (self.table, self.assignments)
     }
 }
@@ -52,7 +85,7 @@ impl ToSql for Insert {
         let placeholders_sql = self
             .assignments
             .iter()
-            .map(|(_, v)| render_value_placeholder(v, dialect, &mut params))
+            .map(|(_, v)| render_insert_value(v, dialect, &mut params))
             .collect::<Vec<_>>()
             .join(", ");
 

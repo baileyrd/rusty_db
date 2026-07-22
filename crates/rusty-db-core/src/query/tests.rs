@@ -63,6 +63,50 @@ fn insert_only_adds_returning_when_dialect_supports_it() {
 }
 
 #[test]
+fn raw_value_is_embedded_verbatim_with_no_bound_parameter() {
+    let users = Table::new("users");
+    let insert = Insert::into_table(&users)
+        .value("name", "ada")
+        .raw_value("created_at", "CURRENT_TIMESTAMP");
+
+    let (sql, params) = insert.to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sql,
+        r#"INSERT INTO "users" ("name", "created_at") VALUES (?, CURRENT_TIMESTAMP)"#
+    );
+    assert_eq!(params, vec![Value::Text("ada".to_string())]);
+}
+
+#[test]
+fn maybe_raw_value_substitutes_the_default_only_when_the_value_equals_its_type_default() {
+    let users = Table::new("users");
+
+    let (sql, params) = Insert::into_table(&users)
+        .maybe_raw_value("priority", "42", 0_i64)
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"INSERT INTO "users" ("priority") VALUES (42)"#);
+    assert!(params.is_empty());
+
+    let (sql, params) = Insert::into_table(&users)
+        .maybe_raw_value("priority", "42", 7_i64)
+        .to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"INSERT INTO "users" ("priority") VALUES (?)"#);
+    assert_eq!(params, vec![Value::I64(7)]);
+}
+
+#[test]
+fn bulk_insert_combines_rows_with_a_mix_of_raw_and_bound_assignments() {
+    let users = Table::new("users");
+    let rows = [0_i64, 7_i64]
+        .map(|priority| Insert::into_table(&users).maybe_raw_value("priority", "42", priority));
+
+    let bulk = BulkInsert::combine(rows).unwrap().unwrap();
+    let (sql, params) = bulk.to_sql(&QuestionMarkDialect);
+    assert_eq!(sql, r#"INSERT INTO "users" ("priority") VALUES (42), (?)"#);
+    assert_eq!(params, vec![Value::I64(7)]);
+}
+
+#[test]
 fn update_and_delete_render_where_clause() {
     let users = Table::new("users");
 
