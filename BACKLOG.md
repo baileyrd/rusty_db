@@ -58,7 +58,9 @@ column; a `Session` unit-of-work with an identity map, autoflush, bulk
 insert, `bulk_update`/`bulk_delete`, audit logging, optimistic locking,
 soft deletes, mapping-level column defaults (`#[table(default = "...")]`,
 distinct from the database-side column defaults schema introspection
-reflects below), session-level lifecycle hooks (`on_before_flush`/etc.)
+reflects below), computed/hybrid properties (`#[hybrid(name = "...", expr
+= "...")]`, an arithmetic-over-fields subset — see "Richer hybrid-property
+expressions" below), session-level lifecycle hooks (`on_before_flush`/etc.)
 plus a hand-implemented `Lifecycle` trait for entity-level
 `before_insert`/`after_update`/`validate`-style hooks (`Session::add_mut`/
 `update_mut`/`delete_mut`), `expire_on_commit` semantics, savepoints/
@@ -73,13 +75,15 @@ observability; connection-level event hooks (`PoolConfig::with_on_connect`/
 statement-cache capacity (`PoolConfig::with_statement_cache_capacity`);
 streaming query results (`Engine::fetch_stream`/`fetch_stream_as`);
 automap-style `#[derive(Mapped)]` struct generation from live schema
-reflection (`Engine::automap_table`/`automap_all`); and Alembic-style
+reflection (`Engine::automap_table`/`automap_all`); Alembic-style
 autogenerate diffing a set of `#[derive(Mapped)]` types' expected shape
 against a live database, generating `CreateTable`/`AlterTable` DDL for
 review (`Engine::autogenerate_migration`, `TableSpec`) — v1 only diffs
 column presence, never a rename, a type change, or a whole table to drop
-(see the "Autogenerate v2" item below). See `README.md` for the full tour
-with examples.
+(see the "Autogenerate v2" item below); and `ShardRouter`, routing to one
+of several `Engine`s by hashing a caller-supplied key (naive modulo
+hashing, not consistent hashing — see the "Consistent hashing / live
+resharding" item below). See `README.md` for the full tour with examples.
 
 ---
 
@@ -109,12 +113,13 @@ with examples.
 - **Inheritance/polymorphism** (single-table, joined-table, or concrete) —
   entirely absent; every `Mapped` type maps to exactly one table with no
   discriminator concept. **XL**
-- **Computed / hybrid properties** (a Rust-side derived attribute that can
-  also translate into a SQL expression for filtering, à la
-  `hybrid_property`) — the query builder now has the expression-column
-  support (`SelectExpr`, arithmetic/string functions, `CASE`/`COALESCE`)
-  needed for the "filter by it" half; this is now just the derive-macro
-  wiring to expose it as a `hybrid_property`-equivalent. **L**
+- **Richer hybrid-property expressions** — `#[hybrid(...)]`'s v1 only
+  parses `+`/`-`/`*`/`/` over this struct's own fields, literals, and
+  parentheses; it has no string functions, `CASE`/`COALESCE`, comparisons,
+  or references to a joined table's columns, and the Rust-side/SQL-side
+  halves are only guaranteed to agree for that arithmetic subset (anything
+  richer needs a hand-written Rust method sitting beside a hand-written
+  `_expr()`, with nothing checking the two still agree). **M**
 
 ## Relationships / eager loading
 

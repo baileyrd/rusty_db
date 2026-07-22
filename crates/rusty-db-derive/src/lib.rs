@@ -149,7 +149,10 @@ use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_macro_input, Data, DeriveInput, Fields, Token};
 
-#[proc_macro_derive(Mapped, attributes(table, has_many, has_one, belongs_to, many_to_many))]
+#[proc_macro_derive(
+    Mapped,
+    attributes(table, has_many, has_one, belongs_to, many_to_many, hybrid)
+)]
 pub fn derive_mapped(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand(input)
@@ -308,6 +311,63 @@ impl Parse for ManyToManySpec {
     }
 }
 
+/// `#[hybrid(name = "...", expr = "...", ty = "...")]`'s shape — a
+/// struct-level, repeatable attribute (SQLAlchemy's `hybrid_property`
+/// equivalent for arithmetic over this struct's own sibling fields). `ty`
+/// is optional: inferred from the first field the expression references
+/// when omitted.
+struct HybridSpec {
+    name: syn::LitStr,
+    expr: syn::LitStr,
+    ty: Option<syn::Type>,
+}
+
+impl Parse for HybridSpec {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut name: Option<syn::LitStr> = None;
+        let mut expr: Option<syn::LitStr> = None;
+        let mut ty: Option<syn::Type> = None;
+
+        loop {
+            let key: syn::Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            if key == "name" {
+                name = Some(input.parse()?);
+            } else if key == "expr" {
+                expr = Some(input.parse()?);
+            } else if key == "ty" {
+                let lit: syn::LitStr = input.parse()?;
+                ty = Some(lit.parse()?);
+            } else {
+                return Err(syn::Error::new_spanned(
+                    &key,
+                    "expected `name`, `expr`, or `ty`",
+                ));
+            }
+            if input.is_empty() {
+                break;
+            }
+            input.parse::<Token![,]>()?;
+        }
+
+        Ok(HybridSpec {
+            name: name.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "#[hybrid(...)] requires `name = \"...\"`",
+                )
+            })?,
+            expr: expr.ok_or_else(|| {
+                syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    "#[hybrid(...)] requires `expr = \"...\"`",
+                )
+            })?,
+            ty,
+        })
+    }
+}
+
 fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let struct_ident = &input.ident;
 
@@ -329,6 +389,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let mut has_one: Vec<RelationSpec> = Vec::new();
     let mut belongs_to: Vec<RelationSpec> = Vec::new();
     let mut many_to_many: Vec<ManyToManySpec> = Vec::new();
+    let mut hybrids: Vec<HybridSpec> = Vec::new();
     for attr in &input.attrs {
         if attr.path().is_ident("table") {
             attr.parse_nested_meta(|meta| {
@@ -349,6 +410,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             belongs_to.push(attr.parse_args::<RelationSpec>()?);
         } else if attr.path().is_ident("many_to_many") {
             many_to_many.push(attr.parse_args::<ManyToManySpec>()?);
+        } else if attr.path().is_ident("hybrid") {
+            hybrids.push(attr.parse_args::<HybridSpec>()?);
         }
     }
     let table_name = table_name.unwrap_or_else(|| struct_ident.to_string().to_snake_case());
@@ -602,6 +665,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         .map(|spec| expand_many_to_many(struct_ident, &core, primary_key, spec))
         .collect::<syn::Result<Vec<_>>>()?;
 
+    let hybrid_impls = hybrids
+        .iter()
+        .map(|spec| expand_hybrid(struct_ident, &core, &fields, spec))
+        .collect::<syn::Result<Vec<_>>>()?;
+
     let cascade_delete_impl = expand_cascade_delete(
         struct_ident,
         &core,
@@ -653,6 +721,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         #(#has_one_impls)*
         #(#belongs_to_impls)*
         #(#many_to_many_impls)*
+        #(#hybrid_impls)*
         #cascade_delete_impl
     })
 }
@@ -1002,6 +1071,350 @@ fn expand_belongs_to(
                     parent_key_column,
                 )
                 .await
+            }
+        }
+    })
+}
+
+/// A parsed `#[hybrid(...)]` arithmetic expression token.
+#[derive(Debug, Clone, PartialEq)]
+enum HybridToken {
+    Ident(String),
+    Number(String),
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    LParen,
+    RParen,
+}
+
+fn tokenize_hybrid_expr(src: &str) -> Result<Vec<HybridToken>, String> {
+    let mut tokens = Vec::new();
+    let mut chars = src.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let mut ident = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    ident.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            tokens.push(HybridToken::Ident(ident));
+        } else if c.is_ascii_digit() {
+            let mut number = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() || c == '.' {
+                    number.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            tokens.push(HybridToken::Number(number));
+        } else {
+            let token = match c {
+                '+' => HybridToken::Plus,
+                '-' => HybridToken::Minus,
+                '*' => HybridToken::Star,
+                '/' => HybridToken::Slash,
+                '(' => HybridToken::LParen,
+                ')' => HybridToken::RParen,
+                other => {
+                    return Err(format!(
+                        "unexpected character {other:?} in hybrid expression"
+                    ))
+                }
+            };
+            tokens.push(token);
+            chars.next();
+        }
+    }
+    Ok(tokens)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HybridOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// The parsed shape of a `#[hybrid(expr = "...")]` string: a small
+/// arithmetic tree over field names, integer/float literals, `+`/`-`/`*`/
+/// `/`, and parentheses for grouping — deliberately nothing richer (no
+/// comparisons, no function calls), since this is meant to render
+/// identically as both a plain Rust expression and a portable `Expr` tree,
+/// and that only holds for the arithmetic ANSI-SQL already shares with
+/// Rust.
+#[derive(Debug, Clone)]
+enum HybridNode {
+    Field(String),
+    IntLit(i64),
+    FloatLit(f64),
+    Op(Box<HybridNode>, HybridOp, Box<HybridNode>),
+}
+
+struct HybridParser<'a> {
+    tokens: &'a [HybridToken],
+    pos: usize,
+}
+
+impl<'a> HybridParser<'a> {
+    fn parse(tokens: &'a [HybridToken]) -> Result<HybridNode, String> {
+        let mut parser = HybridParser { tokens, pos: 0 };
+        let node = parser.parse_expr()?;
+        if parser.pos != parser.tokens.len() {
+            return Err("unexpected trailing tokens in hybrid expression".to_string());
+        }
+        Ok(node)
+    }
+
+    fn parse_expr(&mut self) -> Result<HybridNode, String> {
+        let mut node = self.parse_term()?;
+        loop {
+            match self.tokens.get(self.pos) {
+                Some(HybridToken::Plus) => {
+                    self.pos += 1;
+                    let rhs = self.parse_term()?;
+                    node = HybridNode::Op(Box::new(node), HybridOp::Add, Box::new(rhs));
+                }
+                Some(HybridToken::Minus) => {
+                    self.pos += 1;
+                    let rhs = self.parse_term()?;
+                    node = HybridNode::Op(Box::new(node), HybridOp::Sub, Box::new(rhs));
+                }
+                _ => break,
+            }
+        }
+        Ok(node)
+    }
+
+    fn parse_term(&mut self) -> Result<HybridNode, String> {
+        let mut node = self.parse_factor()?;
+        loop {
+            match self.tokens.get(self.pos) {
+                Some(HybridToken::Star) => {
+                    self.pos += 1;
+                    let rhs = self.parse_factor()?;
+                    node = HybridNode::Op(Box::new(node), HybridOp::Mul, Box::new(rhs));
+                }
+                Some(HybridToken::Slash) => {
+                    self.pos += 1;
+                    let rhs = self.parse_factor()?;
+                    node = HybridNode::Op(Box::new(node), HybridOp::Div, Box::new(rhs));
+                }
+                _ => break,
+            }
+        }
+        Ok(node)
+    }
+
+    fn parse_factor(&mut self) -> Result<HybridNode, String> {
+        match self.tokens.get(self.pos) {
+            Some(HybridToken::Ident(name)) => {
+                let name = name.clone();
+                self.pos += 1;
+                Ok(HybridNode::Field(name))
+            }
+            Some(HybridToken::Number(text)) => {
+                let text = text.clone();
+                self.pos += 1;
+                if text.contains('.') {
+                    text.parse::<f64>()
+                        .map(HybridNode::FloatLit)
+                        .map_err(|_| format!("invalid number {text:?} in hybrid expression"))
+                } else {
+                    text.parse::<i64>()
+                        .map(HybridNode::IntLit)
+                        .map_err(|_| format!("invalid number {text:?} in hybrid expression"))
+                }
+            }
+            Some(HybridToken::LParen) => {
+                self.pos += 1;
+                let node = self.parse_expr()?;
+                match self.tokens.get(self.pos) {
+                    Some(HybridToken::RParen) => {
+                        self.pos += 1;
+                        Ok(node)
+                    }
+                    _ => Err("expected closing `)` in hybrid expression".to_string()),
+                }
+            }
+            other => Err(format!(
+                "expected a field name, number, or `(` in hybrid expression, found {other:?}"
+            )),
+        }
+    }
+}
+
+fn parse_hybrid_expr(src: &str) -> Result<HybridNode, String> {
+    let tokens = tokenize_hybrid_expr(src)?;
+    HybridParser::parse(&tokens)
+}
+
+/// Every field name a hybrid expression tree references, in the order
+/// they first appear (left to right) — used both to validate every name
+/// against the struct's own fields and to infer a return type from the
+/// first one when `ty` isn't given explicitly.
+fn hybrid_field_names(node: &HybridNode) -> Vec<String> {
+    match node {
+        HybridNode::Field(name) => vec![name.clone()],
+        HybridNode::IntLit(_) | HybridNode::FloatLit(_) => Vec::new(),
+        HybridNode::Op(lhs, _, rhs) => {
+            let mut names = hybrid_field_names(lhs);
+            names.extend(hybrid_field_names(rhs));
+            names
+        }
+    }
+}
+
+/// The Rust-side computation (`self.field <op> self.other_field`).
+/// Numeric literals are emitted unsuffixed so they adapt to whatever
+/// numeric type the referenced fields turn out to be, rather than forcing
+/// `i64`/`f64` regardless of the struct's own field types.
+fn hybrid_rust_tokens(node: &HybridNode, fields: &[FieldInfo]) -> TokenStream2 {
+    match node {
+        HybridNode::Field(name) => {
+            let field = fields
+                .iter()
+                .find(|f| f.ident == name)
+                .expect("field name already validated against the struct's own fields");
+            let ident = &field.ident;
+            quote! { (self.#ident) }
+        }
+        HybridNode::IntLit(n) => {
+            let lit = proc_macro2::Literal::i64_unsuffixed(*n);
+            quote! { (#lit) }
+        }
+        HybridNode::FloatLit(n) => {
+            let lit = proc_macro2::Literal::f64_unsuffixed(*n);
+            quote! { (#lit) }
+        }
+        HybridNode::Op(lhs, op, rhs) => {
+            let lhs = hybrid_rust_tokens(lhs, fields);
+            let rhs = hybrid_rust_tokens(rhs, fields);
+            match op {
+                HybridOp::Add => quote! { (#lhs + #rhs) },
+                HybridOp::Sub => quote! { (#lhs - #rhs) },
+                HybridOp::Mul => quote! { (#lhs * #rhs) },
+                HybridOp::Div => quote! { (#lhs / #rhs) },
+            }
+        }
+    }
+}
+
+/// The SQL-side equivalent, built from the same tree via `Expr::col`/
+/// `Expr::lit`/`Expr::add`/`sub`/`mul`/`div` — the same public
+/// constructors any hand-written query would use, so this renders
+/// correctly on every dialect the query builder already supports.
+fn hybrid_sql_tokens(node: &HybridNode, core: &TokenStream2, fields: &[FieldInfo]) -> TokenStream2 {
+    match node {
+        HybridNode::Field(name) => {
+            let field = fields
+                .iter()
+                .find(|f| f.ident == name)
+                .expect("field name already validated against the struct's own fields");
+            let column = &field.column;
+            quote! { #core::Expr::col(Self::table().col(#column)) }
+        }
+        HybridNode::IntLit(n) => quote! { #core::Expr::lit(#n) },
+        HybridNode::FloatLit(n) => quote! { #core::Expr::lit(#n) },
+        HybridNode::Op(lhs, op, rhs) => {
+            let lhs = hybrid_sql_tokens(lhs, core, fields);
+            let rhs = hybrid_sql_tokens(rhs, core, fields);
+            match op {
+                HybridOp::Add => quote! { (#lhs).add(#rhs) },
+                HybridOp::Sub => quote! { (#lhs).sub(#rhs) },
+                HybridOp::Mul => quote! { (#lhs).mul(#rhs) },
+                HybridOp::Div => quote! { (#lhs).div(#rhs) },
+            }
+        }
+    }
+}
+
+/// `#[hybrid(name = "total", expr = "price * quantity")]` generates both
+/// halves SQLAlchemy's single `@hybrid_property` method splits into: a
+/// plain `fn total(&self) -> T` computing the value from this instance's
+/// own fields, and `fn total_expr() -> Expr` — the same computation as a
+/// portable SQL expression, usable in `.filter()`/`.columns()` (anywhere
+/// an `Expr` is accepted; not `.order_by()`, which only accepts a bare
+/// `Column` today). The two are generated from one parsed expression tree
+/// so they can't drift apart from each other, though nothing checks the
+/// expression string itself is correct SQL until it actually runs.
+fn expand_hybrid(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    fields: &[FieldInfo],
+    spec: &HybridSpec,
+) -> syn::Result<TokenStream2> {
+    let node = parse_hybrid_expr(&spec.expr.value())
+        .map_err(|msg| syn::Error::new_spanned(&spec.expr, msg))?;
+
+    let referenced = hybrid_field_names(&node);
+    if referenced.is_empty() {
+        return Err(syn::Error::new_spanned(
+            &spec.expr,
+            "a #[hybrid(...)] expression must reference at least one field",
+        ));
+    }
+    for name in &referenced {
+        if !fields.iter().any(|f| f.ident == name) {
+            return Err(syn::Error::new_spanned(
+                &spec.expr,
+                format!("#[hybrid(...)] expression references unknown field `{name}`"),
+            ));
+        }
+    }
+
+    let name = spec.name.value();
+    if fields.iter().any(|f| f.ident == name) {
+        return Err(syn::Error::new_spanned(
+            &spec.name,
+            format!(
+                "#[hybrid(name = \"{name}\")] collides with an existing field of the same name"
+            ),
+        ));
+    }
+    let method_ident = syn::Ident::new(&name, spec.name.span());
+    let expr_method_ident = format_ident!("{}_expr", name);
+
+    let ty = match &spec.ty {
+        Some(ty) => ty.clone(),
+        None => {
+            let first = referenced.first().expect("checked non-empty above");
+            fields
+                .iter()
+                .find(|f| f.ident == first)
+                .expect("already validated")
+                .ty
+                .clone()
+        }
+    };
+
+    let rust_expr = hybrid_rust_tokens(&node, fields);
+    let sql_expr = hybrid_sql_tokens(&node, core, fields);
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// Computed from this instance's own fields — see
+            /// `#expr_method_ident` for the SQL-side equivalent, usable in
+            /// a filter/query instead.
+            pub fn #method_ident(&self) -> #ty {
+                #rust_expr
+            }
+
+            /// The SQL expression computing the same value as
+            /// `#method_ident`, for use in `.filter()`/`.columns()` (or
+            /// anywhere else an `Expr` is accepted).
+            pub fn #expr_method_ident() -> #core::Expr {
+                #sql_expr
             }
         }
     })
@@ -1423,5 +1836,141 @@ mod tests {
         let (tokens, nullable) = infer("MyCustomEnum");
         assert_eq!(tokens, "rusty_db_core :: ColumnType :: Text");
         assert!(!nullable);
+    }
+
+    fn rust_tokens_for(expr: &str, fields: &[FieldInfo]) -> String {
+        let node = parse_hybrid_expr(expr).unwrap();
+        hybrid_rust_tokens(&node, fields).to_string()
+    }
+
+    fn sql_tokens_for(expr: &str, fields: &[FieldInfo]) -> String {
+        let node = parse_hybrid_expr(expr).unwrap();
+        let core = quote! { rusty_db_core };
+        hybrid_sql_tokens(&node, &core, fields).to_string()
+    }
+
+    fn field(name: &str, column: &str, ty: &str) -> FieldInfo {
+        FieldInfo {
+            ident: syn::Ident::new(name, proc_macro2::Span::call_site()),
+            ty: parse_ty(ty),
+            column: column.to_string(),
+            primary_key: false,
+            version: false,
+            soft_delete: false,
+            default: None,
+        }
+    }
+
+    #[test]
+    fn multiplication_binds_tighter_than_addition() {
+        let fields = vec![
+            field("a", "a", "i64"),
+            field("b", "b", "i64"),
+            field("c", "c", "i64"),
+        ];
+        // `a + b * c` should parse as `a + (b * c)`, not `(a + b) * c`.
+        assert_eq!(
+            rust_tokens_for("a + b * c", &fields),
+            rust_tokens_for("a + (b * c)", &fields),
+        );
+        assert_ne!(
+            rust_tokens_for("a + b * c", &fields),
+            rust_tokens_for("(a + b) * c", &fields),
+        );
+    }
+
+    #[test]
+    fn parentheses_override_default_precedence() {
+        let node = parse_hybrid_expr("(a + b) * c").unwrap();
+        match node {
+            HybridNode::Op(_, HybridOp::Mul, _) => {}
+            other => panic!("expected a top-level multiplication, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integer_literals_are_emitted_unsuffixed_on_the_rust_side() {
+        let fields = vec![field("price", "price", "i64")];
+        let tokens = rust_tokens_for("price * 2", &fields);
+        assert!(
+            !tokens.contains("i64") && !tokens.contains("i32"),
+            "expected an unsuffixed literal so it adapts to the field's own type, got: {tokens}"
+        );
+    }
+
+    #[test]
+    fn float_literals_parse_and_render_on_both_sides() {
+        let fields = vec![field("price", "price", "f64")];
+        let node = parse_hybrid_expr("price * 1.5").unwrap();
+        match node {
+            HybridNode::Op(_, HybridOp::Mul, rhs) => {
+                assert!(matches!(*rhs, HybridNode::FloatLit(n) if n == 1.5));
+            }
+            other => panic!("expected a multiplication, got {other:?}"),
+        }
+        let sql = sql_tokens_for("price * 1.5", &fields);
+        assert!(sql.contains("Expr :: lit"));
+    }
+
+    #[test]
+    fn sql_side_uses_the_column_name_not_the_rust_field_name() {
+        let fields = vec![field("price", "unit_price", "i64")];
+        let sql = sql_tokens_for("price", &fields);
+        assert!(sql.contains("\"unit_price\""));
+        assert!(!sql.contains("\"price\""));
+    }
+
+    #[test]
+    fn division_and_subtraction_are_left_associative() {
+        // `a - b - c` must parse as `(a - b) - c`, not `a - (b - c)` — these
+        // give different results, so getting associativity backwards would
+        // be a silent correctness bug, not just a cosmetic rendering choice.
+        let node = parse_hybrid_expr("a - b - c").unwrap();
+        match node {
+            HybridNode::Op(lhs, HybridOp::Sub, rhs) => {
+                assert!(matches!(*rhs, HybridNode::Field(name) if name == "c"));
+                assert!(matches!(*lhs, HybridNode::Op(_, HybridOp::Sub, _)));
+            }
+            other => panic!("expected a subtraction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_field_reference_is_a_valid_expression() {
+        let fields = vec![field("price", "price", "i64")];
+        assert!(parse_hybrid_expr("price").is_ok());
+        let _ = rust_tokens_for("price", &fields);
+    }
+
+    #[test]
+    fn unknown_characters_are_rejected() {
+        assert!(tokenize_hybrid_expr("price % 2").is_err());
+    }
+
+    #[test]
+    fn trailing_garbage_after_a_complete_expression_is_rejected() {
+        let tokens = tokenize_hybrid_expr("price + quantity )").unwrap();
+        assert!(HybridParser::parse(&tokens).is_err());
+    }
+
+    #[test]
+    fn an_unopened_or_unclosed_paren_is_rejected() {
+        assert!(parse_hybrid_expr("(price + quantity").is_err());
+        assert!(parse_hybrid_expr("price + quantity)").is_err());
+    }
+
+    #[test]
+    fn every_referenced_field_name_is_collected_in_left_to_right_order() {
+        let node = parse_hybrid_expr("(a + b) * c").unwrap();
+        assert_eq!(
+            hybrid_field_names(&node),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_pure_literal_expression_references_no_fields() {
+        let node = parse_hybrid_expr("2 * (3 + 4)").unwrap();
+        assert!(hybrid_field_names(&node).is_empty());
     }
 }
