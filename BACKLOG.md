@@ -50,7 +50,10 @@ column; a `Session` unit-of-work with an identity map, autoflush, bulk
 insert, `bulk_update`/`bulk_delete`, audit logging, optimistic locking,
 soft deletes, mapping-level column defaults (`#[table(default = "...")]`,
 distinct from the database-side column defaults schema introspection
-reflects below), lifecycle hooks, `expire_on_commit` semantics, savepoints/
+reflects below), session-level lifecycle hooks (`on_before_flush`/etc.)
+plus a hand-implemented `Lifecycle` trait for entity-level
+`before_insert`/`after_update`/`validate`-style hooks (`Session::add_mut`/
+`update_mut`/`delete_mut`), `expire_on_commit` semantics, savepoints/
 nested transactions, two-phase commit, and a fluent `session.query::<T>()`
 API; `has_many`/`belongs_to`/`has_one`/`many_to_many` select-in eager
 loading with cascade delete/orphan rules; hand-written versioned
@@ -88,9 +91,6 @@ the full tour with examples.
   `update`, `delete`, optimistic locking, soft deletes, relationships) is
   built assuming a single scalar key. This is a foundational, cross-cutting
   change, not a bolt-on. **XL**
-- **Lifecycle hooks/validators** (`before_insert`/`after_update`/a
-  `#[validates(...)]`-equivalent) — nothing in `Session` or the derive
-  macro runs application code around a write today. **L**
 - **Inheritance/polymorphism** (single-table, joined-table, or concrete) —
   entirely absent; every `Mapped` type maps to exactly one table with no
   discriminator concept. **XL**
