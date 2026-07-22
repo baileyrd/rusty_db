@@ -129,9 +129,14 @@ with examples.
 
 ## Topology / deployment
 
-- **Sharding / multi-tenant routing** beyond the existing single-primary +
-  round-robin-read-replica `ReplicaSet` — no partitioning/shard-key
-  routing, no multi-primary topology. **XL**
+- **Consistent hashing / live resharding** for `ShardRouter` — routing is
+  naive modulo hashing (`hash(key) % shard_count()`), so growing or
+  shrinking the shard list remaps most keys and needs a migration step of
+  your own; there's no `add_shard`/`remove_shard`, no online rebalancing,
+  and no multi-primary-per-shard topology (each shard is a single
+  `Engine`, so a shard with its own read replicas needs its own
+  `ReplicaSet` composed in separately, which `ShardRouter` doesn't do for
+  you). **L**
 - **Additional backends** (Oracle, MSSQL, or a generic ODBC-style driver) —
   only SQLite/Postgres/MySQL exist; each new backend is roughly "another
   driver crate," bounded but not small. **XL** (per backend)

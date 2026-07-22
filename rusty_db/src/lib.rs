@@ -54,8 +54,8 @@ pub mod prelude {
         DatabaseDump, DateTime, Delete, DropIndex, DropTable, Engine, Entity, Expr, FromRow,
         Identifiable, Insert, Join, JoinKind, Json, Lifecycle, Mapped, Migration, Migrator,
         NaiveDate, NaiveDateTime, NaiveTime, PoolConfig, PoolStats, ReplicaSet, Row, Savepoint,
-        Select, SelectExpr, Session, SessionQuery, SetOperation, StreamExt, Table, TableDump,
-        TableSchema, TableSpec, ToSql, Transaction, Update, Utc, Uuid, Value, Window,
+        Select, SelectExpr, Session, SessionQuery, SetOperation, ShardRouter, StreamExt, Table,
+        TableDump, TableSchema, TableSpec, ToSql, Transaction, Update, Utc, Uuid, Value, Window,
     };
 
     // `Mapped` above is the trait (type namespace); this is the derive

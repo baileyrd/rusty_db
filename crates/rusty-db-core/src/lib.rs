@@ -27,6 +27,7 @@ pub mod replica;
 pub mod row;
 pub mod schema;
 pub mod session;
+pub mod shard;
 pub mod timeout;
 pub mod value;
 
@@ -51,6 +52,7 @@ pub use schema::{
     CheckConstraint, ColumnInfo, ForeignKey, IndexInfo, TableSchema, UniqueConstraint,
 };
 pub use session::{Savepoint, Session, SessionQuery};
+pub use shard::ShardRouter;
 pub use timeout::with_timeout;
 pub use value::{FromValue, Value};
 
