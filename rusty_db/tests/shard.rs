@@ -174,3 +174,62 @@ async fn new_rejects_an_empty_shard_list() {
     let outcome = ShardRouter::new(Vec::new());
     assert!(outcome.is_err(), "a router needs at least one shard");
 }
+
+#[tokio::test]
+async fn a_consistent_hash_router_routes_writes_the_same_way_a_modulo_router_does(
+) -> rusty_db::Result<()> {
+    let shards = three_shards("consistent_write").await?;
+    let shard_handles = shards.clone();
+    let router = ShardRouter::new_consistent(shards, 100)?;
+
+    let (key_x, key_y) = two_keys_on_different_shards(&router);
+    let index_x = router.shard_index(key_x);
+    let index_y = router.shard_index(key_y);
+
+    router
+        .execute(
+            key_x,
+            &Insert::into_table(&Node::table())
+                .value("id", 2_i64)
+                .value("label", "written-for-x"),
+        )
+        .await?;
+    router
+        .execute(
+            key_y,
+            &Insert::into_table(&Node::table())
+                .value("id", 3_i64)
+                .value("label", "written-for-y"),
+        )
+        .await?;
+
+    let rows_x: Vec<Node> = shard_handles[index_x]
+        .fetch_all_as(&Select::from(&Node::table()))
+        .await?;
+    assert!(rows_x.iter().any(|n| n.label == "written-for-x"));
+    assert!(!rows_x.iter().any(|n| n.label == "written-for-y"));
+
+    let rows_y: Vec<Node> = shard_handles[index_y]
+        .fetch_all_as(&Select::from(&Node::table()))
+        .await?;
+    assert!(rows_y.iter().any(|n| n.label == "written-for-y"));
+    assert!(!rows_y.iter().any(|n| n.label == "written-for-x"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_consistent_rejects_an_empty_shard_list() {
+    let outcome = ShardRouter::new_consistent(Vec::new(), 100);
+    assert!(outcome.is_err(), "a router needs at least one shard");
+}
+
+#[tokio::test]
+async fn new_consistent_rejects_zero_virtual_nodes() -> rusty_db::Result<()> {
+    let outcome = ShardRouter::new_consistent(three_shards("zero_virtual_nodes").await?, 0);
+    assert!(
+        outcome.is_err(),
+        "a ring with zero virtual nodes per shard can't route anything"
+    );
+    Ok(())
+}
