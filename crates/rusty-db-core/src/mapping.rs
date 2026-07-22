@@ -64,3 +64,45 @@ pub trait Identifiable: Entity {
     /// `Session`'s identity map to key cached instances.
     fn primary_key_value(&self) -> Value;
 }
+
+/// Optional application code run around a write, for a type that
+/// implements this by hand alongside `#[derive(Mapped)]` — hook bodies are
+/// arbitrary application logic, so this isn't (and can't be) derived,
+/// the same reasoning behind `Into<Value>`/`FromValue` being available as
+/// a hand-written escape hatch alongside `MappedEnum`/`MappedNewtype`.
+/// Every method has a no-op (or `Ok(())`) default, so implementing only
+/// the ones a given type needs is fine.
+///
+/// Nothing calls these automatically: `Session::add`/`update`/`delete`
+/// stay exactly as they were before this trait existed (unhooked,
+/// infallible, `&T`) for every existing caller. Opt in per-call instead,
+/// with `Session::add_mut`/`update_mut`/`delete_mut`.
+pub trait Lifecycle: Sized {
+    /// Runs before the row is queued for insertion — the only hook able to
+    /// mutate `self` before its data is captured into the `INSERT`.
+    fn before_insert(&mut self) {}
+    /// Runs once the insert has actually succeeded (never for a write that
+    /// failed and rolled back), on a snapshot of `self` taken right after
+    /// `before_insert`/`validate` ran.
+    fn after_insert(&self) {}
+    /// Runs before the row is queued for update — the only hook able to
+    /// mutate `self` before its data is captured into the `UPDATE`.
+    fn before_update(&mut self) {}
+    /// Runs once the update has actually succeeded (never for a write that
+    /// failed and rolled back), on a snapshot of `self` taken right after
+    /// `before_update`/`validate` ran.
+    fn after_update(&self) {}
+    /// Runs before the row is queued for deletion.
+    fn before_delete(&mut self) {}
+    /// Runs once the delete has actually succeeded (never for a write that
+    /// failed and rolled back), on a snapshot of `self` taken right after
+    /// `before_delete` ran.
+    fn after_delete(&self) {}
+    /// Runs after `before_insert`/`before_update` (never for a delete),
+    /// before anything is queued — returning `Err` rejects the write
+    /// outright, so it's never sent to the database at all, rather than
+    /// failing later at flush/commit time.
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+}

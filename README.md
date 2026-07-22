@@ -950,6 +950,42 @@ session.commit().await?; // fires on_before_flush, then on_after_commit
 
 Hooks are plain `FnMut()` closures (no `async` support — they fire at a specific synchronous point inside an already-`async fn`, not as their own awaited step) and run in registration order. `on_before_flush`/`on_after_flush` only fire when a flush actually has queued writes to send (a flush with nothing pending — including the implicit ones inside `get`/`load_all`/`query`/`commit`/`savepoint` — is a no-op and doesn't trigger them), and `on_after_flush` never fires for a flush that failed. `on_before_commit` fires on every `commit()` call, pending writes or not; `on_after_commit`/`on_after_rollback` only fire when a transaction actually existed to commit/roll back — calling `commit()`/`rollback()` when nothing was ever flushed or read (so no transaction was ever opened) doesn't trigger them.
 
+### Lifecycle hooks
+
+The hooks above are session-level — they don't know which entity is being written, just that *something* is. A type that implements the `Lifecycle` trait by hand (hook bodies are arbitrary application logic, so this can't be derived) gets entity-level hooks instead, run by `Session::add_mut`/`update_mut`/`delete_mut` — opt-in siblings of `add`/`update`/`delete`, which stay exactly as they were, unhooked and infallible, for every type and every existing call site:
+
+```rust
+#[derive(Debug, Clone, Mapped)]
+#[table(name = "documents")]
+struct Document {
+    #[table(primary_key)]
+    id: i64,
+    title: String,
+    word_count: i64,
+}
+
+impl Lifecycle for Document {
+    fn before_insert(&mut self) {
+        self.title = self.title.trim().to_string(); // can mutate self
+    }
+    fn after_insert(&self) {
+        println!("document {} inserted", self.id); // read-only; runs on a snapshot
+    }
+    fn validate(&self) -> rusty_db::Result<()> {
+        if self.word_count < 0 {
+            return Err(rusty_db::Error::QueryBuilder("word_count cannot be negative".into()));
+        }
+        Ok(())
+    }
+}
+
+let mut doc = Document { id: 1, title: "  draft  ".into(), word_count: 2 };
+session.add_mut(&mut doc)?; // before_insert trims the title, validate() passes, then it's queued
+session.commit().await?; // after_insert prints once the insert actually lands
+```
+
+Every hook has a no-op (or `Ok(())`) default, so implementing only the ones a type needs is fine. The `before_*` hooks (the only ones taking `&mut self`) run synchronously inside `add_mut`/`update_mut`/`delete_mut` itself, before anything is queued — the only point where mutating a field can still affect the `INSERT`/`UPDATE` about to be built. `validate()` runs right after (skipped for `delete_mut` — there's nothing about a delete worth validating): returning `Err` rejects the write outright, propagated straight from `add_mut`/`update_mut` themselves, with nothing queued at all. The `after_*` hooks run later, on a snapshot of the entity taken right after `before_*`/`validate` ran (so `T: Clone` is required) — once this specific write has actually been sent successfully as part of a flush, matching `on_after_flush`'s own timing exactly: never for a write that fails and rolls back (including one rolled back because a *different*, later write in the same flush batch failed), and not gated on a later `commit()` either.
+
 ### Expiring on commit
 
 `engine.session().with_expire_on_commit()` clears the whole identity map right after every successful `commit()`, so the next `get`/`load_all`/`query` for a row re-fetches it fresh from the database instead of handing back a cached, possibly now-stale in-memory handle:
@@ -1156,7 +1192,7 @@ Unlike `Migrator::up`, which commits each migration independently, `session.migr
 
 ## Status
 
-This covers Core (query builder — including aggregate functions/expression columns via `SelectExpr`, `GROUP BY`/`HAVING`, set operations (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) via `SetOperation`, SQL functions/arithmetic/`CASE`/`COALESCE`, subqueries (`IN (subquery)`, correlated `EXISTS`, scalar subqueries), CTEs (`WITH`/`WITH RECURSIVE` via `Cte`), and window functions (`ROW_NUMBER`/`RANK`/`DENSE_RANK`, and aggregates as window functions, via `.over(...)`/`Window`) — connections (pooling/tuning, connection-level event hooks on connect/checkout/checkin, tunable per-connection statement-cache capacity, streaming query results via `fetch_stream`/`fetch_stream_as`, TLS, read replicas, query timeouts), first-class `Uuid`/`BigDecimal`/`Json`/temporal (`NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`)/array (`Vec<T>`) value types), a thin mapping layer (`#[derive(Mapped)]`, `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]` for custom field types, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules, mapping-level column defaults via `#[table(default = "...")]`), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), automap-style struct generation from schema reflection (`Engine::automap_table`/`automap_all`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
+This covers Core (query builder — including aggregate functions/expression columns via `SelectExpr`, `GROUP BY`/`HAVING`, set operations (`UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`) via `SetOperation`, SQL functions/arithmetic/`CASE`/`COALESCE`, subqueries (`IN (subquery)`, correlated `EXISTS`, scalar subqueries), CTEs (`WITH`/`WITH RECURSIVE` via `Cte`), and window functions (`ROW_NUMBER`/`RANK`/`DENSE_RANK`, and aggregates as window functions, via `.over(...)`/`Window`) — connections (pooling/tuning, connection-level event hooks on connect/checkout/checkin, tunable per-connection statement-cache capacity, streaming query results via `fetch_stream`/`fetch_stream_as`, TLS, read replicas, query timeouts), first-class `Uuid`/`BigDecimal`/`Json`/temporal (`NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`)/array (`Vec<T>`) value types), a thin mapping layer (`#[derive(Mapped)]`, `#[derive(MappedEnum)]`/`#[derive(MappedNewtype)]` for custom field types, joins, has-many/has-one/belongs-to/many-to-many eager loading, cascade delete/orphan rules, mapping-level column defaults via `#[table(default = "...")]`), versioned migrations (standalone via `Migrator`, or folded into a session's transaction via `session.migrate`), automap-style struct generation from schema reflection (`Engine::automap_table`/`automap_all`), a hand-implemented `Lifecycle` trait for entity-level before/after/`validate` hooks (`Session::add_mut`/`update_mut`/`delete_mut`), and a unit-of-work `Session` with autoflush and an identity map (including eviction on delete). Three drivers exist — SQLite, PostgreSQL, and MySQL/MariaDB — all built the same way (wrapping `sqlx`) and all exercised by the test suite. The Postgres and MySQL tests run against real servers when reachable (`POSTGRES_TEST_URL`/`MYSQL_TEST_URL`, defaulting to local `rusty`/`rusty` test databases) and just skip themselves rather than fail if one isn't — so `cargo test` stays green without either installed, but this environment does have both, and both are actually exercised here.
 
 `tests/concurrent_sessions.rs` (SQLite) and its `_postgres`/`_mysql` counterparts cover multiple `Session`s sharing one `Engine`/connection pool at the same time — `Session` is intentionally `!Send` (it hands out `Rc`s for the identity map), so these run via `tokio::task::LocalSet`/`spawn_local` rather than `tokio::spawn`, which is the standard way to get genuinely concurrent, interleaved execution of `!Send` futures on one thread. They cover independent commits landing correctly under a burst of concurrent sessions, one session's flushed-but-uncommitted write staying invisible to a concurrent reader on a separate connection (deterministically ordered via a `oneshot` channel, not timing), and two sessions never sharing identity-map state for the same row. Same skip-if-unreachable behavior as the Postgres/MySQL smoke tests; each test uses its own table to avoid colliding with other tests running concurrently against the same live server.
 
@@ -1239,6 +1275,8 @@ The same file also covers `Column::lower`/`upper`/`concat`/`add`/`sub`/`mul`/`di
 `tests/session_query.rs` (SQLite) covers `Session::query`/`SessionQuery`: `.filter`/`.order_by` narrow and order the result set; `.limit`/`.offset` page through it; `.first()` returns just the first matching row (`None` when nothing matches); results come back through the identity map exactly like `load_all`'s do, including reflecting an in-memory change made through a handle fetched a different way; and `.active_only()` excludes soft-deleted rows for a `#[table(soft_delete)]` type, the same as `load_active`. No `_postgres`/`_mysql` counterparts — this is `Session`-level logic built entirely on `load_all` and `Select`'s own filter/order/limit/offset, both already exercised per-driver elsewhere.
 
 `tests/session_hooks.rs` (SQLite) covers `Session::on_before_flush`/`on_after_flush`/`on_before_commit`/`on_after_commit`/`on_after_rollback`: `on_before_flush` only fires when a flush actually has something queued to send, not for a no-op flush; `on_after_flush` fires after a successful flush and in the right order relative to `on_before_flush`, but never fires at all for a flush that failed; `on_before_commit` fires on every `commit()` call regardless of whether anything was pending; `on_after_commit`/`on_after_rollback` only fire when a transaction actually existed to commit/roll back (not when `commit()`/`rollback()` was a no-op because nothing was ever flushed or read); and multiple hooks registered on the same event run in registration order. No `_postgres`/`_mysql` counterparts — hooks are plain `Session`-level callbacks with no interaction with which driver is underneath.
+
+`tests/lifecycle_hooks.rs` (SQLite) covers `Lifecycle`/`Session::add_mut`/`update_mut`/`delete_mut`: `before_insert` can mutate the entity (a trimmed string) before it's queued; a failing `validate()` is returned immediately with nothing queued at all; `after_insert` hasn't run yet right after `add_mut` (only `before_insert` has), and only runs once `commit()` actually flushes the write; a rolled-back write (discarded before ever flushing) never fires `after_insert`; the same `before`/`validate`/`after` sequencing for `update_mut`, plus the updated row actually landing; `delete_mut` runs `before_delete`/`after_delete` but never `validate()` (a row with data that would fail `validate()` deletes fine); `add`/`update`/`delete` stay completely unhooked (no `Lifecycle` method ever runs for them, proven with data that would otherwise fail `validate()` or need trimming); and — the trickiest case — `after_insert` still doesn't fire for an `add_mut`'d write that succeeded *within* a transaction later rolled back by a *different*, unhooked write's primary-key collision failing later in the same flush batch. No `_postgres`/`_mysql` counterparts — this is `Session`-level logic with no interaction with which driver is underneath.
 
 ## Running tests
 
