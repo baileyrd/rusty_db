@@ -1,5 +1,6 @@
 mod bulk_insert;
 mod cte;
+mod ddl;
 mod delete;
 mod expr;
 mod insert;
@@ -13,6 +14,7 @@ mod update;
 
 pub use bulk_insert::BulkInsert;
 pub use cte::Cte;
+pub use ddl::{ColumnType, CreateIndex, CreateTable, DropIndex, DropTable};
 pub use delete::Delete;
 pub use expr::{AggFunc, ArithOp, BinOp, Case, Expr, Window};
 pub use insert::Insert;
