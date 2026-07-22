@@ -8,13 +8,30 @@
 
 use rusty_db::prelude::*;
 
-async fn file_engine(name: &str) -> rusty_db::Result<Engine> {
-    let path = std::env::temp_dir().join(format!(
+fn file_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
         "rusty_db_ddl_{name}_{}.sqlite3",
         std::process::id()
-    ));
+    ))
+}
+
+async fn file_engine(name: &str) -> rusty_db::Result<Engine> {
+    let path = file_path(name);
     let _ = std::fs::remove_file(&path);
     let url = format!("sqlite://{}?mode=rwc", path.display());
+    SqliteDriver::engine(&url).await
+}
+
+/// A fresh `Engine` (a brand new connection pool) against the *same*
+/// on-disk file an earlier `file_engine` call already created — see
+/// `AlterTable`'s own docs for why this matters: on SQLite, a connection
+/// that already had a table's *pre-ALTER* shape "in view" can panic
+/// (inside the underlying `sqlx-sqlite` driver, a known upstream
+/// limitation — see `AlterTable`'s doc comment) if queried again through
+/// the same pool right after that table is altered. A genuinely fresh
+/// connection has no such staleness.
+async fn reopen_engine(name: &str) -> rusty_db::Result<Engine> {
+    let url = format!("sqlite://{}?mode=rw", file_path(name).display());
     SqliteDriver::engine(&url).await
 }
 
@@ -308,6 +325,100 @@ async fn create_index_enforces_uniqueness_and_drop_index_lifts_it() -> rusty_db:
                 .value("email", "ada@example.com"),
         )
         .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_add_column_is_usable_from_a_fresh_connection() -> rusty_db::Result<()> {
+    let engine = file_engine("alter_add_column").await?;
+
+    engine
+        .execute(
+            &CreateTable::new("customers")
+                .column("id", ColumnType::I64)
+                .primary_key(),
+        )
+        .await?;
+    let table = Table::new("customers");
+    engine
+        .execute(&Insert::into_table(&table).value("id", 1_i64))
+        .await?;
+    engine
+        .execute(
+            &AlterTable::add_column("customers", "credits", ColumnType::I64)
+                .not_null()
+                .default_raw("0"),
+        )
+        .await?;
+    drop(engine);
+
+    // See `AlterTable`'s own docs: a connection queried through the same
+    // pool an SQLite `ALTER TABLE` just ran on can panic inside the
+    // underlying driver (a known upstream limitation) — a fresh `Engine`
+    // against the same file has no such staleness.
+    let engine = reopen_engine("alter_add_column").await?;
+    let row = engine
+        .fetch_optional(&Select::from(&table))
+        .await?
+        .expect("the row still exists");
+    assert_eq!(
+        row.get_by_name::<i64>("credits")?,
+        0,
+        "the new column's default backfilled the existing row"
+    );
+
+    engine
+        .execute(
+            &Insert::into_table(&table)
+                .value("id", 2_i64)
+                .value("credits", 5_i64),
+        )
+        .await?;
+    let row2 = engine
+        .fetch_all(&Select::from(&table).filter(table.col("id").eq(2_i64)))
+        .await?;
+    assert_eq!(row2[0].get_by_name::<i64>("credits")?, 5);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn alter_table_drop_column_removes_it() -> rusty_db::Result<()> {
+    let engine = file_engine("alter_drop_column").await?;
+
+    engine
+        .execute(
+            &CreateTable::new("customers")
+                .column("id", ColumnType::I64)
+                .primary_key()
+                .column("nickname", ColumnType::Text),
+        )
+        .await?;
+    let table = Table::new("customers");
+    engine
+        .execute(
+            &Insert::into_table(&table)
+                .value("id", 1_i64)
+                .value("nickname", "ace"),
+        )
+        .await?;
+    engine
+        .execute(&AlterTable::drop_column("customers", "nickname"))
+        .await?;
+    drop(engine);
+
+    // Same reasoning as alter_table_add_column_is_usable_from_a_fresh_connection.
+    let engine = reopen_engine("alter_drop_column").await?;
+    let schema = engine
+        .table_schema("customers")
+        .await?
+        .expect("the table still exists");
+    assert!(
+        !schema.columns.iter().any(|c| c.name == "nickname"),
+        "the dropped column should no longer be part of the schema"
+    );
+    assert!(schema.columns.iter().any(|c| c.name == "id"));
 
     Ok(())
 }

@@ -275,6 +275,133 @@ impl ToSql for CreateTable {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AddColumnDef {
+    name: String,
+    ty: ColumnType,
+    nullable: bool,
+    default: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum AlterOperation {
+    AddColumn(AddColumnDef),
+    DropColumn(String),
+}
+
+/// Builds a portable `ALTER TABLE` statement — always exactly *one*
+/// operation (`ADD COLUMN` or `DROP COLUMN`), never several combined into
+/// one statement: Postgres and MySQL/MariaDB both allow comma-separating
+/// multiple actions in a single `ALTER TABLE`, but SQLite only ever allows
+/// one action per statement, so combining several would render
+/// differently — or fail outright — per dialect. Modifying several
+/// columns means calling `engine.execute(...)` once per `AlterTable`,
+/// which works identically everywhere.
+///
+/// Adding a `NOT NULL` column with no default to a table that already has
+/// rows is rejected by the database itself (there'd be no value for
+/// existing rows) — this isn't checked here, the same "let the database
+/// enforce its own rules" approach `CreateTable`'s `CHECK`/`DEFAULT`
+/// already take.
+///
+/// **A real caveat, not a hypothetical one:** on SQLite, a connection that
+/// already had a table's *pre-`ALTER`* shape "in view" can panic (inside
+/// the underlying `sqlx-sqlite` driver, not this crate) if it's used to
+/// query that table again right after altering it — a long-standing
+/// upstream limitation in how SQLite's own statement caching interacts
+/// with schema changes (see [`launchbadge/sqlx#296`](https://github.com/launchbadge/sqlx/issues/296)).
+/// Postgres has a related but much gentler version of the same thing: a
+/// `SELECT *`-shaped statement already prepared against the old shape can
+/// fail with a clean, catchable `"cached plan must not change result
+/// type"` error if reused on the same connection afterward — a normal
+/// consequence of Postgres's own server-side prepared statements, not a
+/// bug. MySQL/MariaDB has neither issue. On any dialect, the safe pattern
+/// is the same: get a fresh `Engine` (a new connection pool) before
+/// reading from a table you just ran `AlterTable` against, rather than
+/// continuing to use the one that issued the `ALTER TABLE` itself.
+#[derive(Debug, Clone)]
+pub struct AlterTable {
+    table: String,
+    operation: AlterOperation,
+}
+
+impl AlterTable {
+    /// `ALTER TABLE <table> ADD COLUMN <name> <ty>`, nullable by default —
+    /// chain `.not_null()`/`.default_raw(...)` right after to modify it.
+    pub fn add_column(table: impl Into<String>, name: impl Into<String>, ty: ColumnType) -> Self {
+        AlterTable {
+            table: table.into(),
+            operation: AlterOperation::AddColumn(AddColumnDef {
+                name: name.into(),
+                ty,
+                nullable: true,
+                default: None,
+            }),
+        }
+    }
+
+    /// `ALTER TABLE <table> DROP COLUMN <name>`.
+    pub fn drop_column(table: impl Into<String>, name: impl Into<String>) -> Self {
+        AlterTable {
+            table: table.into(),
+            operation: AlterOperation::DropColumn(name.into()),
+        }
+    }
+
+    fn added_column(&mut self) -> &mut AddColumnDef {
+        match &mut self.operation {
+            AlterOperation::AddColumn(def) => def,
+            AlterOperation::DropColumn(_) => {
+                panic!("AlterTable: .not_null()/.default_raw() only apply to .add_column(...)")
+            }
+        }
+    }
+
+    /// The column being added may not be `NULL`. Only meaningful after
+    /// `add_column`; panics after `drop_column`.
+    pub fn not_null(mut self) -> Self {
+        self.added_column().nullable = false;
+        self
+    }
+
+    /// A raw SQL fragment as the added column's `DEFAULT` — the same
+    /// raw-SQL convention `CreateTable::default_raw`/`Insert::raw_value`
+    /// use. Only meaningful after `add_column`; panics after `drop_column`.
+    pub fn default_raw(mut self, raw_sql: impl Into<String>) -> Self {
+        self.added_column().default = Some(raw_sql.into());
+        self
+    }
+}
+
+impl ToSql for AlterTable {
+    fn to_sql(&self, dialect: &dyn Dialect) -> (String, Vec<Value>) {
+        let sql = match &self.operation {
+            AlterOperation::AddColumn(def) => {
+                let mut line = format!(
+                    "ALTER TABLE {} ADD COLUMN {} {}",
+                    dialect.quote_ident(&self.table),
+                    dialect.quote_ident(&def.name),
+                    dialect.column_type_sql(&def.ty)
+                );
+                if !def.nullable {
+                    line.push_str(" NOT NULL");
+                }
+                if let Some(default) = &def.default {
+                    line.push_str(" DEFAULT ");
+                    line.push_str(default);
+                }
+                line
+            }
+            AlterOperation::DropColumn(name) => format!(
+                "ALTER TABLE {} DROP COLUMN {}",
+                dialect.quote_ident(&self.table),
+                dialect.quote_ident(name)
+            ),
+        };
+        (sql, Vec::new())
+    }
+}
+
 /// Builds a portable `DROP TABLE` statement.
 #[derive(Debug, Clone)]
 pub struct DropTable {

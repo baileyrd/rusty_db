@@ -191,3 +191,57 @@ async fn drop_index_uses_the_table_name_mysql_requires() -> rusty_db::Result<()>
     engine.execute(&DropTable::new("ddl_mysql_people")).await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn alter_table_add_and_drop_column() -> rusty_db::Result<()> {
+    let Some(engine) = test_engine().await else {
+        return Ok(());
+    };
+
+    engine
+        .execute(&DropTable::new("ddl_mysql_alter").if_exists())
+        .await?;
+    engine
+        .execute(
+            &CreateTable::new("ddl_mysql_alter")
+                .column("id", ColumnType::I64)
+                .primary_key(),
+        )
+        .await?;
+    let table = Table::new("ddl_mysql_alter");
+    engine
+        .execute(&Insert::into_table(&table).value("id", 1_i64))
+        .await?;
+
+    engine
+        .execute(
+            &AlterTable::add_column("ddl_mysql_alter", "credits", ColumnType::I64)
+                .not_null()
+                .default_raw("0"),
+        )
+        .await?;
+    let row = engine
+        .fetch_optional(&Select::from(&table))
+        .await?
+        .expect("the row still exists");
+    assert_eq!(
+        row.get_by_name::<i64>("credits")?,
+        0,
+        "the new column's default backfilled the existing row"
+    );
+
+    engine
+        .execute(&AlterTable::drop_column("ddl_mysql_alter", "credits"))
+        .await?;
+    let schema = engine
+        .table_schema("ddl_mysql_alter")
+        .await?
+        .expect("the table still exists");
+    assert!(
+        !schema.columns.iter().any(|c| c.name == "credits"),
+        "the dropped column should no longer be part of the schema"
+    );
+
+    engine.execute(&DropTable::new("ddl_mysql_alter")).await?;
+    Ok(())
+}

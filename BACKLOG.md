@@ -41,10 +41,14 @@ correlated `EXISTS`, and scalar subqueries, though not yet a subquery in a
 `FROM` clause — CTEs via `Cte`, including `WITH RECURSIVE`, and window
 functions (`ROW_NUMBER`/`RANK`/`DENSE_RANK`, and aggregates as window
 functions, via `Window`/`.over(...)`); a portable DDL builder
-(`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`, with a portable
-`ColumnType` translated to each dialect's own `CREATE TABLE` spelling) —
-scoped to creating/dropping tables and indexes, not yet altering an
-existing table's columns or renaming anything; first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
+(`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`/`AlterTable`, with a
+portable `ColumnType` translated to each dialect's own `CREATE TABLE`
+spelling) — `AlterTable` only adds/drops a column (no renaming or
+altering an existing column's type/constraints), and on SQLite specifically
+carries a real caveat: a connection that already had a table's pre-`ALTER`
+shape in view can panic if reused to query that table right afterward, a
+long-standing upstream `sqlx`/SQLite limitation (a fresh `Engine` avoids
+it); first-class `Value` variants for `Uuid`, `BigDecimal`, `serde_json::Value` (as `Json`),
 `chrono`'s `NaiveDate`/`NaiveTime`/`NaiveDateTime`/`DateTime<Utc>`, and
 `Vec<T>` arrays (native on Postgres, JSON-flattened on MySQL/MariaDB and
 SQLite); `#[derive(Mapped)]` with one primary key, one version column, one
@@ -80,11 +84,12 @@ the full tour with examples.
   live database and generate the migration for you, instead of every
   migration being fully hand-written. Reflection is now rich enough
   (columns/FKs/indexes/unique/check constraints/defaults) to diff against,
-  and the DDL builder (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`)
-  now exists to emit the generated migration's statements — though it
-  doesn't yet cover altering an existing table's columns or renaming
-  anything, which autogenerate's diff will very often need to emit; this
-  is the single largest remaining gap in the migrations story. **XL**
+  and the DDL builder (`CreateTable`/`DropTable`/`CreateIndex`/`DropIndex`/
+  `AlterTable`) now exists to emit the generated migration's statements —
+  though it still doesn't cover renaming a column/table or altering an
+  existing column's type/constraints (only `ADD`/`DROP COLUMN`), which
+  autogenerate's diff will sometimes need to emit; this is the single
+  largest remaining gap in the migrations story. **XL**
 
 ## Mapping / derive macro (`#[derive(Mapped)]`)
 
