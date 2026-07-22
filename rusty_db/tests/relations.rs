@@ -968,6 +968,91 @@ async fn has_many_joined_with_a_filter_narrows_the_parent_batch() -> rusty_db::R
 }
 
 #[tokio::test]
+async fn has_one_joined_matches_the_select_in_result_despite_colliding_id_columns(
+) -> rusty_db::Result<()> {
+    // User and Profile both map their own "id" column too.
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    // A third user with no profile at all.
+    let linus = User {
+        id: 3,
+        name: "linus".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+    engine.execute(&linus.insert()).await?;
+
+    let ada_profile = Profile {
+        id: 1,
+        user_id: 1,
+        bio: "mathematician".to_string(),
+    };
+    engine.execute(&ada_profile.insert()).await?;
+
+    let (parents, profiles_by_user): (Vec<User>, HashMap<i64, Profile>) =
+        rusty_db::relations::load_has_one_joined(&engine, None, "id", "user_id").await?;
+
+    let mut parent_ids: Vec<i64> = parents.iter().map(|u| u.id).collect();
+    parent_ids.sort();
+    assert_eq!(parent_ids, vec![1, 2, 3]);
+
+    assert_eq!(profiles_by_user.len(), 1); // grace and linus have no entry at all
+    assert_eq!(profiles_by_user.get(&ada.id).unwrap(), &ada_profile);
+    assert!(!profiles_by_user.contains_key(&grace.id));
+    assert!(!profiles_by_user.contains_key(&linus.id));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn has_one_joined_reports_a_conflict_when_a_parent_has_more_than_one_matching_row(
+) -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+
+    // Two profiles for the same user: not actually a one-to-one relationship.
+    engine
+        .execute(
+            &(Profile {
+                id: 1,
+                user_id: 1,
+                bio: "mathematician".to_string(),
+            })
+            .insert(),
+        )
+        .await?;
+    engine
+        .execute(
+            &(Profile {
+                id: 2,
+                user_id: 1,
+                bio: "also a mathematician".to_string(),
+            })
+            .insert(),
+        )
+        .await?;
+
+    let result: rusty_db::Result<(Vec<User>, HashMap<i64, Profile>)> =
+        rusty_db::relations::load_has_one_joined(&engine, None, "id", "user_id").await;
+    assert!(matches!(result, Err(rusty_db::Error::Conflict(_))));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_cascading_deletes_cascade_delete_children_and_the_parent() -> rusty_db::Result<()> {
     let engine = engine_with_schema().await?;
 
