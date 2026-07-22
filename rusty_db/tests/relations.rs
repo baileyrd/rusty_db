@@ -833,6 +833,141 @@ async fn derive_generated_via_subquery_methods_work_end_to_end() -> rusty_db::Re
 }
 
 #[tokio::test]
+async fn has_many_joined_matches_the_select_in_result_despite_colliding_id_columns(
+) -> rusty_db::Result<()> {
+    // User and Order both map their own "id" column — proving the joined
+    // strategy's internal per-side column aliasing actually works, not
+    // just that it happens not to matter for this particular schema.
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    // A third user with no orders at all.
+    let linus = User {
+        id: 3,
+        name: "linus".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+    engine.execute(&linus.insert()).await?;
+
+    let orders = vec![
+        Order {
+            id: 1,
+            user_id: 1,
+            amount: 100,
+        },
+        Order {
+            id: 2,
+            user_id: 1,
+            amount: 50,
+        },
+        Order {
+            id: 3,
+            user_id: 2,
+            amount: 200,
+        },
+    ];
+    for order in &orders {
+        engine.execute(&order.insert()).await?;
+    }
+
+    let (parents, orders_by_user): (Vec<User>, HashMap<i64, Vec<Order>>) =
+        rusty_db::relations::load_many_joined(&engine, None, "id", "user_id").await?;
+
+    // Every user comes back exactly once, including the childless one —
+    // the join's per-child row repetition was correctly deduplicated.
+    let mut parent_ids: Vec<i64> = parents.iter().map(|u| u.id).collect();
+    parent_ids.sort();
+    assert_eq!(parent_ids, vec![1, 2, 3]);
+
+    let mut ada_orders = orders_by_user.get(&ada.id).unwrap().clone();
+    ada_orders.sort_by_key(|o| o.id);
+    assert_eq!(
+        ada_orders,
+        vec![
+            Order {
+                id: 1,
+                user_id: 1,
+                amount: 100
+            },
+            Order {
+                id: 2,
+                user_id: 1,
+                amount: 50
+            },
+        ]
+    );
+    assert_eq!(
+        orders_by_user.get(&grace.id).unwrap(),
+        &vec![Order {
+            id: 3,
+            user_id: 2,
+            amount: 200
+        }]
+    );
+    // A childless parent still appears in the parent list, but has no
+    // entry at all in the children map — same as `load_many`'s shape.
+    assert!(!orders_by_user.contains_key(&linus.id));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn has_many_joined_with_a_filter_narrows_the_parent_batch() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+
+    engine
+        .execute(
+            &(Order {
+                id: 1,
+                user_id: 1,
+                amount: 100,
+            })
+            .insert(),
+        )
+        .await?;
+    engine
+        .execute(
+            &(Order {
+                id: 2,
+                user_id: 2,
+                amount: 200,
+            })
+            .insert(),
+        )
+        .await?;
+
+    let filter = User::table().col("id").eq(1_i64);
+    let (parents, orders_by_user): (Vec<User>, HashMap<i64, Vec<Order>>) =
+        rusty_db::relations::load_many_joined(&engine, Some(filter), "id", "user_id").await?;
+
+    assert_eq!(parents, vec![ada.clone()]);
+    assert!(orders_by_user.contains_key(&ada.id));
+    // grace's order genuinely exists but grace was excluded by the filter.
+    assert!(!orders_by_user.contains_key(&grace.id));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_cascading_deletes_cascade_delete_children_and_the_parent() -> rusty_db::Result<()> {
     let engine = engine_with_schema().await?;
 

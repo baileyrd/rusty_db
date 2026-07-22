@@ -19,10 +19,27 @@
 //! server-side in one round trip instead of two. This is the same trick
 //! that gives this crate `IN (subquery)` support and a genuine `FROM`
 //! subquery for free, without a new "derived table" primitive: a CTE is
-//! already just a named, referenceable result set.
+//! already just a named, referenceable result set. `#[has_many(...)]`/etc.
+//! also generate a `_via_subquery`-suffixed convenience method around
+//! each of these.
 //!
-//! Not (yet) wired into `#[has_many(...)]`/etc. as an opt-in `strategy`
-//! the way the plain functions above are — call these directly.
+//! `load_many_joined` is a third strategy — SQLAlchemy calls this
+//! `joinedload` — for the `has_many` shape only so far. Unlike the two
+//! above, it doesn't add a second query at all: parents and their
+//! matching children come back from a single `LEFT JOIN` query, one row
+//! per matched child (or one row with every child column `NULL` for a
+//! parent with none). That's a materially different shape than
+//! `load_many`/`load_many_via_subquery` return — those always start from
+//! an already-fetched (or independently queried) parent batch — so
+//! `load_many_joined` fetches *and* returns the parents itself, not just
+//! the children, and has to deduplicate the repeated parent rows a join
+//! naturally produces. It also has to solve a problem the other two
+//! strategies never hit: `Parent`'s and `Child`'s own column names can
+//! collide (both mapping an `id` primary key, say), so every selected
+//! column gets an internal, uniquely prefixed alias, invisible to the
+//! caller, that `FromRow` decodes back through.
+//! Not (yet) generalized to `has_one`/`belongs_to`/`many_to_many`, or
+//! wired into `#[has_many(...)]` as an opt-in strategy — call it directly.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -30,7 +47,7 @@ use std::hash::Hash;
 use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::mapping::{FromRow, Mapped};
-use crate::query::{Cte, Select, Table};
+use crate::query::{Cte, Expr, Select, SelectExpr, Table};
 use crate::row::Row;
 use crate::value::{FromValue, Value};
 
@@ -391,4 +408,108 @@ where
     }
 
     Ok(grouped)
+}
+
+const JOINED_PARENT_PREFIX: &str = "__rusty_db_joined_parent__";
+const JOINED_CHILD_PREFIX: &str = "__rusty_db_joined_child__";
+
+/// A synthetic `Row` built from every column in `row` whose name starts
+/// with `prefix`, with the prefix stripped back off — used to decode one
+/// side of `load_many_joined`'s aliased column projection without
+/// `Parent`/`Child` ever needing to know a join happened at all.
+fn prefixed_sub_row(row: &Row, prefix: &str) -> Row {
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    for (i, name) in row.columns().iter().enumerate() {
+        if let Some(stripped) = name.strip_prefix(prefix) {
+            columns.push(stripped.to_string());
+            values.push(row.value(i).cloned().unwrap_or(Value::Null));
+        }
+    }
+    Row::new(columns.into(), values)
+}
+
+/// Has-many eager load via the "joined" strategy (SQLAlchemy's
+/// `joinedload`): fetches every `Parent` row matching `filter` (`None`
+/// for no filter) together with its matching `Child` rows in a single
+/// `LEFT JOIN` query — one round trip total, not `load_many`'s two.
+/// Returns the parents in the order they first appear in the joined
+/// result set, deduplicated (a join naturally repeats a parent row once
+/// per matching child), alongside the same `HashMap<PK, Vec<Child>>`
+/// shape `load_many` returns — a parent with no matching children has no
+/// entry in it, same as there.
+///
+/// `Parent` and `Child` may map columns with the very same name (both
+/// having their own `id` primary key, say) without colliding: every
+/// selected column is given an internal, uniquely prefixed alias, and
+/// decoded back through it — invisible to the caller, and to `FromRow`.
+///
+/// Simpler than `load_many_via_subquery`'s `parent_ids: Select` — this
+/// only accepts a plain `filter` on `Parent`'s own table (build it with
+/// `Parent::table().col(...)`, not a fresh `Table::new(...)`, so its
+/// column references resolve against the same table name this function
+/// builds internally), rather than an arbitrary caller-built query, since
+/// the join and column-aliasing this needs require an actual `Table`
+/// handle this function controls throughout, not just a key column name.
+pub async fn load_many_joined<Parent, Child, PK>(
+    engine: &Engine,
+    filter: Option<Expr>,
+    parent_pk_column: &str,
+    fk_column: &str,
+) -> Result<(Vec<Parent>, HashMap<PK, Vec<Child>>)>
+where
+    Parent: Mapped + FromRow,
+    Child: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash + Clone,
+{
+    let parent_table = Table::new(Parent::TABLE_NAME);
+    let child_table = Table::new(Child::TABLE_NAME);
+
+    let mut select_columns: Vec<SelectExpr> = Parent::COLUMNS
+        .iter()
+        .map(|c| SelectExpr::from(parent_table.col(*c)).alias(format!("{JOINED_PARENT_PREFIX}{c}")))
+        .collect();
+    select_columns.extend(
+        Child::COLUMNS.iter().map(|c| {
+            SelectExpr::from(child_table.col(*c)).alias(format!("{JOINED_CHILD_PREFIX}{c}"))
+        }),
+    );
+
+    let mut query = Select::from(&parent_table)
+        .left_join(
+            &child_table,
+            parent_table
+                .col(parent_pk_column)
+                .eq_col(&child_table.col(fk_column)),
+        )
+        .columns(select_columns);
+    if let Some(filter) = filter {
+        query = query.filter(filter);
+    }
+
+    let mut parents = Vec::new();
+    let mut seen_parent_keys: HashSet<PK> = HashSet::new();
+    let mut children: HashMap<PK, Vec<Child>> = HashMap::new();
+
+    for row in engine.fetch_all(&query).await? {
+        let parent_row = prefixed_sub_row(&row, JOINED_PARENT_PREFIX);
+        let parent_key: PK = parent_row.get_by_name(parent_pk_column)?;
+        if seen_parent_keys.insert(parent_key.clone()) {
+            parents.push(Parent::from_row(&parent_row)?);
+        }
+
+        let child_row = prefixed_sub_row(&row, JOINED_CHILD_PREFIX);
+        // A `LEFT JOIN` with no matching child row comes back with every
+        // child column `NULL`, including the join key itself — the join
+        // condition guarantees a real match's `fk_column` is never null,
+        // so this is an unambiguous "no child here" signal regardless of
+        // whether any of `Child`'s own fields happen to be nullable.
+        let fk_value: Value = child_row.get_by_name(fk_column)?;
+        if !matches!(fk_value, Value::Null) {
+            let child = Child::from_row(&child_row)?;
+            children.entry(parent_key).or_default().push(child);
+        }
+    }
+
+    Ok((parents, children))
 }
