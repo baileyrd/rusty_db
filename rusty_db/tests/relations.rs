@@ -455,6 +455,298 @@ async fn many_to_many_returns_empty_map_for_empty_input() -> rusty_db::Result<()
 }
 
 #[tokio::test]
+async fn has_many_via_subquery_matches_the_select_in_result_for_a_filtered_parent_batch(
+) -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    // Excluded from the parent batch below by its own filter, not by lack of orders.
+    let linus = User {
+        id: 3,
+        name: "linus".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+    engine.execute(&linus.insert()).await?;
+
+    engine
+        .execute(
+            &(Order {
+                id: 1,
+                user_id: 1,
+                amount: 100,
+            })
+            .insert(),
+        )
+        .await?;
+    engine
+        .execute(
+            &(Order {
+                id: 2,
+                user_id: 1,
+                amount: 50,
+            })
+            .insert(),
+        )
+        .await?;
+    engine
+        .execute(
+            &(Order {
+                id: 3,
+                user_id: 2,
+                amount: 200,
+            })
+            .insert(),
+        )
+        .await?;
+    engine
+        .execute(
+            &(Order {
+                id: 4,
+                user_id: 3,
+                amount: 999,
+            })
+            .insert(),
+        )
+        .await?;
+
+    let users_table = User::table();
+    // Only ada and grace are in the parent batch — linus is filtered out here,
+    // not because linus has no orders (linus does).
+    let parent_ids = Select::from(&users_table)
+        .columns([users_table.col("id")])
+        .filter(users_table.col("id").lt(3_i64));
+
+    let orders_by_user: HashMap<i64, Vec<Order>> =
+        rusty_db::relations::load_many_via_subquery(&engine, parent_ids, "id", "user_id").await?;
+
+    assert_eq!(orders_by_user.len(), 2);
+    let mut ada_orders = orders_by_user.get(&ada.id).unwrap().clone();
+    ada_orders.sort_by_key(|o| o.id);
+    assert_eq!(
+        ada_orders,
+        vec![
+            Order {
+                id: 1,
+                user_id: 1,
+                amount: 100
+            },
+            Order {
+                id: 2,
+                user_id: 1,
+                amount: 50
+            },
+        ]
+    );
+    assert_eq!(
+        orders_by_user.get(&grace.id).unwrap(),
+        &vec![Order {
+            id: 3,
+            user_id: 2,
+            amount: 200
+        }]
+    );
+    assert!(!orders_by_user.contains_key(&linus.id));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn has_one_via_subquery_matches_the_select_in_result() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+
+    let ada_profile = Profile {
+        id: 1,
+        user_id: 1,
+        bio: "mathematician".to_string(),
+    };
+    engine.execute(&ada_profile.insert()).await?;
+
+    let users_table = User::table();
+    let parent_ids = Select::from(&users_table).columns([users_table.col("id")]);
+
+    let profiles_by_user: HashMap<i64, Profile> =
+        rusty_db::relations::load_has_one_via_subquery(&engine, parent_ids, "id", "user_id")
+            .await?;
+
+    assert_eq!(profiles_by_user.len(), 1);
+    assert_eq!(profiles_by_user.get(&ada.id).unwrap(), &ada_profile);
+    assert!(!profiles_by_user.contains_key(&grace.id));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn has_one_via_subquery_reports_the_same_conflict_as_the_select_in_version(
+) -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine
+        .execute(
+            &(Profile {
+                id: 1,
+                user_id: 1,
+                bio: "mathematician".to_string(),
+            })
+            .insert(),
+        )
+        .await?;
+    engine
+        .execute(
+            &(Profile {
+                id: 2,
+                user_id: 1,
+                bio: "also a mathematician".to_string(),
+            })
+            .insert(),
+        )
+        .await?;
+
+    let users_table = User::table();
+    let parent_ids = Select::from(&users_table).columns([users_table.col("id")]);
+
+    let result: rusty_db::Result<HashMap<i64, Profile>> =
+        rusty_db::relations::load_has_one_via_subquery(&engine, parent_ids, "id", "user_id").await;
+    assert!(matches!(result, Err(rusty_db::Error::Conflict(_))));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn belongs_to_via_subquery_matches_the_select_in_result() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+
+    let orders = vec![
+        Order {
+            id: 1,
+            user_id: 1,
+            amount: 100,
+        },
+        Order {
+            id: 2,
+            user_id: 1,
+            amount: 50,
+        },
+        Order {
+            id: 3,
+            user_id: 2,
+            amount: 200,
+        },
+    ];
+    for order in &orders {
+        engine.execute(&order.insert()).await?;
+    }
+
+    let orders_table = Order::table();
+    let foreign_key_ids = Select::from(&orders_table).columns([orders_table.col("user_id")]);
+
+    let users_by_id: HashMap<i64, User> =
+        rusty_db::relations::load_one_via_subquery(&engine, foreign_key_ids, "user_id", "id")
+            .await?;
+
+    assert_eq!(users_by_id.len(), 2);
+    assert_eq!(users_by_id.get(&1).unwrap(), &ada);
+    assert_eq!(users_by_id.get(&2).unwrap(), &grace);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn many_to_many_via_subquery_matches_the_select_in_result() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let rust_post = Post {
+        id: 1,
+        title: "Why Rust".to_string(),
+    };
+    let db_post = Post {
+        id: 2,
+        title: "Databases 101".to_string(),
+    };
+    engine.execute(&rust_post.insert()).await?;
+    engine.execute(&db_post.insert()).await?;
+
+    let rust_tag = Tag {
+        id: 1,
+        name: "rust".to_string(),
+    };
+    let db_tag = Tag {
+        id: 2,
+        name: "databases".to_string(),
+    };
+    let systems_tag = Tag {
+        id: 3,
+        name: "systems".to_string(),
+    };
+    engine.execute(&rust_tag.insert()).await?;
+    engine.execute(&db_tag.insert()).await?;
+    engine.execute(&systems_tag.insert()).await?;
+
+    insert_post_tag(&engine, rust_post.id, rust_tag.id).await?;
+    insert_post_tag(&engine, rust_post.id, systems_tag.id).await?;
+    insert_post_tag(&engine, db_post.id, rust_tag.id).await?;
+    insert_post_tag(&engine, db_post.id, db_tag.id).await?;
+
+    let posts_table = Post::table();
+    let parent_ids = Select::from(&posts_table).columns([posts_table.col("id")]);
+
+    let tags_by_post: HashMap<i64, Vec<Tag>> = rusty_db::relations::load_many_to_many_via_subquery(
+        &engine,
+        parent_ids,
+        "id",
+        "post_tags",
+        "post_id",
+        "tag_id",
+        "id",
+    )
+    .await?;
+
+    assert_eq!(tags_by_post.len(), 2);
+    let mut rust_post_tags = tags_by_post.get(&rust_post.id).unwrap().clone();
+    rust_post_tags.sort_by_key(|t| t.id);
+    assert_eq!(rust_post_tags, vec![rust_tag.clone(), systems_tag.clone()]);
+    let mut db_post_tags = tags_by_post.get(&db_post.id).unwrap().clone();
+    db_post_tags.sort_by_key(|t| t.id);
+    assert_eq!(db_post_tags, vec![rust_tag.clone(), db_tag.clone()]);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_cascading_deletes_cascade_delete_children_and_the_parent() -> rusty_db::Result<()> {
     let engine = engine_with_schema().await?;
 
