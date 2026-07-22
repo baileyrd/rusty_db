@@ -1090,3 +1090,33 @@ fn alter_table_drop_column_renders_identically_shaped_sql_on_every_dialect() {
 fn alter_table_not_null_after_drop_column_panics() {
     let _ = AlterTable::drop_column("users", "nickname").not_null();
 }
+
+#[test]
+fn alter_table_rename_column_renders_identically_shaped_sql_on_every_dialect() {
+    let (sqlite_sql, _) =
+        AlterTable::rename_column("users", "nickname", "display_name").to_sql(&QuestionMarkDialect);
+    assert_eq!(
+        sqlite_sql,
+        r#"ALTER TABLE "users" RENAME COLUMN "nickname" TO "display_name""#
+    );
+
+    let (mysql_sql, _) =
+        AlterTable::rename_column("users", "nickname", "display_name").to_sql(&MySqlDialect);
+    assert_eq!(
+        mysql_sql,
+        "ALTER TABLE `users` RENAME COLUMN `nickname` TO `display_name`"
+    );
+
+    let (pg_sql, _) =
+        AlterTable::rename_column("users", "nickname", "display_name").to_sql(&NumberedDialect);
+    assert_eq!(
+        pg_sql,
+        r#"ALTER TABLE "users" RENAME COLUMN "nickname" TO "display_name""#
+    );
+}
+
+#[test]
+#[should_panic(expected = "only apply to .add_column(...)")]
+fn alter_table_not_null_after_rename_column_panics() {
+    let _ = AlterTable::rename_column("users", "nickname", "display_name").not_null();
+}

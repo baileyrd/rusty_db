@@ -32,7 +32,7 @@ pub mod timeout;
 pub mod value;
 
 pub use audit::{AuditEntry, AuditOperation};
-pub use autogenerate::TableSpec;
+pub use autogenerate::{AutogenerateOptions, TableSpec};
 pub use backup::{DatabaseDump, TableDump};
 pub use connection::{Connection, Driver, Executor};
 pub use dialect::Dialect;
