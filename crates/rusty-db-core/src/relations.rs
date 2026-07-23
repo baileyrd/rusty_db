@@ -23,24 +23,28 @@
 //! also generate a `_via_subquery`-suffixed convenience method around
 //! each of these.
 //!
-//! `load_many_joined`/`load_has_one_joined` are a third strategy —
-//! SQLAlchemy calls this `joinedload` — for the `has_many`/`has_one`
-//! shapes so far. Unlike the two above, it doesn't add a second query at
-//! all: parents and their matching children come back from a single
-//! `LEFT JOIN` query, one row per matched child (or one row with every
-//! child column `NULL` for a parent with none). That's a materially
-//! different shape than `load_many`/`load_many_via_subquery` return —
-//! those always start from an already-fetched (or independently queried)
-//! parent batch — so these fetch *and* return the parents themselves, not
-//! just the children, and have to deduplicate the repeated parent rows a
-//! join naturally produces. They also have to solve a problem the other
-//! two strategies never hit: `Parent`'s and `Child`'s own column names can
-//! collide (both mapping an `id` primary key, say), so every selected
-//! column gets an internal, uniquely prefixed alias, invisible to the
-//! caller, that `FromRow` decodes back through.
-//! Not (yet) generalized to `belongs_to`/`many_to_many`, or wired into
-//! `#[has_many(...)]`/`#[has_one(...)]` as an opt-in strategy — call
-//! these directly.
+//! `load_many_joined`/`load_has_one_joined`/`load_one_joined` are a third
+//! strategy — SQLAlchemy calls this `joinedload` — for the
+//! `has_many`/`has_one`/`belongs_to` shapes so far. Unlike the two above,
+//! it doesn't add a second query at all: both sides come back from a
+//! single `LEFT JOIN` query, one row per match (or one row with every
+//! column on the "many" side's counterpart `NULL`, for an unmatched row).
+//! That's a materially different shape than `load_many`/
+//! `load_many_via_subquery` return — those always start from an
+//! already-fetched (or independently queried) batch on one side — so
+//! these fetch *and* return both sides themselves, and have to
+//! deduplicate whichever side the join naturally repeats: the "one" side
+//! for `has_many`/`has_one` (a parent row repeats once per matching
+//! child), or the referenced side for `belongs_to` (a parent row repeats
+//! once per child that references it — see `load_one_joined`'s own doc
+//! for why the deduplication direction flips there). They also have to
+//! solve a problem the other two strategies never hit: the two mapped
+//! types' own column names can collide (both mapping an `id` primary key,
+//! say), so every selected column gets an internal, uniquely prefixed
+//! alias, invisible to the caller, that `FromRow` decodes back through.
+//! Not (yet) generalized to `many_to_many`, or wired into
+//! `#[has_many(...)]`/`#[has_one(...)]`/`#[belongs_to(...)]` as an opt-in
+//! strategy — call these directly.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -574,4 +578,79 @@ where
     }
 
     Ok((parents, matches))
+}
+
+/// Belongs-to (many-to-one) eager load via the "joined" strategy: fetches
+/// every `Child` row matching `filter` (`None` for no filter) together
+/// with the single `Parent` row it references, in one `LEFT JOIN` query —
+/// one round trip total, not `load_one`'s two.
+///
+/// The deduplication direction is the opposite of `load_many_joined`/
+/// `load_has_one_joined`: there, one parent row could repeat across
+/// several matching children, so the *parent* list needed deduplicating.
+/// Here it's the reverse — each `Child` row matches at most one `Parent`,
+/// so `Child` never repeats and needs no dedup, but more than one child
+/// can reference the *same* parent, so the returned
+/// `HashMap<PK, Parent>` (the same shape `load_one` returns, keyed by
+/// `parent_key_column`) is what dedupes instead.
+///
+/// `filter` is on `Child`'s own table this time (build it with
+/// `Child::table().col(...)`, not a fresh `Table::new(...)`, so it
+/// resolves against the same table name this function builds
+/// internally) — see `load_many_joined` for why only a plain `filter` is
+/// accepted, and for how `Parent`/`Child` column-name collisions are
+/// resolved.
+pub async fn load_one_joined<Child, Parent, PK>(
+    engine: &Engine,
+    filter: Option<Expr>,
+    fk_column: &str,
+    parent_key_column: &str,
+) -> Result<(Vec<Child>, HashMap<PK, Parent>)>
+where
+    Child: Mapped + FromRow,
+    Parent: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash,
+{
+    let child_table = Table::new(Child::TABLE_NAME);
+    let parent_table = Table::new(Parent::TABLE_NAME);
+
+    let mut select_columns: Vec<SelectExpr> = Child::COLUMNS
+        .iter()
+        .map(|c| SelectExpr::from(child_table.col(*c)).alias(format!("{JOINED_CHILD_PREFIX}{c}")))
+        .collect();
+    select_columns.extend(Parent::COLUMNS.iter().map(|c| {
+        SelectExpr::from(parent_table.col(*c)).alias(format!("{JOINED_PARENT_PREFIX}{c}"))
+    }));
+
+    let mut query = Select::from(&child_table)
+        .left_join(
+            &parent_table,
+            child_table
+                .col(fk_column)
+                .eq_col(&parent_table.col(parent_key_column)),
+        )
+        .columns(select_columns);
+    if let Some(filter) = filter {
+        query = query.filter(filter);
+    }
+
+    let mut children = Vec::new();
+    let mut by_key: HashMap<PK, Parent> = HashMap::new();
+
+    for row in engine.fetch_all(&query).await? {
+        let child_row = prefixed_sub_row(&row, JOINED_CHILD_PREFIX);
+        children.push(Child::from_row(&child_row)?);
+
+        let parent_row = prefixed_sub_row(&row, JOINED_PARENT_PREFIX);
+        // Same "every column NULL, including the join key" signal
+        // `fetch_joined` uses, just checked on the parent side this time.
+        let key_value: Value = parent_row.get_by_name(parent_key_column)?;
+        if !matches!(key_value, Value::Null) {
+            let key: PK = parent_row.get_by_name(parent_key_column)?;
+            let parent = Parent::from_row(&parent_row)?;
+            by_key.insert(key, parent);
+        }
+    }
+
+    Ok((children, by_key))
 }

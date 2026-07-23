@@ -1053,6 +1053,102 @@ async fn has_one_joined_reports_a_conflict_when_a_parent_has_more_than_one_match
 }
 
 #[tokio::test]
+async fn belongs_to_joined_matches_the_select_in_result_despite_colliding_id_columns(
+) -> rusty_db::Result<()> {
+    // Order and User both map their own "id" column too.
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+
+    let orders = vec![
+        Order {
+            id: 1,
+            user_id: 1,
+            amount: 100,
+        },
+        Order {
+            id: 2,
+            user_id: 1,
+            amount: 50,
+        },
+        Order {
+            id: 3,
+            user_id: 2,
+            amount: 200,
+        },
+    ];
+    for order in &orders {
+        engine.execute(&order.insert()).await?;
+    }
+
+    let (children, users_by_id): (Vec<Order>, HashMap<i64, User>) =
+        rusty_db::relations::load_one_joined(&engine, None, "user_id", "id").await?;
+
+    // Every order comes back exactly once — no dedup needed on this side.
+    let mut child_ids: Vec<i64> = children.iter().map(|o| o.id).collect();
+    child_ids.sort();
+    assert_eq!(child_ids, vec![1, 2, 3]);
+
+    // Two orders share user_id 1 -> the map still has exactly one entry for it.
+    assert_eq!(users_by_id.len(), 2);
+    assert_eq!(users_by_id.get(&ada.id).unwrap(), &ada);
+    assert_eq!(users_by_id.get(&grace.id).unwrap(), &grace);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn belongs_to_joined_with_a_filter_narrows_the_child_batch() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+
+    engine
+        .execute(
+            &(Order {
+                id: 1,
+                user_id: 1,
+                amount: 100,
+            })
+            .insert(),
+        )
+        .await?;
+    engine
+        .execute(
+            &(Order {
+                id: 2,
+                user_id: 1,
+                amount: 999,
+            })
+            .insert(),
+        )
+        .await?;
+
+    let filter = Order::table().col("amount").eq(100_i64);
+    let (children, users_by_id): (Vec<Order>, HashMap<i64, User>) =
+        rusty_db::relations::load_one_joined(&engine, Some(filter), "user_id", "id").await?;
+
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].id, 1);
+    assert_eq!(users_by_id.get(&ada.id).unwrap(), &ada);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_cascading_deletes_cascade_delete_children_and_the_parent() -> rusty_db::Result<()> {
     let engine = engine_with_schema().await?;
 
