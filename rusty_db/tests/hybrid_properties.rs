@@ -17,6 +17,7 @@ use rusty_db::prelude::*;
     ty = "i64"
 )]
 #[hybrid(name = "is_expensive", expr = "price > 50")]
+#[hybrid(name = "is_bulk_discount_eligible", expr = "price > 5 && quantity > 1")]
 struct LineItem {
     #[table(primary_key)]
     id: i64,
@@ -210,6 +211,41 @@ async fn a_comparison_hybrids_sql_side_filters_the_same_rows_the_rust_side_would
     // The sample data actually has both an expensive and a non-expensive
     // item, so this test would catch a filter that's silently a no-op
     // (e.g. always true or always false) too.
+    assert!(!expected.is_empty() && expected.len() < items.len());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_boolean_combinator_hybrids_sql_side_matches_the_rust_side() -> rusty_db::Result<()> {
+    let engine = file_engine("bool_combinator_filter").await?;
+    let items = sample_items();
+    seed(&engine, &items).await?;
+
+    // Rust side: price > 5 && quantity > 1.
+    for item in &items {
+        assert_eq!(
+            item.is_bulk_discount_eligible(),
+            item.price > 5 && item.quantity > 1
+        );
+    }
+
+    let rows: Vec<LineItem> = engine
+        .fetch_all_as(
+            &Select::from(&LineItem::table()).filter(LineItem::is_bulk_discount_eligible_expr()),
+        )
+        .await?;
+
+    let expected: Vec<i64> = items
+        .iter()
+        .filter(|i| i.is_bulk_discount_eligible())
+        .map(|i| i.id)
+        .collect();
+    let mut actual: Vec<i64> = rows.iter().map(|i| i.id).collect();
+    actual.sort();
+    assert_eq!(actual, expected);
+    // Sample data has both a match and non-matches, catching a
+    // silently-always-true/always-false filter.
     assert!(!expected.is_empty() && expected.len() < items.len());
 
     Ok(())

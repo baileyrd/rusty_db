@@ -1329,6 +1329,8 @@ enum HybridToken {
     Ge,
     EqEq,
     NotEq,
+    AndAnd,
+    OrOr,
 }
 
 fn tokenize_hybrid_expr(src: &str) -> Result<Vec<HybridToken>, String> {
@@ -1384,6 +1386,8 @@ fn tokenize_hybrid_expr(src: &str) -> Result<Vec<HybridToken>, String> {
                 }
                 '=' if chars.next_if_eq(&'=').is_some() => HybridToken::EqEq,
                 '!' if chars.next_if_eq(&'=').is_some() => HybridToken::NotEq,
+                '&' if chars.next_if_eq(&'&').is_some() => HybridToken::AndAnd,
+                '|' if chars.next_if_eq(&'|').is_some() => HybridToken::OrOr,
                 other => {
                     return Err(format!(
                         "unexpected character {other:?} in hybrid expression"
@@ -1405,12 +1409,10 @@ enum HybridOp {
 }
 
 /// `<`/`<=`/`>`/`>=`/`==`/`!=` — always compares two arithmetic
-/// sub-expressions and produces a `bool`, so (unlike `HybridOp`) it can
-/// only ever appear once, at the very top of an expression: `HybridNode`
-/// deliberately has no boolean combinators (`&&`/`||`) to chain more than
-/// one, and comparisons can't be nested inside an arithmetic
-/// sub-expression or parenthesized group, the same restriction Rust's own
-/// grammar puts on chained comparisons like `a < b < c`.
+/// sub-expressions and produces a `bool`. Comparisons can't be nested
+/// inside an arithmetic sub-expression or parenthesized group — only
+/// `HybridBoolOp` can combine more than one, the same restriction Rust's
+/// own grammar puts on chained comparisons like `a < b < c`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HybridCompareOp {
     Lt,
@@ -1421,15 +1423,30 @@ enum HybridCompareOp {
     Ne,
 }
 
+/// `&&`/`||`, combining two `bool`-producing sub-expressions (ordinarily
+/// `HybridNode::Compare` or another `HybridBoolOp`) into a `bool`. `&&`
+/// binds tighter than `||`, matching Rust's own precedence — but neither
+/// can be parenthesized as its own group the way an arithmetic
+/// sub-expression can (`(price > 50) && (qty > 1)` isn't supported); only
+/// a flat, left-to-right chain of comparisons at the very top of the
+/// expression.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HybridBoolOp {
+    And,
+    Or,
+}
+
 /// The parsed shape of a `#[hybrid(expr = "...")]` string: a small
 /// expression tree over field names, integer/float literals, `+`/`-`/`*`/
-/// `/`, parentheses for grouping, and — at most once, at the top level —
-/// a `<`/`<=`/`>`/`>=`/`==`/`!=` comparison of two such arithmetic
-/// sub-expressions. Deliberately nothing richer still (no string
-/// functions, `CASE`/`COALESCE`, boolean combinators, or references to a
+/// `/`, parentheses for grouping, and — at the top level only — a
+/// `<`/`<=`/`>`/`>=`/`==`/`!=` comparison of two such arithmetic
+/// sub-expressions, optionally chained with `&&`/`||` into more than one.
+/// Deliberately nothing richer still (no string functions,
+/// `CASE`/`COALESCE`, parenthesized boolean groups, or references to a
 /// joined table's columns), since this is meant to render identically as
 /// both a plain Rust expression and a portable `Expr` tree, and that only
-/// holds for the arithmetic/comparison ANSI-SQL already shares with Rust.
+/// holds for the arithmetic/comparison/boolean ANSI SQL already shares
+/// with Rust.
 #[derive(Debug, Clone)]
 enum HybridNode {
     Field(String),
@@ -1437,6 +1454,7 @@ enum HybridNode {
     FloatLit(f64),
     Op(Box<HybridNode>, HybridOp, Box<HybridNode>),
     Compare(Box<HybridNode>, HybridCompareOp, Box<HybridNode>),
+    BoolOp(Box<HybridNode>, HybridBoolOp, Box<HybridNode>),
 }
 
 struct HybridParser<'a> {
@@ -1447,18 +1465,42 @@ struct HybridParser<'a> {
 impl<'a> HybridParser<'a> {
     fn parse(tokens: &'a [HybridToken]) -> Result<HybridNode, String> {
         let mut parser = HybridParser { tokens, pos: 0 };
-        let node = parser.parse_comparison()?;
+        let node = parser.parse_or()?;
         if parser.pos != parser.tokens.len() {
             return Err("unexpected trailing tokens in hybrid expression".to_string());
         }
         Ok(node)
     }
 
-    /// The true top-level entry point: an arithmetic expression, optionally
-    /// followed by exactly one comparison operator and a second arithmetic
-    /// expression. Never recurses back into itself, so a comparison can
-    /// only ever appear once, at the top — matching `HybridCompareOp`'s own
-    /// doc.
+    /// The true top-level entry point: one or more `parse_and` operands
+    /// joined by `||`, left-associative.
+    fn parse_or(&mut self) -> Result<HybridNode, String> {
+        let mut node = self.parse_and()?;
+        while matches!(self.tokens.get(self.pos), Some(HybridToken::OrOr)) {
+            self.pos += 1;
+            let rhs = self.parse_and()?;
+            node = HybridNode::BoolOp(Box::new(node), HybridBoolOp::Or, Box::new(rhs));
+        }
+        Ok(node)
+    }
+
+    /// One or more `parse_comparison` operands joined by `&&`,
+    /// left-associative — binds tighter than `||` since it's the level
+    /// `parse_or` calls into, not the other way around.
+    fn parse_and(&mut self) -> Result<HybridNode, String> {
+        let mut node = self.parse_comparison()?;
+        while matches!(self.tokens.get(self.pos), Some(HybridToken::AndAnd)) {
+            self.pos += 1;
+            let rhs = self.parse_comparison()?;
+            node = HybridNode::BoolOp(Box::new(node), HybridBoolOp::And, Box::new(rhs));
+        }
+        Ok(node)
+    }
+
+    /// An arithmetic expression, optionally followed by exactly one
+    /// comparison operator and a second arithmetic expression. Never
+    /// recurses back into itself, so a comparison can only ever appear
+    /// once per `&&`/`||` operand — matching `HybridCompareOp`'s own doc.
     fn parse_comparison(&mut self) -> Result<HybridNode, String> {
         let lhs = self.parse_expr()?;
         let op = match self.tokens.get(self.pos) {
@@ -1566,7 +1608,9 @@ fn hybrid_field_names(node: &HybridNode) -> Vec<String> {
     match node {
         HybridNode::Field(name) => vec![name.clone()],
         HybridNode::IntLit(_) | HybridNode::FloatLit(_) => Vec::new(),
-        HybridNode::Op(lhs, _, rhs) | HybridNode::Compare(lhs, _, rhs) => {
+        HybridNode::Op(lhs, _, rhs)
+        | HybridNode::Compare(lhs, _, rhs)
+        | HybridNode::BoolOp(lhs, _, rhs) => {
             let mut names = hybrid_field_names(lhs);
             names.extend(hybrid_field_names(rhs));
             names
@@ -1618,6 +1662,14 @@ fn hybrid_rust_tokens(node: &HybridNode, fields: &[FieldInfo]) -> TokenStream2 {
                 HybridCompareOp::Ne => quote! { (#lhs != #rhs) },
             }
         }
+        HybridNode::BoolOp(lhs, op, rhs) => {
+            let lhs = hybrid_rust_tokens(lhs, fields);
+            let rhs = hybrid_rust_tokens(rhs, fields);
+            match op {
+                HybridBoolOp::And => quote! { (#lhs && #rhs) },
+                HybridBoolOp::Or => quote! { (#lhs || #rhs) },
+            }
+        }
     }
 }
 
@@ -1657,6 +1709,14 @@ fn hybrid_sql_tokens(node: &HybridNode, core: &TokenStream2, fields: &[FieldInfo
                 HybridCompareOp::Ge => quote! { (#lhs).gte_expr(#rhs) },
                 HybridCompareOp::Eq => quote! { (#lhs).eq_expr(#rhs) },
                 HybridCompareOp::Ne => quote! { (#lhs).ne_expr(#rhs) },
+            }
+        }
+        HybridNode::BoolOp(lhs, op, rhs) => {
+            let lhs = hybrid_sql_tokens(lhs, core, fields);
+            let rhs = hybrid_sql_tokens(rhs, core, fields);
+            match op {
+                HybridBoolOp::And => quote! { (#lhs).and(#rhs) },
+                HybridBoolOp::Or => quote! { (#lhs).or(#rhs) },
             }
         }
     }
@@ -1710,7 +1770,9 @@ fn expand_hybrid(
 
     let ty = match &spec.ty {
         Some(ty) => ty.clone(),
-        None if matches!(node, HybridNode::Compare(..)) => syn::parse_quote!(bool),
+        None if matches!(node, HybridNode::Compare(..) | HybridNode::BoolOp(..)) => {
+            syn::parse_quote!(bool)
+        }
         None => {
             let first = referenced.first().expect("checked non-empty above");
             fields
@@ -2373,5 +2435,59 @@ mod tests {
                 "expected {src:?} to render `{method}`, got: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // `a > 1 || b > 2 && c > 3` should parse as `a > 1 || (b > 2 && c > 3)`,
+        // not `(a > 1 || b > 2) && c > 3`.
+        match parse_hybrid_expr("a > 1 || b > 2 && c > 3").unwrap() {
+            HybridNode::BoolOp(lhs, HybridBoolOp::Or, rhs) => {
+                assert!(matches!(*lhs, HybridNode::Compare(..)));
+                assert!(matches!(*rhs, HybridNode::BoolOp(_, HybridBoolOp::And, _)));
+            }
+            other => panic!("expected a top-level ||, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn and_and_or_are_left_associative() {
+        let node = parse_hybrid_expr("a > 1 && b > 2 && c > 3").unwrap();
+        match node {
+            HybridNode::BoolOp(lhs, HybridBoolOp::And, rhs) => {
+                assert!(matches!(*rhs, HybridNode::Compare(..)));
+                assert!(matches!(*lhs, HybridNode::BoolOp(_, HybridBoolOp::And, _)));
+            }
+            other => panic!("expected a top-level &&, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_ampersand_or_pipe_is_rejected() {
+        assert!(tokenize_hybrid_expr("price & 1").is_err());
+        assert!(tokenize_hybrid_expr("price | 1").is_err());
+    }
+
+    #[test]
+    fn a_bool_combinator_expression_defaults_to_a_bool_return_type() {
+        let fields = vec![field("price", "price", "i64"), field("qty", "qty", "i64")];
+        let node = parse_hybrid_expr("price > 10 && qty > 1").unwrap();
+        assert!(matches!(node, HybridNode::BoolOp(..)));
+        let rust = rust_tokens_for("price > 10 && qty > 1", &fields);
+        assert!(rust.contains("&&"));
+        let sql = sql_tokens_for("price > 10 && qty > 1", &fields);
+        assert!(sql.contains(". and"));
+
+        let sql_or = sql_tokens_for("price > 10 || qty > 1", &fields);
+        assert!(sql_or.contains(". or"));
+    }
+
+    #[test]
+    fn every_field_referenced_across_a_bool_combinator_is_collected() {
+        let node = parse_hybrid_expr("a > 1 && b < 2 || c == 3").unwrap();
+        assert_eq!(
+            hybrid_field_names(&node),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 }
