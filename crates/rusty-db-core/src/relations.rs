@@ -43,10 +43,22 @@
 //! say), so every selected column gets an internal, uniquely prefixed
 //! alias, invisible to the caller, that `FromRow` decodes back through.
 //! `load_many_to_many_joined` extends the same technique across a
-//! two-hop join (`Parent LEFT JOIN through_table LEFT JOIN Target`). Not
-//! (yet) wired into `#[has_many(...)]`/`#[has_one(...)]`/
-//! `#[belongs_to(...)]`/`#[many_to_many(...)]` as an opt-in strategy —
-//! call these directly.
+//! two-hop join (`Parent LEFT JOIN through_table LEFT JOIN Target`). All
+//! four are wired into `#[has_many(...)]`/`#[has_one(...)]`/
+//! `#[belongs_to(...)]`/`#[many_to_many(...)]` as `_joined`-suffixed
+//! convenience methods, the same way `_via_subquery` already was.
+//!
+//! Each `*_joined` function above only accepts a plain, optional `filter`
+//! on one side's own table — the `_joined_from_query` sibling next to
+//! each one instead takes an arbitrary caller-built `Select` (its own
+//! filters, joins, even other CTEs), the same widened contract
+//! `*_via_subquery` already has, but with one added requirement: it must
+//! select every column of the "from" side's own `Mapped::COLUMNS`, each
+//! under its own (unaliased) column name, rather than just a single key
+//! column — reconstructing a full mapped row (not just a key) is what the
+//! `LEFT JOIN` needs to build. It's wrapped as a `WITH` CTE (same trick as
+//! `_via_subquery`) and joined against directly instead of a plain
+//! `Table::new(Parent::TABLE_NAME)`.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -419,6 +431,7 @@ where
 
 const JOINED_PARENT_PREFIX: &str = "__rusty_db_joined_parent__";
 const JOINED_CHILD_PREFIX: &str = "__rusty_db_joined_child__";
+const JOINED_FROM_QUERY_CTE_NAME: &str = "_rusty_db_eager_load_joined_from";
 
 /// A synthetic `Row` built from every column in `row` whose name starts
 /// with `prefix`, with the prefix stripped back off — used to decode one
@@ -471,13 +484,49 @@ where
 {
     let (parents, matches) =
         fetch_joined::<Parent, Child, PK>(engine, filter, parent_pk_column, fk_column).await?;
+    Ok((parents, group_matches(matches)))
+}
 
-    let mut children: HashMap<PK, Vec<Child>> = HashMap::new();
+/// Like `load_many_joined`, but instead of a plain `filter` on `Parent`'s
+/// own table, takes `parents` — an arbitrary `Select` the caller built
+/// however they like (its own filters, joins, even other CTEs), as long as
+/// it selects every one of `Parent::COLUMNS`, each under its own
+/// (unaliased) column name — e.g.
+/// `Select::from(&Parent::table()).columns(Parent::COLUMNS.iter().map(|c| Parent::table().col(c))).filter(...)`.
+/// `parents` is wrapped as a `WITH` CTE (the same trick
+/// `query_via_subquery` uses) and the `Child` `LEFT JOIN` runs against
+/// that CTE instead of `Parent`'s table directly — this is what lets the
+/// caller bring their own joins/CTEs, something `load_many_joined`'s plain
+/// `filter` can't do.
+pub async fn load_many_joined_from_query<Parent, Child, PK>(
+    engine: &Engine,
+    parents: Select,
+    parent_pk_column: &str,
+    fk_column: &str,
+) -> Result<(Vec<Parent>, HashMap<PK, Vec<Child>>)>
+where
+    Parent: Mapped + FromRow,
+    Child: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash + Clone,
+{
+    let (parents, matches) =
+        fetch_joined_from_query::<Parent, Child, PK>(engine, parents, parent_pk_column, fk_column)
+            .await?;
+    Ok((parents, group_matches(matches)))
+}
+
+/// Groups a flat `(PK, Child)` match list (what `fetch_joined`/
+/// `fetch_joined_from_query` return) into the `HashMap<PK, Vec<Child>>`
+/// shape `load_many_joined`/`load_many_joined_from_query` return.
+fn group_matches<PK, Child>(matches: Vec<(PK, Child)>) -> HashMap<PK, Vec<Child>>
+where
+    PK: Eq + Hash,
+{
+    let mut grouped: HashMap<PK, Vec<Child>> = HashMap::new();
     for (key, child) in matches {
-        children.entry(key).or_default().push(child);
+        grouped.entry(key).or_default().push(child);
     }
-
-    Ok((parents, children))
+    grouped
 }
 
 /// Has-one eager load via the "joined" strategy — see `load_many_joined`
@@ -498,27 +547,62 @@ where
 {
     let (parents, matches) =
         fetch_joined::<Parent, Child, PK>(engine, filter, parent_pk_column, fk_column).await?;
+    Ok((
+        parents,
+        dedup_matches::<Child, _>(matches, fk_column, Child::TABLE_NAME)?,
+    ))
+}
 
+/// Like `load_has_one_joined`, but instead of a plain `filter`, takes
+/// `parents` — an arbitrary `Select` on `Parent`'s own table, the same
+/// contract `load_many_joined_from_query`'s `parents` has.
+pub async fn load_has_one_joined_from_query<Parent, Child, PK>(
+    engine: &Engine,
+    parents: Select,
+    parent_pk_column: &str,
+    fk_column: &str,
+) -> Result<(Vec<Parent>, HashMap<PK, Child>)>
+where
+    Parent: Mapped + FromRow,
+    Child: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash + Clone,
+{
+    let (parents, matches) =
+        fetch_joined_from_query::<Parent, Child, PK>(engine, parents, parent_pk_column, fk_column)
+            .await?;
+    Ok((
+        parents,
+        dedup_matches::<Child, _>(matches, fk_column, Child::TABLE_NAME)?,
+    ))
+}
+
+/// Collapses a flat `(PK, Child)` match list into a `HashMap<PK, Child>`,
+/// erroring with the same `Error::Conflict` message every `has_one`-shaped
+/// loader in this module uses if the same key turns up twice — the
+/// relationship isn't actually one-to-one.
+fn dedup_matches<Child, PK>(
+    matches: Vec<(PK, Child)>,
+    fk_column: &str,
+    child_table_name: &str,
+) -> Result<HashMap<PK, Child>>
+where
+    PK: Eq + Hash,
+{
     let mut by_key: HashMap<PK, Child> = HashMap::new();
     for (key, child) in matches {
         if by_key.insert(key, child).is_some() {
             return Err(Error::Conflict(format!(
-                "has_one: more than one {:?} row shares the same {fk_column:?} value, \
-                 so this isn't actually a one-to-one relationship",
-                Child::TABLE_NAME
+                "has_one: more than one {child_table_name:?} row shares the same {fk_column:?} \
+                 value, so this isn't actually a one-to-one relationship"
             )));
         }
     }
-
-    Ok((parents, by_key))
+    Ok(by_key)
 }
 
-/// Shared machinery for every `*_joined` function above: builds and runs
-/// the single `LEFT JOIN` query, and decodes its rows into the
-/// deduplicated parent list plus a flat `(PK, Child)` list of every
-/// actual match (a parent with no matching child contributes nothing to
-/// it) — left for each public function above to group/conflict-check
-/// however its own return shape needs.
+/// Shared machinery for `load_many_joined`/`load_has_one_joined`: builds
+/// the single `LEFT JOIN` query against `Parent`'s own table (filtered by
+/// `filter`, if any) and hands it to `decode_joined_rows`.
 async fn fetch_joined<Parent, Child, PK>(
     engine: &Engine,
     filter: Option<Expr>,
@@ -555,6 +639,79 @@ where
         query = query.filter(filter);
     }
 
+    decode_joined_rows(engine, query, parent_pk_column, fk_column).await
+}
+
+/// Shared machinery for `load_many_joined_from_query`/
+/// `load_has_one_joined_from_query`: wraps `parents` as a `WITH` CTE (see
+/// `query_via_subquery`'s own doc for the same trick) and builds the
+/// `LEFT JOIN` query against that CTE instead of `Parent`'s table
+/// directly, then hands it to `decode_joined_rows` exactly like
+/// `fetch_joined` does. `parents` must select every one of
+/// `Parent::COLUMNS`, each under its own (unaliased) column name, so the
+/// CTE's own column list lines up with what `Parent::from_row` expects.
+async fn fetch_joined_from_query<Parent, Child, PK>(
+    engine: &Engine,
+    parents: Select,
+    parent_pk_column: &str,
+    fk_column: &str,
+) -> Result<(Vec<Parent>, Vec<(PK, Child)>)>
+where
+    Parent: Mapped + FromRow,
+    Child: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash + Clone,
+{
+    let cte_table = Table::new(JOINED_FROM_QUERY_CTE_NAME);
+    let cte = Cte::new(JOINED_FROM_QUERY_CTE_NAME, parents);
+    let child_table = Table::new(Child::TABLE_NAME);
+
+    let mut select_columns: Vec<SelectExpr> = Parent::COLUMNS
+        .iter()
+        .map(|c| SelectExpr::from(cte_table.col(*c)).alias(format!("{JOINED_PARENT_PREFIX}{c}")))
+        .collect();
+    select_columns.extend(
+        Child::COLUMNS.iter().map(|c| {
+            SelectExpr::from(child_table.col(*c)).alias(format!("{JOINED_CHILD_PREFIX}{c}"))
+        }),
+    );
+
+    let query = Select::from(&cte_table)
+        .left_join(
+            &child_table,
+            cte_table
+                .col(parent_pk_column)
+                .eq_col(&child_table.col(fk_column)),
+        )
+        .columns(select_columns)
+        .with([cte]);
+
+    decode_joined_rows(engine, query, parent_pk_column, fk_column).await
+}
+
+/// Decodes an already fully-built `query` — selecting both sides through
+/// the `JOINED_PARENT_PREFIX`/`JOINED_CHILD_PREFIX` aliasing scheme — into
+/// the deduplicated parent list plus a flat `(PK, Child)` list of every
+/// actual match (a parent with no matching child contributes nothing to
+/// it), left for each caller to group/conflict-check however its own
+/// return shape needs. Shared by every has_many/has_one/many_to_many
+/// `*_joined`/`*_joined_from_query` function. `child_null_check_column` is
+/// whichever column on the child/target side is guaranteed non-null for a
+/// real match and null for an unmatched `LEFT JOIN` row (`fk_column` for
+/// has_many/has_one, `target_key_column` for many_to_many) — the join
+/// condition guarantees it's never null for a real match, so it's an
+/// unambiguous "no match here" signal regardless of whether any of
+/// `Child`'s own fields happen to be nullable.
+async fn decode_joined_rows<Parent, Child, PK>(
+    engine: &Engine,
+    query: Select,
+    parent_pk_column: &str,
+    child_null_check_column: &str,
+) -> Result<(Vec<Parent>, Vec<(PK, Child)>)>
+where
+    Parent: Mapped + FromRow,
+    Child: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash + Clone,
+{
     let mut parents = Vec::new();
     let mut seen_parent_keys: HashSet<PK> = HashSet::new();
     let mut matches = Vec::new();
@@ -567,13 +724,8 @@ where
         }
 
         let child_row = prefixed_sub_row(&row, JOINED_CHILD_PREFIX);
-        // A `LEFT JOIN` with no matching child row comes back with every
-        // child column `NULL`, including the join key itself — the join
-        // condition guarantees a real match's `fk_column` is never null,
-        // so this is an unambiguous "no child here" signal regardless of
-        // whether any of `Child`'s own fields happen to be nullable.
-        let fk_value: Value = child_row.get_by_name(fk_column)?;
-        if !matches!(fk_value, Value::Null) {
+        let null_check: Value = child_row.get_by_name(child_null_check_column)?;
+        if !matches!(null_check, Value::Null) {
             let child = Child::from_row(&child_row)?;
             matches.push((parent_key, child));
         }
@@ -646,29 +798,61 @@ where
         query = query.filter(filter);
     }
 
-    let mut parents = Vec::new();
-    let mut seen_parent_keys: HashSet<PK> = HashSet::new();
-    let mut grouped: HashMap<PK, Vec<Target>> = HashMap::new();
+    let (parents, matches) =
+        decode_joined_rows(engine, query, parent_pk_column, target_key_column).await?;
+    Ok((parents, group_matches(matches)))
+}
 
-    for row in engine.fetch_all(&query).await? {
-        let parent_row = prefixed_sub_row(&row, JOINED_PARENT_PREFIX);
-        let parent_key: PK = parent_row.get_by_name(parent_pk_column)?;
-        if seen_parent_keys.insert(parent_key.clone()) {
-            parents.push(Parent::from_row(&parent_row)?);
-        }
+/// Like `load_many_to_many_joined`, but instead of a plain `filter`, takes
+/// `parents` — an arbitrary `Select` on `Parent`'s own table, the same
+/// contract `load_many_joined_from_query`'s `parents` has. `through_table`
+/// itself is still never selected from beyond its two join columns.
+pub async fn load_many_to_many_joined_from_query<Parent, Target, PK>(
+    engine: &Engine,
+    parents: Select,
+    parent_pk_column: &str,
+    through_table: &str,
+    local_key_column: &str,
+    foreign_key_column: &str,
+    target_key_column: &str,
+) -> Result<(Vec<Parent>, HashMap<PK, Vec<Target>>)>
+where
+    Parent: Mapped + FromRow,
+    Target: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash + Clone,
+{
+    let cte_table = Table::new(JOINED_FROM_QUERY_CTE_NAME);
+    let cte = Cte::new(JOINED_FROM_QUERY_CTE_NAME, parents);
+    let through = Table::new(through_table);
+    let target_table = Table::new(Target::TABLE_NAME);
 
-        let target_row = prefixed_sub_row(&row, JOINED_CHILD_PREFIX);
-        // Same "every column NULL, including the join key" no-match
-        // signal `fetch_joined` uses, checked via `target_key_column`
-        // (the far side of the second hop) instead of a direct FK.
-        let target_key_value: Value = target_row.get_by_name(target_key_column)?;
-        if !matches!(target_key_value, Value::Null) {
-            let target = Target::from_row(&target_row)?;
-            grouped.entry(parent_key).or_default().push(target);
-        }
-    }
+    let mut select_columns: Vec<SelectExpr> = Parent::COLUMNS
+        .iter()
+        .map(|c| SelectExpr::from(cte_table.col(*c)).alias(format!("{JOINED_PARENT_PREFIX}{c}")))
+        .collect();
+    select_columns.extend(Target::COLUMNS.iter().map(|c| {
+        SelectExpr::from(target_table.col(*c)).alias(format!("{JOINED_CHILD_PREFIX}{c}"))
+    }));
 
-    Ok((parents, grouped))
+    let query = Select::from(&cte_table)
+        .left_join(
+            &through,
+            cte_table
+                .col(parent_pk_column)
+                .eq_col(&through.col(local_key_column)),
+        )
+        .left_join(
+            &target_table,
+            target_table
+                .col(target_key_column)
+                .eq_col(&through.col(foreign_key_column)),
+        )
+        .columns(select_columns)
+        .with([cte]);
+
+    let (parents, matches) =
+        decode_joined_rows(engine, query, parent_pk_column, target_key_column).await?;
+    Ok((parents, group_matches(matches)))
 }
 
 /// Belongs-to (many-to-one) eager load via the "joined" strategy: fetches
@@ -725,6 +909,72 @@ where
         query = query.filter(filter);
     }
 
+    decode_one_joined_rows(engine, query, parent_key_column).await
+}
+
+/// Like `load_one_joined`, but instead of a plain `filter` on `Child`'s
+/// own table, takes `children` — an arbitrary `Select` the caller built
+/// however they like, as long as it selects every one of
+/// `Child::COLUMNS`, each under its own (unaliased) column name — the
+/// same contract `load_many_joined_from_query`'s `parents` has, just on
+/// the child/"many" side instead of the parent side (matching this
+/// relationship's own direction: `Child` is the `FROM` table here, same
+/// as in `load_one_joined`). Wrapped as a `WITH` CTE and joined against
+/// directly, the same trick every other `*_joined_from_query` function
+/// uses.
+pub async fn load_one_joined_from_query<Child, Parent, PK>(
+    engine: &Engine,
+    children: Select,
+    fk_column: &str,
+    parent_key_column: &str,
+) -> Result<(Vec<Child>, HashMap<PK, Parent>)>
+where
+    Child: Mapped + FromRow,
+    Parent: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash,
+{
+    let cte_table = Table::new(JOINED_FROM_QUERY_CTE_NAME);
+    let cte = Cte::new(JOINED_FROM_QUERY_CTE_NAME, children);
+    let parent_table = Table::new(Parent::TABLE_NAME);
+
+    let mut select_columns: Vec<SelectExpr> = Child::COLUMNS
+        .iter()
+        .map(|c| SelectExpr::from(cte_table.col(*c)).alias(format!("{JOINED_CHILD_PREFIX}{c}")))
+        .collect();
+    select_columns.extend(Parent::COLUMNS.iter().map(|c| {
+        SelectExpr::from(parent_table.col(*c)).alias(format!("{JOINED_PARENT_PREFIX}{c}"))
+    }));
+
+    let query = Select::from(&cte_table)
+        .left_join(
+            &parent_table,
+            cte_table
+                .col(fk_column)
+                .eq_col(&parent_table.col(parent_key_column)),
+        )
+        .columns(select_columns)
+        .with([cte]);
+
+    decode_one_joined_rows(engine, query, parent_key_column).await
+}
+
+/// Shared decode step for `load_one_joined`/`load_one_joined_from_query`:
+/// every row's `Child` side is decoded directly (it never repeats, so
+/// there's nothing to deduplicate there), while the `Parent` side
+/// deduplicates into the returned `HashMap` — the same "every column
+/// NULL, including the join key" no-match signal `decode_joined_rows`
+/// uses, just checked on the parent side here since the dedup direction
+/// is reversed for this relationship shape.
+async fn decode_one_joined_rows<Child, Parent, PK>(
+    engine: &Engine,
+    query: Select,
+    parent_key_column: &str,
+) -> Result<(Vec<Child>, HashMap<PK, Parent>)>
+where
+    Child: Mapped + FromRow,
+    Parent: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash,
+{
     let mut children = Vec::new();
     let mut by_key: HashMap<PK, Parent> = HashMap::new();
 
@@ -733,8 +983,6 @@ where
         children.push(Child::from_row(&child_row)?);
 
         let parent_row = prefixed_sub_row(&row, JOINED_PARENT_PREFIX);
-        // Same "every column NULL, including the join key" signal
-        // `fetch_joined` uses, just checked on the parent side this time.
         let key_value: Value = parent_row.get_by_name(parent_key_column)?;
         if !matches!(key_value, Value::Null) {
             let key: PK = parent_row.get_by_name(parent_key_column)?;

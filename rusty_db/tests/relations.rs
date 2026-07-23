@@ -923,6 +923,175 @@ async fn derive_generated_joined_methods_work_end_to_end() -> rusty_db::Result<(
 }
 
 #[tokio::test]
+async fn has_many_joined_from_query_accepts_an_arbitrary_caller_built_select(
+) -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    // A third user with no orders at all — excluded by the join below,
+    // same as it would be from a plain `filter`.
+    let linus = User {
+        id: 3,
+        name: "linus".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+    engine.execute(&linus.insert()).await?;
+
+    let ada_small_order = Order {
+        id: 1,
+        user_id: 1,
+        amount: 100,
+    };
+    let ada_tiny_order = Order {
+        id: 2,
+        user_id: 1,
+        amount: 50,
+    };
+    let grace_big_order = Order {
+        id: 3,
+        user_id: 2,
+        amount: 200,
+    };
+    engine.execute(&ada_small_order.insert()).await?;
+    engine.execute(&ada_tiny_order.insert()).await?;
+    engine.execute(&grace_big_order.insert()).await?;
+
+    // Unlike `load_many_joined`'s plain `filter`, this Select brings its
+    // own JOIN — a real capability gap `filter` alone can't cover: "every
+    // user with an order over 100" (only grace's order qualifies).
+    let users_table = User::table();
+    let orders_table = Order::table();
+    let parents = Select::from(&users_table)
+        .join(
+            &orders_table,
+            users_table.col("id").eq_col(&orders_table.col("user_id")),
+        )
+        .columns(User::COLUMNS.iter().map(|c| users_table.col(*c)))
+        .filter(orders_table.col("amount").gt(100_i64))
+        .distinct();
+
+    let (parents, orders_by_user): (Vec<User>, HashMap<i64, Vec<Order>>) =
+        rusty_db::relations::load_many_joined_from_query(&engine, parents, "id", "user_id").await?;
+
+    assert_eq!(parents, vec![grace.clone()]);
+    assert_eq!(
+        orders_by_user.get(&grace.id).unwrap(),
+        &vec![grace_big_order]
+    );
+    assert!(!orders_by_user.contains_key(&ada.id));
+    assert!(!orders_by_user.contains_key(&linus.id));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn derive_generated_joined_from_query_methods_work_end_to_end() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+
+    let ada_order = Order {
+        id: 1,
+        user_id: 1,
+        amount: 100,
+    };
+    let grace_order = Order {
+        id: 2,
+        user_id: 2,
+        amount: 200,
+    };
+    engine.execute(&ada_order.insert()).await?;
+    engine.execute(&grace_order.insert()).await?;
+
+    let ada_profile = Profile {
+        id: 1,
+        user_id: 1,
+        bio: "mathematician".to_string(),
+    };
+    engine.execute(&ada_profile.insert()).await?;
+
+    let rust_post = Post {
+        id: 1,
+        title: "Why Rust".to_string(),
+    };
+    engine.execute(&rust_post.insert()).await?;
+    let rust_tag = Tag {
+        id: 1,
+        name: "rust".to_string(),
+    };
+    engine.execute(&rust_tag.insert()).await?;
+    insert_post_tag(&engine, rust_post.id, rust_tag.id).await?;
+
+    let users_table = User::table();
+    let full_users =
+        || Select::from(&users_table).columns(User::COLUMNS.iter().map(|c| users_table.col(*c)));
+
+    // has_many: User::load_orders_joined_from_query.
+    let (users, orders_by_user): (Vec<User>, HashMap<i64, Vec<Order>>) =
+        User::load_orders_joined_from_query(&engine, full_users()).await?;
+    let mut user_ids: Vec<i64> = users.iter().map(|u| u.id).collect();
+    user_ids.sort();
+    assert_eq!(user_ids, vec![1, 2]);
+    assert_eq!(
+        orders_by_user.get(&ada.id).unwrap(),
+        &vec![ada_order.clone()]
+    );
+    assert_eq!(
+        orders_by_user.get(&grace.id).unwrap(),
+        &vec![grace_order.clone()]
+    );
+
+    // has_one: User::load_profile_joined_from_query, narrowed by the
+    // caller's own filter this time (proving the widened contract, not
+    // just a like-for-like replay of the plain-filter test above).
+    let ada_only = full_users().filter(users_table.col("id").eq(ada.id));
+    let (filtered_users, profiles_by_user): (Vec<User>, HashMap<i64, Profile>) =
+        User::load_profile_joined_from_query(&engine, ada_only).await?;
+    assert_eq!(filtered_users, vec![ada.clone()]);
+    assert_eq!(profiles_by_user.get(&ada.id).unwrap(), &ada_profile);
+
+    // belongs_to: Order::load_user_joined_from_query.
+    let orders_table = Order::table();
+    let full_orders =
+        Select::from(&orders_table).columns(Order::COLUMNS.iter().map(|c| orders_table.col(*c)));
+    let (orders, users_by_id): (Vec<Order>, HashMap<i64, User>) =
+        Order::load_user_joined_from_query(&engine, full_orders).await?;
+    let mut order_ids: Vec<i64> = orders.iter().map(|o| o.id).collect();
+    order_ids.sort();
+    assert_eq!(order_ids, vec![1, 2]);
+    assert_eq!(users_by_id.get(&ada.id).unwrap(), &ada);
+    assert_eq!(users_by_id.get(&grace.id).unwrap(), &grace);
+
+    // many_to_many: Post::load_tags_joined_from_query.
+    let posts_table = Post::table();
+    let full_posts =
+        Select::from(&posts_table).columns(Post::COLUMNS.iter().map(|c| posts_table.col(*c)));
+    let (posts, tags_by_post): (Vec<Post>, HashMap<i64, Vec<Tag>>) =
+        Post::load_tags_joined_from_query(&engine, full_posts).await?;
+    assert_eq!(posts, vec![rust_post.clone()]);
+    assert_eq!(tags_by_post.get(&rust_post.id).unwrap(), &vec![rust_tag]);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn has_many_joined_matches_the_select_in_result_despite_colliding_id_columns(
 ) -> rusty_db::Result<()> {
     // User and Order both map their own "id" column — proving the joined

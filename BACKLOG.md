@@ -75,15 +75,17 @@ alternative joining directly against a caller-supplied `Select` wrapped
 as a CTE instead of shipping a parent key list back and forth, also
 callable directly as `rusty_db::relations::load_many_via_subquery`/
 `load_has_one_via_subquery`/`load_one_via_subquery`/
-`load_many_to_many_via_subquery` — plus a generated `_joined` convenience
-method for each, a third strategy covering all four relationship shapes
+`load_many_to_many_via_subquery` — plus a generated `_joined`/
+`_joined_from_query` convenience method pair for each, a third strategy
+covering all four relationship shapes
 (`rusty_db::relations::load_many_joined`/`load_has_one_joined`/
 `load_one_joined`/`load_many_to_many_joined`, a single `LEFT JOIN` round
 trip (a two-hop one for `many_to_many`) returning both sides,
 deduplicating whichever one the join naturally repeats and safely
-aliasing around any column-name collision between the two — see "Accept
-an arbitrary Select for joined eager loading" below for what's still
-missing); hand-written versioned
+aliasing around any column-name collision between the two, plus a
+`_from_query`-suffixed sibling of each accepting an arbitrary
+caller-built `Select` — the same widened contract `_via_subquery` has,
+wrapped as a `WITH` CTE the same way); hand-written versioned
 migrations (standalone via `Migrator`, folded into a session's
 transaction via `session.migrate`, or driven from a small
 `src/bin/migrate.rs` in your own crate via the dependency-free
@@ -163,19 +165,6 @@ missing). See `README.md` for the full tour with examples.
 - **Lazy loading** (an attribute that fetches on first access instead of
   always being eagerly select-in-loaded) — today every relationship is
   eager, which is safe but can over-fetch. **L**
-- **Accept an arbitrary `Select` for joined eager loading** —
-  `rusty_db::relations::load_many_joined`/`load_has_one_joined`/
-  `load_one_joined`/`load_many_to_many_joined` now cover all four
-  relationship shapes and are wired into
-  `#[has_many(...)]`/`#[has_one(...)]`/`#[belongs_to(...)]`/
-  `#[many_to_many(...)]` as `_joined`-suffixed convenience methods,
-  alongside the select-in and `_via_subquery` ones, the same way
-  subqueryload already was. Still only accept a plain `filter` on one
-  side's own table, though, not an arbitrary caller-built `Select` the
-  way `load_many_via_subquery`/etc. do — they can't accept a query with
-  its own joins/CTEs, since building the `LEFT JOIN` and per-side column
-  aliasing needs an actual `Table` handle this function controls
-  throughout, not just a key column name reachable off of any `Select`. **S**
 
 ## Topology / deployment
 
