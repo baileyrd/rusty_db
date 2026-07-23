@@ -75,10 +75,11 @@ alternative joining directly against a caller-supplied `Select` wrapped
 as a CTE instead of shipping a parent key list back and forth, also
 callable directly as `rusty_db::relations::load_many_via_subquery`/
 `load_has_one_via_subquery`/`load_one_via_subquery`/
-`load_many_to_many_via_subquery` — plus, for `has_many`/`has_one`/
-`belongs_to` so far, a third "joined" strategy
+`load_many_to_many_via_subquery` — plus a third "joined" strategy
+covering all four relationship shapes
 (`rusty_db::relations::load_many_joined`/`load_has_one_joined`/
-`load_one_joined`, a single `LEFT JOIN` round trip returning both sides,
+`load_one_joined`/`load_many_to_many_joined`, a single `LEFT JOIN` round
+trip (a two-hop one for `many_to_many`) returning both sides,
 deduplicating whichever one the join naturally repeats and safely
 aliasing around any column-name collision between the two — see "Extend
 joined eager loading beyond has_many/has_one/belongs_to" below for what's
@@ -162,20 +163,24 @@ missing). See `README.md` for the full tour with examples.
 - **Lazy loading** (an attribute that fetches on first access instead of
   always being eagerly select-in-loaded) — today every relationship is
   eager, which is safe but can over-fetch. **L**
-- **Extend joined eager loading beyond has_many/has_one/belongs_to** —
+- **Wire the joined eager-loading strategy into the derive attributes** —
   `rusty_db::relations::load_many_joined`/`load_has_one_joined`/
-  `load_one_joined` fetch both sides in one query via `LEFT JOIN` instead
-  of a second round trip, deduplicating whichever side the join naturally
-  repeats and safely aliasing around any column-name collision between
-  the two tables. `many_to_many` doesn't have a joined-strategy
-  equivalent yet. Also still missing: wiring these into
-  `#[has_many(...)]`/`#[has_one(...)]`/`#[belongs_to(...)]` as an opt-in
-  strategy the way select-in/subqueryload already are (they're plain
-  functions only, called directly), and their "plain `filter`, not an
-  arbitrary caller-built `Select`" scope — unlike `load_many_via_subquery`,
-  they can't accept a query with its own joins/CTEs, since building the
-  `LEFT JOIN` and per-side column aliasing needs an actual `Table` handle,
-  not just a key column name. **M**
+  `load_one_joined`/`load_many_to_many_joined` now cover all four
+  relationship shapes, each fetching both sides in one query via
+  `LEFT JOIN` (a two-hop one for `many_to_many`) instead of a second round
+  trip, deduplicating whichever side the join naturally repeats and
+  safely aliasing around any column-name collision between the two
+  tables (the join table itself, for `many_to_many`, is never selected
+  from beyond its two join columns, so it can't be part of that collision
+  either). Still missing: wiring these into
+  `#[has_many(...)]`/`#[has_one(...)]`/`#[belongs_to(...)]`/
+  `#[many_to_many(...)]` as an opt-in strategy the way select-in/
+  subqueryload already are (they're plain functions only, called
+  directly), and their "plain `filter`, not an arbitrary caller-built
+  `Select`" scope — unlike `load_many_via_subquery`, they can't accept a
+  query with its own joins/CTEs, since building the `LEFT JOIN` and
+  per-side column aliasing needs an actual `Table` handle, not just a key
+  column name. **S**
 
 ## Topology / deployment
 

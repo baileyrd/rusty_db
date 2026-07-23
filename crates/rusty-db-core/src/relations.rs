@@ -42,9 +42,11 @@
 //! types' own column names can collide (both mapping an `id` primary key,
 //! say), so every selected column gets an internal, uniquely prefixed
 //! alias, invisible to the caller, that `FromRow` decodes back through.
-//! Not (yet) generalized to `many_to_many`, or wired into
-//! `#[has_many(...)]`/`#[has_one(...)]`/`#[belongs_to(...)]` as an opt-in
-//! strategy — call these directly.
+//! `load_many_to_many_joined` extends the same technique across a
+//! two-hop join (`Parent LEFT JOIN through_table LEFT JOIN Target`). Not
+//! (yet) wired into `#[has_many(...)]`/`#[has_one(...)]`/
+//! `#[belongs_to(...)]`/`#[many_to_many(...)]` as an opt-in strategy —
+//! call these directly.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -578,6 +580,95 @@ where
     }
 
     Ok((parents, matches))
+}
+
+/// Many-to-many eager load via the "joined" strategy: fetches every
+/// `Parent` row matching `filter` (`None` for no filter) together with
+/// every `Target` row it's joined to through `through_table`, in a single
+/// two-hop `LEFT JOIN` query (`Parent LEFT JOIN through_table LEFT JOIN
+/// Target`) — one round trip total, not `load_many_to_many`'s two.
+///
+/// Returns the parents in the order they first appear in the joined
+/// result set, deduplicated (a join naturally repeats a parent row once
+/// per matching target — same direction as `load_many_joined`, since a
+/// `Parent` can match many `Target`s here too), alongside the same
+/// `HashMap<PK, Vec<Target>>` shape `load_many_to_many` returns — a
+/// parent with no matching targets has no entry in it, same as there.
+///
+/// See `load_many_joined` for what `filter`/the column-aliasing/no-match
+/// detection mean (checked here via `target_key_column`, the same role
+/// `fk_column` plays there), and `load_many_to_many` for what
+/// `through_table`/`local_key_column`/`foreign_key_column`/
+/// `target_key_column` mean. `through_table` itself is never selected
+/// from beyond its two join columns, so it can't collide with either
+/// mapped type's own columns.
+pub async fn load_many_to_many_joined<Parent, Target, PK>(
+    engine: &Engine,
+    filter: Option<Expr>,
+    parent_pk_column: &str,
+    through_table: &str,
+    local_key_column: &str,
+    foreign_key_column: &str,
+    target_key_column: &str,
+) -> Result<(Vec<Parent>, HashMap<PK, Vec<Target>>)>
+where
+    Parent: Mapped + FromRow,
+    Target: Mapped + FromRow,
+    PK: Into<Value> + FromValue + Eq + Hash + Clone,
+{
+    let parent_table = Table::new(Parent::TABLE_NAME);
+    let through = Table::new(through_table);
+    let target_table = Table::new(Target::TABLE_NAME);
+
+    let mut select_columns: Vec<SelectExpr> = Parent::COLUMNS
+        .iter()
+        .map(|c| SelectExpr::from(parent_table.col(*c)).alias(format!("{JOINED_PARENT_PREFIX}{c}")))
+        .collect();
+    select_columns.extend(Target::COLUMNS.iter().map(|c| {
+        SelectExpr::from(target_table.col(*c)).alias(format!("{JOINED_CHILD_PREFIX}{c}"))
+    }));
+
+    let mut query = Select::from(&parent_table)
+        .left_join(
+            &through,
+            parent_table
+                .col(parent_pk_column)
+                .eq_col(&through.col(local_key_column)),
+        )
+        .left_join(
+            &target_table,
+            target_table
+                .col(target_key_column)
+                .eq_col(&through.col(foreign_key_column)),
+        )
+        .columns(select_columns);
+    if let Some(filter) = filter {
+        query = query.filter(filter);
+    }
+
+    let mut parents = Vec::new();
+    let mut seen_parent_keys: HashSet<PK> = HashSet::new();
+    let mut grouped: HashMap<PK, Vec<Target>> = HashMap::new();
+
+    for row in engine.fetch_all(&query).await? {
+        let parent_row = prefixed_sub_row(&row, JOINED_PARENT_PREFIX);
+        let parent_key: PK = parent_row.get_by_name(parent_pk_column)?;
+        if seen_parent_keys.insert(parent_key.clone()) {
+            parents.push(Parent::from_row(&parent_row)?);
+        }
+
+        let target_row = prefixed_sub_row(&row, JOINED_CHILD_PREFIX);
+        // Same "every column NULL, including the join key" no-match
+        // signal `fetch_joined` uses, checked via `target_key_column`
+        // (the far side of the second hop) instead of a direct FK.
+        let target_key_value: Value = target_row.get_by_name(target_key_column)?;
+        if !matches!(target_key_value, Value::Null) {
+            let target = Target::from_row(&target_row)?;
+            grouped.entry(parent_key).or_default().push(target);
+        }
+    }
+
+    Ok((parents, grouped))
 }
 
 /// Belongs-to (many-to-one) eager load via the "joined" strategy: fetches
