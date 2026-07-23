@@ -21,6 +21,10 @@ use rusty_db::prelude::*;
 #[hybrid(name = "sku_upper", expr = "upper(sku)")]
 #[hybrid(name = "sku_lower", expr = "lower(sku)")]
 #[hybrid(name = "sku_tag", expr = "concat(sku, \"-item\")")]
+#[hybrid(
+    name = "is_notable",
+    expr = "(price > 50 || quantity > 10) && discount < 20"
+)]
 struct LineItem {
     #[table(primary_key)]
     id: i64,
@@ -341,6 +345,64 @@ async fn concat_hybrid_matches_the_rust_side_string_concatenation() -> rusty_db:
         let tag: String = row.get_by_name("tag")?;
         assert_eq!(tag, item.sku_tag());
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_parenthesized_boolean_group_hybrid_matches_the_grouped_not_the_flat_semantics(
+) -> rusty_db::Result<()> {
+    let engine = file_engine("parenthesized_bool_group").await?;
+
+    // `is_notable`'s expr is `(price > 50 || quantity > 10) && discount < 20`
+    // — a grouping unreachable without explicit parens, since without them
+    // `&&` always binds tighter than `||` (so the only reachable flat form
+    // would be `price > 50 || (quantity > 10 && discount < 20)`, a
+    // genuinely different condition). This item is chosen specifically to
+    // disagree between the two: price > 50 alone would make the flat form
+    // true, but the grouped form still requires discount < 20, which is
+    // false here.
+    let discount_disqualifies = LineItem {
+        id: 1,
+        price: 100,
+        quantity: 1,
+        discount: 50,
+        sku: "a".to_string(),
+    };
+    let notable = LineItem {
+        id: 2,
+        price: 10,
+        quantity: 20,
+        discount: 5,
+        sku: "b".to_string(),
+    };
+    let not_notable = LineItem {
+        id: 3,
+        price: 10,
+        quantity: 2,
+        discount: 1,
+        sku: "c".to_string(),
+    };
+    let items = vec![
+        discount_disqualifies.clone(),
+        notable.clone(),
+        not_notable.clone(),
+    ];
+    seed(&engine, &items).await?;
+
+    // The grouped semantics: false, since discount (50) isn't < 20 despite
+    // price > 50 — the flat/ungrouped reading would incorrectly say true.
+    assert!(!discount_disqualifies.is_notable());
+    assert!(notable.is_notable());
+    assert!(!not_notable.is_notable());
+
+    let rows: Vec<LineItem> = engine
+        .fetch_all_as(&Select::from(&LineItem::table()).filter(LineItem::is_notable_expr()))
+        .await?;
+
+    let mut actual_ids: Vec<i64> = rows.iter().map(|i| i.id).collect();
+    actual_ids.sort();
+    assert_eq!(actual_ids, vec![notable.id]);
 
     Ok(())
 }

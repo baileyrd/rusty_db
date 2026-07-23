@@ -60,10 +60,11 @@ soft deletes, mapping-level column defaults (`#[table(default = "...")]`,
 distinct from the database-side column defaults schema introspection
 reflects below), computed/hybrid properties (`#[hybrid(name = "...", expr
 = "...")]`, an arithmetic-over-fields subset plus comparisons, `&&`/`||`
-chains of comparisons producing a `bool`-typed hybrid, and
-`upper`/`lower`/`concat` string functions producing a `String`-typed one
-— see "Richer hybrid-property expressions" below for what's still
-missing), session-level lifecycle hooks (`on_before_flush`/etc.)
+chains of comparisons (with parenthesized grouping) producing a
+`bool`-typed hybrid, and `upper`/`lower`/`concat` string functions
+producing a `String`-typed one — see "Richer hybrid-property expressions"
+below for what's still missing), session-level lifecycle hooks
+(`on_before_flush`/etc.)
 plus a hand-implemented `Lifecycle` trait for entity-level
 `before_insert`/`after_update`/`validate`-style hooks (`Session::add_mut`/
 `update_mut`/`delete_mut`), `expire_on_commit` semantics, savepoints/
@@ -147,14 +148,22 @@ missing). See `README.md` for the full tour with examples.
   `+`/`-`/`*`/`/` over this struct's own fields, literals, and
   parentheses, a `<`/`<=`/`>`/`>=`/`==`/`!=` comparison of two such
   sub-expressions chainable with `&&`/`||` (`&&` binding tighter,
-  left-associative) into a `bool`-typed hybrid, and string literals plus
-  `upper(x)`/`lower(x)`/`concat(a, b)` into a `String`-typed one; it still
+  left-associative) — either operand of which can itself be a
+  parenthesized group, overriding the default flat precedence the same
+  way arithmetic parentheses already do — into a `bool`-typed hybrid, and
+  string literals plus `upper(x)`/`lower(x)`/`concat(a, b)` into a
+  `String`-typed one. A comparison or `&&`/`||` combinator is only valid
+  at the top level of the expression or as a `&&`/`||` operand, though —
+  nesting one inside arithmetic, another comparison, or a string
+  function's argument is rejected at macro-expansion time (the query
+  builder's `Expr` has no type distinguishing arithmetic from boolean, so
+  a case like that would build a valid SQL `Expr` tree while only failing
+  — confusingly, deep in macro-generated code — on the Rust side). Still
   has no `CASE`/`COALESCE` (skipped deliberately — they fundamentally
   operate on NULL-able SQL values/`Option<T>` fields, but this design's
   arithmetic operators assume plain non-`Option` types, so supporting them
   properly is a nullability design question, not just a parser
-  extension), a parenthesized boolean group (only a flat `&&`/`||` chain
-  at the top), or references to a joined table's columns, and the
+  extension), or references to a joined table's columns, and the
   Rust-side/SQL-side halves are only guaranteed to agree for that
   arithmetic/comparison/boolean/string-function subset (anything richer
   needs a hand-written Rust method sitting beside a hand-written

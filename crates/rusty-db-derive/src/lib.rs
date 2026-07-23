@@ -1896,10 +1896,16 @@ enum HybridOp {
 }
 
 /// `<`/`<=`/`>`/`>=`/`==`/`!=` — always compares two arithmetic
-/// sub-expressions and produces a `bool`. Comparisons can't be nested
-/// inside an arithmetic sub-expression or parenthesized group — only
-/// `HybridBoolOp` can combine more than one, the same restriction Rust's
-/// own grammar puts on chained comparisons like `a < b < c`.
+/// sub-expressions and produces a `bool`. A comparison can appear only at
+/// the top level of a hybrid expression or as a direct operand of
+/// `HybridBoolOp` (optionally wrapped in its own parentheses to make a
+/// `&&`/`||` grouping unambiguous) — never nested inside an arithmetic
+/// sub-expression, another comparison, or a string function's argument
+/// (enforced by `reject_nested_boolean`, since the grammar alone can't
+/// rule it out once parentheses can hold a comparison at all). Chaining
+/// two comparisons directly (`a < b < c`) is rejected too, the same
+/// restriction Rust's own grammar puts on it — only `HybridBoolOp` can
+/// combine more than one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HybridCompareOp {
     Lt,
@@ -1912,11 +1918,12 @@ enum HybridCompareOp {
 
 /// `&&`/`||`, combining two `bool`-producing sub-expressions (ordinarily
 /// `HybridNode::Compare` or another `HybridBoolOp`) into a `bool`. `&&`
-/// binds tighter than `||`, matching Rust's own precedence — but neither
-/// can be parenthesized as its own group the way an arithmetic
-/// sub-expression can (`(price > 50) && (qty > 1)` isn't supported); only
-/// a flat, left-to-right chain of comparisons at the very top of the
-/// expression.
+/// binds tighter than `||`, matching Rust's own precedence. Either operand
+/// can be parenthesized as its own group (`(price > 50) && (qty > 1)`,
+/// or a fully parenthesized chain like `(price > 50 || price < 5) &&
+/// qty > 1`) — same as `HybridCompareOp`, this is only ever valid at the
+/// top level or as a `BoolOp` operand, never nested inside arithmetic,
+/// a comparison, or a string function's argument.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HybridBoolOp {
     And,
@@ -1926,19 +1933,20 @@ enum HybridBoolOp {
 /// The parsed shape of a `#[hybrid(expr = "...")]` string: a small
 /// expression tree over field names, integer/float/string literals, `+`/
 /// `-`/`*`/`/`, `upper(x)`/`lower(x)`/`concat(a, b)` string functions,
-/// parentheses for grouping, and — at the top level only — a `<`/`<=`/`>`/
-/// `>=`/`==`/`!=` comparison of two such arithmetic sub-expressions,
-/// optionally chained with `&&`/`||` into more than one. Deliberately
-/// nothing richer still (no `CASE`/`COALESCE`, parenthesized boolean
-/// groups, or references to a joined table's columns) — `CASE`/`COALESCE`
-/// in particular are skipped because they fundamentally operate on
-/// NULL-able SQL values, which map to `Option<T>` Rust fields, but this
-/// design's arithmetic operators implicitly assume plain, non-`Option`
-/// field types (there's no natural "first non-null" analog once a value
-/// might not be an `Option`). String functions map cleanly to Rust's
-/// `.to_uppercase()`/`.to_lowercase()`/`format!()` and the query builder's
-/// `Expr::upper()`/`Expr::lower()`/`Expr::concat()` without touching
-/// nullability at all, so they're supported while `CASE`/`COALESCE` aren't.
+/// parentheses for grouping, and — at the top level, or nested inside a
+/// parenthesized `&&`/`||` group — a `<`/`<=`/`>`/`>=`/`==`/`!=` comparison
+/// of two such arithmetic sub-expressions, optionally chained/grouped
+/// with `&&`/`||` into more than one. Deliberately nothing richer still
+/// (no `CASE`/`COALESCE`, or references to a joined table's columns) —
+/// `CASE`/`COALESCE` in particular are skipped because they fundamentally
+/// operate on NULL-able SQL values, which map to `Option<T>` Rust fields,
+/// but this design's arithmetic operators implicitly assume plain,
+/// non-`Option` field types (there's no natural "first non-null" analog
+/// once a value might not be an `Option`). String functions map cleanly
+/// to Rust's `.to_uppercase()`/`.to_lowercase()`/`format!()` and the query
+/// builder's `Expr::upper()`/`Expr::lower()`/`Expr::concat()` without
+/// touching nullability at all, so they're supported while
+/// `CASE`/`COALESCE` aren't.
 #[derive(Debug, Clone)]
 enum HybridNode {
     Field(String),
@@ -1995,8 +2003,11 @@ impl<'a> HybridParser<'a> {
 
     /// An arithmetic expression, optionally followed by exactly one
     /// comparison operator and a second arithmetic expression. Never
-    /// recurses back into itself, so a comparison can only ever appear
-    /// once per `&&`/`||` operand — matching `HybridCompareOp`'s own doc.
+    /// recurses back into itself directly, so a comparison can only ever
+    /// appear once per `&&`/`||` operand from the grammar alone — though a
+    /// parenthesized comparison/boolean group can still smuggle one in via
+    /// `parse_expr`/`parse_factor`'s own `LParen` arm; `reject_nested_boolean`
+    /// is what actually rules that out (see `HybridCompareOp`'s own doc).
     fn parse_comparison(&mut self) -> Result<HybridNode, String> {
         let lhs = self.parse_expr()?;
         let op = match self.tokens.get(self.pos) {
@@ -2084,7 +2095,14 @@ impl<'a> HybridParser<'a> {
             }
             Some(HybridToken::LParen) => {
                 self.pos += 1;
-                let node = self.parse_expr()?;
+                // Parses at the top of the precedence chain (`parse_or`),
+                // not just `parse_expr` (arithmetic) — this is what lets a
+                // parenthesized group hold a comparison or `&&`/`||` chain,
+                // not only arithmetic. A group containing pure arithmetic
+                // still round-trips through unaffected, since `parse_or`
+                // falls straight back down to `parse_expr` when no
+                // comparison/boolean operator follows.
+                let node = self.parse_or()?;
                 match self.tokens.get(self.pos) {
                     Some(HybridToken::RParen) => {
                         self.pos += 1;
@@ -2151,7 +2169,64 @@ impl<'a> HybridParser<'a> {
 
 fn parse_hybrid_expr(src: &str) -> Result<HybridNode, String> {
     let tokens = tokenize_hybrid_expr(src)?;
-    HybridParser::parse(&tokens)
+    let node = HybridParser::parse(&tokens)?;
+    reject_nested_boolean(&node, true)?;
+    Ok(node)
+}
+
+/// Rejects a `Compare`/`BoolOp` node anywhere except the top level of the
+/// whole expression or as a direct operand of another `BoolOp` — i.e. a
+/// parenthesized comparison/boolean group (`(price > 50) && (qty > 1)`)
+/// is fine, but nesting one as an arithmetic operand, a comparison's own
+/// operand, or a string function's argument (`(price > 50) + 1`,
+/// `(price > 50) > 2`, `upper((price > 50))`) isn't. Only the parenthesized
+/// grammar in `parse_factor`'s `LParen` arm can produce this shape at all
+/// — before it called `parse_or` (to support the parenthesized group in
+/// the first place) it was structurally impossible, since `parse_expr`/
+/// `parse_term`/`parse_factor` never produced a `Compare`/`BoolOp` node on
+/// their own. The reason this needs rejecting explicitly rather than left
+/// to just fail at compile time: the query builder's `Expr` has no type
+/// distinguishing "arithmetic" from "boolean" — `(a > 1) + 5` would still
+/// build a syntactically valid `Expr` tree (`Expr::lt_expr(...).add(...)`)
+/// even though the Rust side hard-fails to compile (`bool + i32`), which
+/// is exactly the kind of Rust-side/SQL-side disagreement this design is
+/// meant to rule out everywhere else.
+fn reject_nested_boolean(node: &HybridNode, top_level: bool) -> Result<(), String> {
+    match node {
+        HybridNode::Field(_)
+        | HybridNode::IntLit(_)
+        | HybridNode::FloatLit(_)
+        | HybridNode::StringLit(_) => Ok(()),
+        HybridNode::Op(lhs, _, rhs) | HybridNode::Concat(lhs, rhs) => {
+            reject_nested_boolean(lhs, false)?;
+            reject_nested_boolean(rhs, false)
+        }
+        HybridNode::Upper(inner) | HybridNode::Lower(inner) => reject_nested_boolean(inner, false),
+        HybridNode::Compare(lhs, _, rhs) => {
+            if !top_level {
+                return Err(
+                    "a comparison can only appear at the top level of a hybrid expression or \
+                     as an operand of `&&`/`||`, not nested inside arithmetic, another \
+                     comparison, or a string function's argument"
+                        .to_string(),
+                );
+            }
+            reject_nested_boolean(lhs, false)?;
+            reject_nested_boolean(rhs, false)
+        }
+        HybridNode::BoolOp(lhs, _, rhs) => {
+            if !top_level {
+                return Err(
+                    "a `&&`/`||` combinator can only appear at the top level of a hybrid \
+                     expression, not nested inside arithmetic, a comparison, or a string \
+                     function's argument"
+                        .to_string(),
+                );
+            }
+            reject_nested_boolean(lhs, true)?;
+            reject_nested_boolean(rhs, true)
+        }
+    }
 }
 
 /// Every field name a hybrid expression tree references, in the order
@@ -3191,5 +3266,68 @@ mod tests {
             }
             other => panic!("expected a comparison, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_parenthesized_boolean_group_overrides_the_default_flat_precedence() {
+        // Without parens, `a > 1 || b > 2 && c > 3` parses as
+        // `a > 1 || (b > 2 && c > 3)` (see `and_binds_tighter_than_or`).
+        // With parens around the first two, the grouping flips.
+        let node = parse_hybrid_expr("(a > 1 || b > 2) && c > 3").unwrap();
+        match node {
+            HybridNode::BoolOp(lhs, HybridBoolOp::And, rhs) => {
+                assert!(matches!(*lhs, HybridNode::BoolOp(_, HybridBoolOp::Or, _)));
+                assert!(matches!(*rhs, HybridNode::Compare(..)));
+            }
+            other => panic!("expected a top-level &&, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_single_parenthesized_comparison_is_equivalent_to_the_unparenthesized_form() {
+        let fields = vec![field("price", "price", "i64")];
+        assert_eq!(
+            rust_tokens_for("(price > 50)", &fields),
+            rust_tokens_for("price > 50", &fields),
+        );
+        assert_eq!(
+            sql_tokens_for("(price > 50)", &fields),
+            sql_tokens_for("price > 50", &fields),
+        );
+    }
+
+    #[test]
+    fn a_parenthesized_boolean_group_still_infers_a_bool_return_type() {
+        let node = parse_hybrid_expr("(a > 1 || b > 2) && c > 3").unwrap();
+        assert!(matches!(node, HybridNode::BoolOp(..)));
+    }
+
+    #[test]
+    fn a_comparison_nested_inside_arithmetic_via_parens_is_rejected() {
+        // `(a > 1) + 5` is syntactically reachable now that parens can
+        // hold a comparison, but must still be rejected: the query
+        // builder's `Expr` has no type distinguishing arithmetic from
+        // boolean, so this would build a valid `Expr` tree while only
+        // failing (a `bool + i32` type error) on the Rust side.
+        let err = parse_hybrid_expr("(a > 1) + 5").unwrap_err();
+        assert!(err.contains("comparison"), "got: {err}");
+    }
+
+    #[test]
+    fn a_comparison_nested_inside_another_comparison_via_parens_is_rejected() {
+        let err = parse_hybrid_expr("(a > 1) > 2").unwrap_err();
+        assert!(err.contains("comparison"), "got: {err}");
+    }
+
+    #[test]
+    fn a_bool_combinator_nested_inside_arithmetic_via_parens_is_rejected() {
+        let err = parse_hybrid_expr("(a > 1 && b > 2) + 5").unwrap_err();
+        assert!(err.contains("&&"), "got: {err}");
+    }
+
+    #[test]
+    fn a_comparison_nested_inside_a_string_function_argument_via_parens_is_rejected() {
+        let err = parse_hybrid_expr("upper((a > 1))").unwrap_err();
+        assert!(err.contains("comparison"), "got: {err}");
     }
 }
