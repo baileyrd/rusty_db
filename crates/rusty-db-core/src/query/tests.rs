@@ -1120,3 +1120,27 @@ fn alter_table_rename_column_renders_identically_shaped_sql_on_every_dialect() {
 fn alter_table_not_null_after_rename_column_panics() {
     let _ = AlterTable::rename_column("users", "nickname", "display_name").not_null();
 }
+
+#[test]
+fn alter_table_alter_column_type_renders_a_using_cast_on_postgres() {
+    let (pg_sql, params) =
+        AlterTable::alter_column_type("users", "age", ColumnType::I64).to_sql(&NumberedDialect);
+    assert_eq!(
+        pg_sql,
+        r#"ALTER TABLE "users" ALTER COLUMN "age" TYPE BIGINT USING "age"::BIGINT"#
+    );
+    assert!(params.is_empty());
+}
+
+#[test]
+#[should_panic(expected = "does not support directly altering a column's type")]
+fn alter_table_alter_column_type_panics_on_sqlite() {
+    let _ =
+        AlterTable::alter_column_type("users", "age", ColumnType::I64).to_sql(&QuestionMarkDialect);
+}
+
+#[test]
+#[should_panic(expected = "does not support directly altering a column's type")]
+fn alter_table_alter_column_type_panics_on_mysql() {
+    let _ = AlterTable::alter_column_type("users", "age", ColumnType::I64).to_sql(&MySqlDialect);
+}

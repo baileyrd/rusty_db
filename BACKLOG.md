@@ -105,10 +105,12 @@ autogenerate diffing a set of `#[derive(Mapped)]` types' expected shape
 against a live database, generating `CreateTable`/`AlterTable` DDL for
 review (`Engine::autogenerate_migration`, `TableSpec`), with
 `AutogenerateOptions` opting into a caller-hinted column rename
-(`AlterTable::rename_column`, spelled identically on all three dialects)
-or an explicitly allow-listed whole-table drop, beyond the conservative
-add/drop-column default — still never a type change either way (see
-"Autogenerate type-change detection" below); and `ShardRouter`, routing to one
+(`AlterTable::rename_column`, spelled identically on all three dialects),
+an explicitly allow-listed whole-table drop, or a caller-confirmed column
+type change (`AlterTable::alter_column_type`, Postgres only — see
+"Autogenerate type-change detection on MySQL/SQLite" below for what's
+still missing), beyond the conservative add/drop-column default; and
+`ShardRouter`, routing to one
 of several `Engine`s by hashing a caller-supplied key, via either naive
 modulo hashing (`ShardRouter::new`) or a consistent-hash ring
 (`ShardRouter::new_consistent`, remapping only a minority of keys when
@@ -119,20 +121,28 @@ missing). See `README.md` for the full tour with examples.
 
 ## Schema / DDL / reflection
 
-- **Autogenerate type-change detection** — `Engine::autogenerate_migration`
-  now closes the rename and whole-table-drop gaps via explicit, opt-in
+- **Autogenerate type-change detection on MySQL/SQLite** —
+  `Engine::autogenerate_migration` now closes the rename,
+  whole-table-drop, *and* type-change gaps via explicit, opt-in
   `AutogenerateOptions` (a caller-supplied rename hint, an allow-listed
-  drop), but still never detects a column's *type* changing: a live
-  column's `type_name` is dialect-native, verbatim text with no portable
-  representation to compare `ColumnType` against without reimplementing
-  `automap::rust_type_for`'s heuristic in reverse, per dialect — changing
-  a field's type without renaming it produces no suggested statement at
-  all. Closing this needs either that reverse heuristic (per dialect) or
-  its own opt-in surface (e.g. a caller-supplied "this column's new type
-  is X" hint, mirroring how renames are already handled) — plus, once a
-  type change is detected at all, a real `AlterTable` operation to render
-  it as (`ALTER COLUMN ... TYPE ...`/`MODIFY COLUMN`/SQLite's
-  table-rebuild dance), which doesn't exist yet either. **M**
+  drop, and — new — `changed_column_types`, a `(table, column)` hint
+  confirming a column's type genuinely changed, producing a real
+  `AlterTable::alter_column_type`), but the type-change hint only ever
+  produces a statement on Postgres (`ALTER COLUMN ... TYPE ... USING
+  ...`); `Dialect::supports_alter_column_type()` defaults to `false`, and
+  `diff` checks it before ever building the statement, so a matching hint
+  against a MySQL/MariaDB- or SQLite-backed diff quietly does nothing.
+  Extending it to MySQL/MariaDB needs restating the column's *entire*
+  definition in `MODIFY COLUMN` (nullability, default, ...) or those get
+  silently reset — a real correctness trap, not just more per-dialect SQL
+  spelling. Extending it to SQLite needs a full create-copy-drop-rename
+  table-rebuild dance (SQLite has no direct `ALTER COLUMN TYPE` at all),
+  which would also need `TableSchema` to start capturing a table's
+  triggers (currently doesn't) so a rebuild doesn't silently drop them,
+  and breaks the "always exactly one independently-runnable statement"
+  invariant every other `AlterTable` operation relies on — a rebuild is
+  an atomic *sequence*, not one more operation variant. Both are
+  separately-sized follow-ups, not bolt-ons to the Postgres path. **M**
 
 ## Mapping / derive macro (`#[derive(Mapped)]`)
 
