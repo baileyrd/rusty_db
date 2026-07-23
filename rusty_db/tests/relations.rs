@@ -827,6 +827,96 @@ async fn derive_generated_via_subquery_methods_work_end_to_end() -> rusty_db::Re
     let parent_ids = Select::from(&posts_table).columns([posts_table.col("id")]);
     let tags_by_post: HashMap<i64, Vec<Tag>> =
         Post::load_tags_via_subquery(&engine, parent_ids).await?;
+    assert_eq!(
+        tags_by_post.get(&rust_post.id).unwrap(),
+        &vec![rust_tag.clone()]
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn derive_generated_joined_methods_work_end_to_end() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let ada = User {
+        id: 1,
+        name: "ada".to_string(),
+    };
+    let grace = User {
+        id: 2,
+        name: "grace".to_string(),
+    };
+    engine.execute(&ada.insert()).await?;
+    engine.execute(&grace.insert()).await?;
+
+    let ada_order = Order {
+        id: 1,
+        user_id: 1,
+        amount: 100,
+    };
+    let grace_order = Order {
+        id: 2,
+        user_id: 2,
+        amount: 200,
+    };
+    engine.execute(&ada_order.insert()).await?;
+    engine.execute(&grace_order.insert()).await?;
+
+    let ada_profile = Profile {
+        id: 1,
+        user_id: 1,
+        bio: "mathematician".to_string(),
+    };
+    engine.execute(&ada_profile.insert()).await?;
+
+    let rust_post = Post {
+        id: 1,
+        title: "Why Rust".to_string(),
+    };
+    engine.execute(&rust_post.insert()).await?;
+    let rust_tag = Tag {
+        id: 1,
+        name: "rust".to_string(),
+    };
+    engine.execute(&rust_tag.insert()).await?;
+    insert_post_tag(&engine, rust_post.id, rust_tag.id).await?;
+
+    // has_many: User::load_orders_joined.
+    let (users, orders_by_user): (Vec<User>, HashMap<i64, Vec<Order>>) =
+        User::load_orders_joined(&engine, None).await?;
+    let mut user_ids: Vec<i64> = users.iter().map(|u| u.id).collect();
+    user_ids.sort();
+    assert_eq!(user_ids, vec![1, 2]);
+    assert_eq!(
+        orders_by_user.get(&ada.id).unwrap(),
+        &vec![ada_order.clone()]
+    );
+    assert_eq!(
+        orders_by_user.get(&grace.id).unwrap(),
+        &vec![grace_order.clone()]
+    );
+
+    // has_one: User::load_profile_joined, with a filter this time.
+    let filter = User::table().col("id").eq(ada.id);
+    let (filtered_users, profiles_by_user): (Vec<User>, HashMap<i64, Profile>) =
+        User::load_profile_joined(&engine, Some(filter)).await?;
+    assert_eq!(filtered_users, vec![ada.clone()]);
+    assert_eq!(profiles_by_user.get(&ada.id).unwrap(), &ada_profile);
+
+    // belongs_to: Order::load_user_joined.
+    let (orders, users_by_id): (Vec<Order>, HashMap<i64, User>) =
+        Order::load_user_joined(&engine, None).await?;
+    let mut order_ids: Vec<i64> = orders.iter().map(|o| o.id).collect();
+    order_ids.sort();
+    assert_eq!(order_ids, vec![1, 2]);
+    assert_eq!(users_by_id.get(&ada.id).unwrap(), &ada);
+    assert_eq!(users_by_id.get(&grace.id).unwrap(), &grace);
+
+    // many_to_many: Post::load_tags_joined.
+    let (posts, tags_by_post): (Vec<Post>, HashMap<i64, Vec<Tag>>) =
+        Post::load_tags_joined(&engine, None).await?;
+    assert_eq!(posts, vec![rust_post.clone()]);
     assert_eq!(tags_by_post.get(&rust_post.id).unwrap(), &vec![rust_tag]);
 
     Ok(())
