@@ -1317,12 +1317,14 @@ fn expand_belongs_to_via_subquery(
 enum HybridToken {
     Ident(String),
     Number(String),
+    Str(String),
     Plus,
     Minus,
     Star,
     Slash,
     LParen,
     RParen,
+    Comma,
     Lt,
     Le,
     Gt,
@@ -1361,6 +1363,19 @@ fn tokenize_hybrid_expr(src: &str) -> Result<Vec<HybridToken>, String> {
                 }
             }
             tokens.push(HybridToken::Number(number));
+        } else if c == '"' {
+            chars.next();
+            let mut text = String::new();
+            loop {
+                match chars.next() {
+                    Some('"') => break,
+                    Some(c) => text.push(c),
+                    None => {
+                        return Err("unterminated string literal in hybrid expression".to_string())
+                    }
+                }
+            }
+            tokens.push(HybridToken::Str(text));
         } else {
             chars.next();
             let token = match c {
@@ -1370,6 +1385,7 @@ fn tokenize_hybrid_expr(src: &str) -> Result<Vec<HybridToken>, String> {
                 '/' => HybridToken::Slash,
                 '(' => HybridToken::LParen,
                 ')' => HybridToken::RParen,
+                ',' => HybridToken::Comma,
                 '<' => {
                     if chars.next_if_eq(&'=').is_some() {
                         HybridToken::Le
@@ -1437,24 +1453,33 @@ enum HybridBoolOp {
 }
 
 /// The parsed shape of a `#[hybrid(expr = "...")]` string: a small
-/// expression tree over field names, integer/float literals, `+`/`-`/`*`/
-/// `/`, parentheses for grouping, and — at the top level only — a
-/// `<`/`<=`/`>`/`>=`/`==`/`!=` comparison of two such arithmetic
-/// sub-expressions, optionally chained with `&&`/`||` into more than one.
-/// Deliberately nothing richer still (no string functions,
-/// `CASE`/`COALESCE`, parenthesized boolean groups, or references to a
-/// joined table's columns), since this is meant to render identically as
-/// both a plain Rust expression and a portable `Expr` tree, and that only
-/// holds for the arithmetic/comparison/boolean ANSI SQL already shares
-/// with Rust.
+/// expression tree over field names, integer/float/string literals, `+`/
+/// `-`/`*`/`/`, `upper(x)`/`lower(x)`/`concat(a, b)` string functions,
+/// parentheses for grouping, and — at the top level only — a `<`/`<=`/`>`/
+/// `>=`/`==`/`!=` comparison of two such arithmetic sub-expressions,
+/// optionally chained with `&&`/`||` into more than one. Deliberately
+/// nothing richer still (no `CASE`/`COALESCE`, parenthesized boolean
+/// groups, or references to a joined table's columns) — `CASE`/`COALESCE`
+/// in particular are skipped because they fundamentally operate on
+/// NULL-able SQL values, which map to `Option<T>` Rust fields, but this
+/// design's arithmetic operators implicitly assume plain, non-`Option`
+/// field types (there's no natural "first non-null" analog once a value
+/// might not be an `Option`). String functions map cleanly to Rust's
+/// `.to_uppercase()`/`.to_lowercase()`/`format!()` and the query builder's
+/// `Expr::upper()`/`Expr::lower()`/`Expr::concat()` without touching
+/// nullability at all, so they're supported while `CASE`/`COALESCE` aren't.
 #[derive(Debug, Clone)]
 enum HybridNode {
     Field(String),
     IntLit(i64),
     FloatLit(f64),
+    StringLit(String),
     Op(Box<HybridNode>, HybridOp, Box<HybridNode>),
     Compare(Box<HybridNode>, HybridCompareOp, Box<HybridNode>),
     BoolOp(Box<HybridNode>, HybridBoolOp, Box<HybridNode>),
+    Upper(Box<HybridNode>),
+    Lower(Box<HybridNode>),
+    Concat(Box<HybridNode>, Box<HybridNode>),
 }
 
 struct HybridParser<'a> {
@@ -1562,7 +1587,11 @@ impl<'a> HybridParser<'a> {
             Some(HybridToken::Ident(name)) => {
                 let name = name.clone();
                 self.pos += 1;
-                Ok(HybridNode::Field(name))
+                if matches!(self.tokens.get(self.pos), Some(HybridToken::LParen)) {
+                    self.parse_call(&name)
+                } else {
+                    Ok(HybridNode::Field(name))
+                }
             }
             Some(HybridToken::Number(text)) => {
                 let text = text.clone();
@@ -1577,6 +1606,11 @@ impl<'a> HybridParser<'a> {
                         .map_err(|_| format!("invalid number {text:?} in hybrid expression"))
                 }
             }
+            Some(HybridToken::Str(text)) => {
+                let text = text.clone();
+                self.pos += 1;
+                Ok(HybridNode::StringLit(text))
+            }
             Some(HybridToken::LParen) => {
                 self.pos += 1;
                 let node = self.parse_expr()?;
@@ -1589,7 +1623,56 @@ impl<'a> HybridParser<'a> {
                 }
             }
             other => Err(format!(
-                "expected a field name, number, or `(` in hybrid expression, found {other:?}"
+                "expected a field name, number, string, or `(` in hybrid expression, found {other:?}"
+            )),
+        }
+    }
+
+    /// Parses `name(arg, arg, ...)` — the `(` after `name` has already been
+    /// peeked but not yet consumed. Each argument is parsed at `parse_expr`
+    /// level (arithmetic, no comparisons/booleans), matching what makes
+    /// sense inside `upper`/`lower`/`concat`. Rejects unknown function
+    /// names and wrong argument counts eagerly, rather than deferring to
+    /// codegen.
+    fn parse_call(&mut self, name: &str) -> Result<HybridNode, String> {
+        self.pos += 1; // consume `(`
+        let mut args = Vec::new();
+        if !matches!(self.tokens.get(self.pos), Some(HybridToken::RParen)) {
+            loop {
+                args.push(self.parse_expr()?);
+                match self.tokens.get(self.pos) {
+                    Some(HybridToken::Comma) => {
+                        self.pos += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        match self.tokens.get(self.pos) {
+            Some(HybridToken::RParen) => self.pos += 1,
+            _ => {
+                return Err(format!(
+                    "expected closing `)` after `{name}(...)` arguments"
+                ))
+            }
+        }
+
+        match (name, args.len()) {
+            ("upper", 1) => Ok(HybridNode::Upper(Box::new(args.remove(0)))),
+            ("lower", 1) => Ok(HybridNode::Lower(Box::new(args.remove(0)))),
+            ("concat", 2) => {
+                let rhs = args.remove(1);
+                let lhs = args.remove(0);
+                Ok(HybridNode::Concat(Box::new(lhs), Box::new(rhs)))
+            }
+            ("upper" | "lower", n) => Err(format!(
+                "`{name}(...)` takes exactly 1 argument in a hybrid expression, found {n}"
+            )),
+            ("concat", n) => Err(format!(
+                "`concat(...)` takes exactly 2 arguments in a hybrid expression, found {n}"
+            )),
+            (other, _) => Err(format!(
+                "unknown function `{other}` in hybrid expression; expected `upper`, `lower`, or `concat`"
             )),
         }
     }
@@ -1607,14 +1690,16 @@ fn parse_hybrid_expr(src: &str) -> Result<HybridNode, String> {
 fn hybrid_field_names(node: &HybridNode) -> Vec<String> {
     match node {
         HybridNode::Field(name) => vec![name.clone()],
-        HybridNode::IntLit(_) | HybridNode::FloatLit(_) => Vec::new(),
+        HybridNode::IntLit(_) | HybridNode::FloatLit(_) | HybridNode::StringLit(_) => Vec::new(),
         HybridNode::Op(lhs, _, rhs)
         | HybridNode::Compare(lhs, _, rhs)
-        | HybridNode::BoolOp(lhs, _, rhs) => {
+        | HybridNode::BoolOp(lhs, _, rhs)
+        | HybridNode::Concat(lhs, rhs) => {
             let mut names = hybrid_field_names(lhs);
             names.extend(hybrid_field_names(rhs));
             names
         }
+        HybridNode::Upper(inner) | HybridNode::Lower(inner) => hybrid_field_names(inner),
     }
 }
 
@@ -1640,6 +1725,7 @@ fn hybrid_rust_tokens(node: &HybridNode, fields: &[FieldInfo]) -> TokenStream2 {
             let lit = proc_macro2::Literal::f64_unsuffixed(*n);
             quote! { (#lit) }
         }
+        HybridNode::StringLit(s) => quote! { (#s.to_string()) },
         HybridNode::Op(lhs, op, rhs) => {
             let lhs = hybrid_rust_tokens(lhs, fields);
             let rhs = hybrid_rust_tokens(rhs, fields);
@@ -1670,6 +1756,19 @@ fn hybrid_rust_tokens(node: &HybridNode, fields: &[FieldInfo]) -> TokenStream2 {
                 HybridBoolOp::Or => quote! { (#lhs || #rhs) },
             }
         }
+        HybridNode::Upper(inner) => {
+            let inner = hybrid_rust_tokens(inner, fields);
+            quote! { (#inner.to_uppercase()) }
+        }
+        HybridNode::Lower(inner) => {
+            let inner = hybrid_rust_tokens(inner, fields);
+            quote! { (#inner.to_lowercase()) }
+        }
+        HybridNode::Concat(lhs, rhs) => {
+            let lhs = hybrid_rust_tokens(lhs, fields);
+            let rhs = hybrid_rust_tokens(rhs, fields);
+            quote! { (format!("{}{}", #lhs, #rhs)) }
+        }
     }
 }
 
@@ -1689,6 +1788,7 @@ fn hybrid_sql_tokens(node: &HybridNode, core: &TokenStream2, fields: &[FieldInfo
         }
         HybridNode::IntLit(n) => quote! { #core::Expr::lit(#n) },
         HybridNode::FloatLit(n) => quote! { #core::Expr::lit(#n) },
+        HybridNode::StringLit(s) => quote! { #core::Expr::lit(#s) },
         HybridNode::Op(lhs, op, rhs) => {
             let lhs = hybrid_sql_tokens(lhs, core, fields);
             let rhs = hybrid_sql_tokens(rhs, core, fields);
@@ -1718,6 +1818,19 @@ fn hybrid_sql_tokens(node: &HybridNode, core: &TokenStream2, fields: &[FieldInfo
                 HybridBoolOp::And => quote! { (#lhs).and(#rhs) },
                 HybridBoolOp::Or => quote! { (#lhs).or(#rhs) },
             }
+        }
+        HybridNode::Upper(inner) => {
+            let inner = hybrid_sql_tokens(inner, core, fields);
+            quote! { (#inner).upper() }
+        }
+        HybridNode::Lower(inner) => {
+            let inner = hybrid_sql_tokens(inner, core, fields);
+            quote! { (#inner).lower() }
+        }
+        HybridNode::Concat(lhs, rhs) => {
+            let lhs = hybrid_sql_tokens(lhs, core, fields);
+            let rhs = hybrid_sql_tokens(rhs, core, fields);
+            quote! { (#lhs).concat(#rhs) }
         }
     }
 }
@@ -1772,6 +1885,16 @@ fn expand_hybrid(
         Some(ty) => ty.clone(),
         None if matches!(node, HybridNode::Compare(..) | HybridNode::BoolOp(..)) => {
             syn::parse_quote!(bool)
+        }
+        None if matches!(
+            node,
+            HybridNode::Upper(..)
+                | HybridNode::Lower(..)
+                | HybridNode::Concat(..)
+                | HybridNode::StringLit(..)
+        ) =>
+        {
+            syn::parse_quote!(String)
         }
         None => {
             let first = referenced.first().expect("checked non-empty above");
@@ -2489,5 +2612,113 @@ mod tests {
             hybrid_field_names(&node),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+    }
+
+    #[test]
+    fn a_string_literal_tokenizes_and_parses() {
+        let tokens = tokenize_hybrid_expr("\"hello\"").unwrap();
+        assert_eq!(tokens, vec![HybridToken::Str("hello".to_string())]);
+        let node = parse_hybrid_expr("\"hello\"").unwrap();
+        assert!(matches!(node, HybridNode::StringLit(s) if s == "hello"));
+    }
+
+    #[test]
+    fn an_unterminated_string_literal_is_rejected() {
+        assert!(tokenize_hybrid_expr("\"hello").is_err());
+    }
+
+    #[test]
+    fn upper_and_lower_parse_as_single_argument_calls() {
+        let fields = vec![field("name", "name", "String")];
+        match parse_hybrid_expr("upper(name)").unwrap() {
+            HybridNode::Upper(inner) => {
+                assert!(matches!(*inner, HybridNode::Field(f) if f == "name"))
+            }
+            other => panic!("expected Upper, got {other:?}"),
+        }
+        match parse_hybrid_expr("lower(name)").unwrap() {
+            HybridNode::Lower(inner) => {
+                assert!(matches!(*inner, HybridNode::Field(f) if f == "name"))
+            }
+            other => panic!("expected Lower, got {other:?}"),
+        }
+        let _ = rust_tokens_for("upper(name)", &fields);
+        let _ = rust_tokens_for("lower(name)", &fields);
+    }
+
+    #[test]
+    fn concat_parses_as_a_two_argument_call() {
+        let fields = vec![
+            field("first", "first", "String"),
+            field("last", "last", "String"),
+        ];
+        match parse_hybrid_expr("concat(first, last)").unwrap() {
+            HybridNode::Concat(lhs, rhs) => {
+                assert!(matches!(*lhs, HybridNode::Field(f) if f == "first"));
+                assert!(matches!(*rhs, HybridNode::Field(f) if f == "last"));
+            }
+            other => panic!("expected Concat, got {other:?}"),
+        }
+        let _ = rust_tokens_for("concat(first, last)", &fields);
+    }
+
+    #[test]
+    fn upper_lower_and_concat_reject_the_wrong_argument_count() {
+        assert!(parse_hybrid_expr("upper(name, name)").is_err());
+        assert!(parse_hybrid_expr("upper()").is_err());
+        assert!(parse_hybrid_expr("concat(name)").is_err());
+        assert!(parse_hybrid_expr("concat(name, name, name)").is_err());
+    }
+
+    #[test]
+    fn an_unknown_function_name_is_rejected() {
+        let err = parse_hybrid_expr("frobnicate(name)").unwrap_err();
+        assert!(err.contains("unknown function"), "got: {err}");
+    }
+
+    #[test]
+    fn upper_lower_and_concat_render_the_matching_rust_and_sql_calls() {
+        let fields = vec![
+            field("first", "first", "String"),
+            field("last", "last", "String"),
+        ];
+
+        let rust = rust_tokens_for("upper(first)", &fields);
+        assert!(rust.contains("to_uppercase"));
+        let sql = sql_tokens_for("upper(first)", &fields);
+        assert!(sql.contains(". upper"));
+
+        let rust = rust_tokens_for("lower(first)", &fields);
+        assert!(rust.contains("to_lowercase"));
+        let sql = sql_tokens_for("lower(first)", &fields);
+        assert!(sql.contains(". lower"));
+
+        let rust = rust_tokens_for("concat(first, last)", &fields);
+        assert!(rust.contains("format !"));
+        let sql = sql_tokens_for("concat(first, last)", &fields);
+        assert!(sql.contains(". concat"));
+    }
+
+    #[test]
+    fn a_string_function_expression_defaults_to_a_string_return_type() {
+        let node = parse_hybrid_expr("upper(name)").unwrap();
+        assert!(matches!(node, HybridNode::Upper(..)));
+        let node = parse_hybrid_expr("concat(first, last)").unwrap();
+        assert!(matches!(node, HybridNode::Concat(..)));
+    }
+
+    #[test]
+    fn a_string_function_can_be_used_inside_arithmetic_free_comparisons() {
+        // concat/upper/lower nest fine as comparison operands since
+        // parse_comparison calls parse_expr on each side, same as any
+        // other arithmetic sub-expression.
+        let node = parse_hybrid_expr("upper(name) == \"ADA\"").unwrap();
+        match node {
+            HybridNode::Compare(lhs, HybridCompareOp::Eq, rhs) => {
+                assert!(matches!(*lhs, HybridNode::Upper(..)));
+                assert!(matches!(*rhs, HybridNode::StringLit(s) if s == "ADA"));
+            }
+            other => panic!("expected a comparison, got {other:?}"),
+        }
     }
 }

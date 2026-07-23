@@ -18,12 +18,16 @@ use rusty_db::prelude::*;
 )]
 #[hybrid(name = "is_expensive", expr = "price > 50")]
 #[hybrid(name = "is_bulk_discount_eligible", expr = "price > 5 && quantity > 1")]
+#[hybrid(name = "sku_upper", expr = "upper(sku)")]
+#[hybrid(name = "sku_lower", expr = "lower(sku)")]
+#[hybrid(name = "sku_tag", expr = "concat(sku, \"-item\")")]
 struct LineItem {
     #[table(primary_key)]
     id: i64,
     price: i64,
     quantity: i64,
     discount: i64,
+    sku: String,
 }
 
 async fn file_engine(name: &str) -> rusty_db::Result<Engine> {
@@ -39,7 +43,7 @@ async fn file_engine(name: &str) -> rusty_db::Result<Engine> {
         .await?
         .execute(
             "CREATE TABLE line_items (id INTEGER PRIMARY KEY, price INTEGER NOT NULL, \
-             quantity INTEGER NOT NULL, discount INTEGER NOT NULL)",
+             quantity INTEGER NOT NULL, discount INTEGER NOT NULL, sku TEXT NOT NULL)",
             &[],
         )
         .await?;
@@ -53,18 +57,21 @@ fn sample_items() -> Vec<LineItem> {
             price: 10,
             quantity: 2,
             discount: 1,
+            sku: "widget".to_string(),
         },
         LineItem {
             id: 2,
             price: 5,
             quantity: 5,
             discount: 0,
+            sku: "Gadget".to_string(),
         },
         LineItem {
             id: 3,
             price: 100,
             quantity: 1,
             discount: 20,
+            sku: "GIZMO".to_string(),
         },
     ]
 }
@@ -84,6 +91,7 @@ async fn the_rust_side_method_computes_the_same_arithmetic_as_the_expression_str
         price: 10,
         quantity: 3,
         discount: 4,
+        sku: "widget".to_string(),
     };
     assert_eq!(item.total(), 30);
     assert_eq!(item.discounted_total(), 26);
@@ -173,12 +181,14 @@ async fn a_comparison_hybrid_computes_a_bool_on_the_rust_side() -> rusty_db::Res
         price: 10,
         quantity: 1,
         discount: 0,
+        sku: "widget".to_string(),
     };
     let expensive = LineItem {
         id: 2,
         price: 100,
         quantity: 1,
         discount: 0,
+        sku: "widget".to_string(),
     };
     assert!(!cheap.is_expensive());
     assert!(expensive.is_expensive());
@@ -247,6 +257,90 @@ async fn a_boolean_combinator_hybrids_sql_side_matches_the_rust_side() -> rusty_
     // Sample data has both a match and non-matches, catching a
     // silently-always-true/always-false filter.
     assert!(!expected.is_empty() && expected.len() < items.len());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn upper_and_lower_hybrids_compute_the_same_case_conversion_on_both_sides(
+) -> rusty_db::Result<()> {
+    let engine = file_engine("upper_lower").await?;
+    let items = sample_items();
+    seed(&engine, &items).await?;
+
+    for item in &items {
+        assert_eq!(item.sku_upper(), item.sku.to_uppercase());
+        assert_eq!(item.sku_lower(), item.sku.to_lowercase());
+    }
+
+    let rows = engine
+        .fetch_all(
+            &Select::from(&LineItem::table())
+                .columns([
+                    SelectExpr::from(LineItem::table().col("id")),
+                    SelectExpr::from(LineItem::sku_upper_expr()).alias("upper_sku"),
+                    SelectExpr::from(LineItem::sku_lower_expr()).alias("lower_sku"),
+                ])
+                .order_by(LineItem::table().col("id").asc()),
+        )
+        .await?;
+
+    for (row, item) in rows.iter().zip(items.iter()) {
+        let id: i64 = row.get_by_name("id")?;
+        let upper_sku: String = row.get_by_name("upper_sku")?;
+        let lower_sku: String = row.get_by_name("lower_sku")?;
+        assert_eq!(id, item.id);
+        assert_eq!(upper_sku, item.sku_upper());
+        assert_eq!(lower_sku, item.sku_lower());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_filter_on_an_upper_hybrid_matches_case_insensitively() -> rusty_db::Result<()> {
+    let engine = file_engine("upper_filter").await?;
+    let items = sample_items();
+    seed(&engine, &items).await?;
+
+    // "Gadget" (mixed case) should match a filter on the uppercased SKU.
+    let rows: Vec<LineItem> = engine
+        .fetch_all_as(
+            &Select::from(&LineItem::table()).filter(LineItem::sku_upper_expr().eq("GADGET")),
+        )
+        .await?;
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].sku, "Gadget");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn concat_hybrid_matches_the_rust_side_string_concatenation() -> rusty_db::Result<()> {
+    let engine = file_engine("concat").await?;
+    let items = sample_items();
+    seed(&engine, &items).await?;
+
+    for item in &items {
+        assert_eq!(item.sku_tag(), format!("{}-item", item.sku));
+    }
+
+    let rows = engine
+        .fetch_all(
+            &Select::from(&LineItem::table())
+                .columns([
+                    SelectExpr::from(LineItem::table().col("id")),
+                    SelectExpr::from(LineItem::sku_tag_expr()).alias("tag"),
+                ])
+                .order_by(LineItem::table().col("id").asc()),
+        )
+        .await?;
+
+    for (row, item) in rows.iter().zip(items.iter()) {
+        let tag: String = row.get_by_name("tag")?;
+        assert_eq!(tag, item.sku_tag());
+    }
 
     Ok(())
 }
