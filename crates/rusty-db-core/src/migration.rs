@@ -212,6 +212,107 @@ fn create_table_ddl(quoted_table: &str) -> String {
     )
 }
 
+/// A thin `up`/`down`/`status` command dispatcher over `Migrator`, for
+/// building an Alembic-style migration binary without inventing a
+/// file-based migration format: migrations here are always compile-time
+/// Rust `const` arrays (see the module doc), so there's nothing for a
+/// generic, project-agnostic CLI binary to discover on disk. Instead,
+/// `run`/`run_to` are meant to be called from a few lines of a small
+/// binary *in your own crate*, which already has both the `&[Migration]`
+/// array and however it builds its own `Engine`:
+///
+/// ```no_run
+/// # use rusty_db_core::{Engine, Migration};
+/// # async fn example(engine: Engine, migrations: &[Migration]) -> rusty_db_core::Result<()> {
+/// // src/bin/migrate.rs
+/// rusty_db_core::migration::cli::run(&engine, migrations).await
+/// # }
+/// ```
+///
+/// Then `cargo run --bin migrate -- up`/`down`/`status` behaves like
+/// `alembic upgrade head`/`downgrade -1`/`current`, with zero extra
+/// dependencies (no argument-parsing crate, just `std::env::args`).
+pub mod cli {
+    use super::{Error, Migration, Migrator, Result};
+    use crate::engine::Engine;
+
+    /// Runs the subcommand named by this process's own command-line
+    /// arguments (`std::env::args()`, skipping the program name) against
+    /// `stdout`/`stderr` — the entry point a `src/bin/migrate.rs` calls
+    /// directly. See `run_to` for the same logic against an arbitrary
+    /// writer (e.g. for testing).
+    pub async fn run(engine: &Engine, migrations: &[Migration]) -> Result<()> {
+        run_to(
+            &mut std::io::stdout(),
+            engine,
+            migrations,
+            std::env::args().skip(1),
+        )
+        .await
+    }
+
+    /// Like `run`, but takes the arguments and the output writer
+    /// explicitly instead of reading the real process argv/stdout —
+    /// what `run` itself calls, and what tests call directly to avoid
+    /// depending on actual process arguments or capturing real stdout.
+    ///
+    /// Recognizes exactly three subcommands, matching `Migrator`'s own
+    /// methods: `up` (apply every not-yet-applied migration, printing
+    /// each one's version as it applies, or a single "already up to
+    /// date" line if there's nothing to do), `down` (revert the single
+    /// most-recently-applied migration, or print that there's nothing to
+    /// revert), and `status` (list every migration in `migrations`,
+    /// marking each applied one). Anything else — including no
+    /// subcommand at all — is `Err(Error::Migration(_))`, the same error
+    /// type every other migration-related failure in this crate already
+    /// uses.
+    pub async fn run_to(
+        out: &mut impl std::io::Write,
+        engine: &Engine,
+        migrations: &[Migration],
+        mut args: impl Iterator<Item = String>,
+    ) -> Result<()> {
+        let migrator = Migrator::new(engine);
+        match args.next().as_deref() {
+            Some("up") => {
+                let applied = migrator.up(migrations).await?;
+                if applied.is_empty() {
+                    let _ = writeln!(out, "Already up to date.");
+                } else {
+                    for version in &applied {
+                        let _ = writeln!(out, "Applied migration {version}");
+                    }
+                }
+            }
+            Some("down") => match migrator.down(migrations).await? {
+                Some(version) => {
+                    let _ = writeln!(out, "Reverted migration {version}");
+                }
+                None => {
+                    let _ = writeln!(out, "Nothing to revert.");
+                }
+            },
+            Some("status") => {
+                for (migration, applied) in migrator.status(migrations).await? {
+                    let mark = if applied { "x" } else { " " };
+                    let _ = writeln!(out, "[{mark}] {:>4} {}", migration.version, migration.name);
+                }
+            }
+            Some(other) => {
+                return Err(Error::Migration(format!(
+                    "unknown migration command {other:?}; expected \"up\", \"down\", or \"status\""
+                )));
+            }
+            None => {
+                return Err(Error::Migration(
+                    "expected a migration command: \"up\", \"down\", or \"status\"".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Applies every migration in `migrations` not already recorded as applied
 /// (in ascending version order) through `txn`, without committing or
 /// rolling it back — that's left to the caller. This is what

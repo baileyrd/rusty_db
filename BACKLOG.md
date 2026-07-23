@@ -82,7 +82,12 @@ deduplicating whichever one the join naturally repeats and safely
 aliasing around any column-name collision between the two — see "Extend
 joined eager loading beyond has_many/has_one/belongs_to" below for what's
 still missing); hand-written versioned
-migrations; schema introspection (columns/types/nullability/PK/foreign
+migrations (standalone via `Migrator`, folded into a session's
+transaction via `session.migrate`, or driven from a small
+`src/bin/migrate.rs` in your own crate via the dependency-free
+`up`/`down`/`status` dispatcher `rusty_db::migration::cli` — see "A
+migration CLI" below for why this stops short of a generic,
+project-agnostic binary); schema introspection (columns/types/nullability/PK/foreign
 keys/indexes/unique constraints/check constraints/column defaults);
 logical backup/restore; read replicas; TLS; query timeouts; connection-pool
 observability; connection-level event hooks (`PoolConfig::with_on_connect`/
@@ -183,14 +188,19 @@ missing). See `README.md` for the full tour with examples.
 
 ## Tooling
 
-- **A migration CLI** (an Alembic-equivalent command-line tool — `rusty-db
-  migrate up`/`down`/`status` as a standalone binary, vs. today's
-  library-only `Migrator`/`session.migrate()` API) — there's no binary
-  crate anywhere in the workspace yet. Note: migrations are always defined
-  as compile-time Rust `const` arrays (`&'static [Migration]`), not loaded
-  from files on disk, so a genuinely standalone binary needs a file-based
-  migration format invented first — a bigger prerequisite than the effort
-  guess suggests. **M**
+- **A single, generic, project-agnostic migration CLI binary** — resolved
+  differently than originally scoped: `rusty_db::migration::cli` now
+  gives `up`/`down`/`status` subcommand *dispatch* (`run`/`run_to`) for
+  free, but since migrations are always compile-time Rust `const` arrays
+  (`&'static [Migration]`), not loaded from files on disk, there's still
+  nothing for a single workspace-provided binary to discover across
+  arbitrary projects — each project needs its own few-line
+  `src/bin/migrate.rs` supplying its own `&[Migration]` and `Engine`. A
+  genuinely standalone, zero-code, `pip install alembic`-style tool would
+  still need a file-based migration format invented first, which remains
+  a bigger undertaking than a CLI wrapper by itself. **S** (down from **M**
+  now that the dispatcher itself exists — what's left is specifically the
+  file-format prerequisite, not the CLI logic)
 
 ---
 
