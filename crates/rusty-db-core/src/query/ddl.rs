@@ -291,22 +291,26 @@ enum AlterOperation {
     AddColumn(AddColumnDef),
     DropColumn(String),
     RenameColumn { old_name: String, new_name: String },
+    ChangeColumnType { name: String, ty: ColumnType },
 }
 
 /// Builds a portable `ALTER TABLE` statement — always exactly *one*
-/// operation (`ADD COLUMN`, `DROP COLUMN`, or `RENAME COLUMN`), never
-/// several combined into one statement: Postgres and MySQL/MariaDB both
-/// allow comma-separating multiple actions in a single `ALTER TABLE`, but
-/// SQLite only ever allows one action per statement, so combining several
-/// would render differently — or fail outright — per dialect. Modifying
-/// several columns means calling `engine.execute(...)` once per
-/// `AlterTable`, which works identically everywhere.
+/// operation (`ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`, or — Postgres
+/// only — `ALTER COLUMN ... TYPE ...`), never several combined into one
+/// statement: Postgres and MySQL/MariaDB both allow comma-separating
+/// multiple actions in a single `ALTER TABLE`, but SQLite only ever
+/// allows one action per statement, so combining several would render
+/// differently — or fail outright — per dialect. Modifying several
+/// columns means calling `engine.execute(...)` once per `AlterTable`,
+/// which works identically everywhere.
 ///
 /// `RENAME COLUMN <old> TO <new>` happens to be spelled identically on
 /// all three dialects (SQLite since 3.25.0, MySQL/MariaDB since 8.0/10.5.2,
 /// both well below anything this crate otherwise assumes), so
 /// `rename_column` needs no per-dialect branching the way `add_column`'s
-/// type spelling does.
+/// type spelling does. `alter_column_type` is the opposite case — see its
+/// own doc and `Dialect::supports_alter_column_type` for why it's
+/// Postgres-only rather than portable across all three.
 ///
 /// Adding a `NOT NULL` column with no default to a table that already has
 /// rows is rejected by the database itself (there'd be no value for
@@ -375,10 +379,34 @@ impl AlterTable {
         }
     }
 
+    /// `ALTER TABLE <table> ALTER COLUMN <name> TYPE <ty>` (Postgres only
+    /// — panics from `.to_sql(...)` on any dialect where
+    /// `Dialect::supports_alter_column_type` is `false`, currently
+    /// SQLite and MySQL/MariaDB; see that method's own doc for why).
+    /// Doesn't restate nullability or a default — Postgres's `ALTER
+    /// COLUMN ... TYPE` is a standalone clause that doesn't touch either,
+    /// unlike MySQL/MariaDB's `MODIFY COLUMN`, which is exactly the trap
+    /// that keeps this operation Postgres-only for now.
+    pub fn alter_column_type(
+        table: impl Into<String>,
+        name: impl Into<String>,
+        ty: ColumnType,
+    ) -> Self {
+        AlterTable {
+            table: table.into(),
+            operation: AlterOperation::ChangeColumnType {
+                name: name.into(),
+                ty,
+            },
+        }
+    }
+
     fn added_column(&mut self) -> &mut AddColumnDef {
         match &mut self.operation {
             AlterOperation::AddColumn(def) => def,
-            AlterOperation::DropColumn(_) | AlterOperation::RenameColumn { .. } => {
+            AlterOperation::DropColumn(_)
+            | AlterOperation::RenameColumn { .. }
+            | AlterOperation::ChangeColumnType { .. } => {
                 panic!("AlterTable: .not_null()/.default_raw() only apply to .add_column(...)")
             }
         }
@@ -430,6 +458,9 @@ impl ToSql for AlterTable {
                 dialect.quote_ident(old_name),
                 dialect.quote_ident(new_name)
             ),
+            AlterOperation::ChangeColumnType { name, ty } => {
+                dialect.alter_column_type_sql(&self.table, name, ty)
+            }
         };
         (sql, Vec::new())
     }

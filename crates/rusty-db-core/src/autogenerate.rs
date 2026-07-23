@@ -34,12 +34,24 @@
 //!   the new name expected but not yet live); a stale or irrelevant hint
 //!   is simply ignored rather than forced.
 //!
-//! Still entirely unaddressed: **diffing column type**. A live column's
-//! `type_name` is dialect-native, verbatim text (see `schema.rs`) with no
-//! portable representation to compare `ColumnType` against without
-//! reimplementing `automap::rust_type_for`'s heuristic in reverse, per
-//! dialect — changing a field's type without renaming it produces no
-//! suggested statement at all; review type-level changes by hand.
+//! - **Never detects a type change, unless explicitly hinted, and even
+//!   then only on Postgres.** A live column's `type_name` is
+//!   dialect-native, verbatim text (see `schema.rs`) with no portable
+//!   representation to compare `ColumnType` against without reimplementing
+//!   `automap::rust_type_for`'s heuristic in reverse, per dialect — so
+//!   instead of guessing, `AutogenerateOptions::changed_column_types` lets
+//!   the caller say "this table's column genuinely changed type" up
+//!   front, the same up-front-confirmation shape `renamed_columns` already
+//!   has (only acted on when the column is actually live on both sides —
+//!   a stale hint naming a column that no longer exists is simply
+//!   ignored). Unlike renames, though, this only ever produces a
+//!   statement on Postgres: `AlterTable::alter_column_type` panics on any
+//!   dialect where `Dialect::supports_alter_column_type()` is `false`
+//!   (MySQL/MariaDB's `MODIFY COLUMN` would silently reset any omitted
+//!   nullability/default, and SQLite has no direct support at all — see
+//!   that method's own doc), so `diff` checks the capability first and
+//!   quietly skips emitting anything for a hinted column when it's
+//!   `false`, rather than reaching that panic.
 
 use std::collections::HashMap;
 
@@ -72,7 +84,7 @@ impl TableSpec {
 /// Explicit, opt-in inputs to `diff`/`Engine::autogenerate_migration` for
 /// the two things it can't safely infer from `expected`/`existing` alone
 /// — see the module doc for why each needs a caller's say-so rather than
-/// a heuristic. Both default to empty, giving back exactly v1's
+/// a heuristic. All three default to empty, giving back exactly v1's
 /// conservative behavior.
 #[derive(Debug, Clone, Default)]
 pub struct AutogenerateOptions {
@@ -86,6 +98,14 @@ pub struct AutogenerateOptions {
     /// they're live but absent from `expected`. A live table *not* named
     /// here is always left alone, regardless of what `expected` contains.
     pub allow_drop_tables: Vec<String>,
+    /// `(table, column)` hints confirming a column's type genuinely
+    /// changed. Only acted on when the column is a live column of `table`
+    /// *and* still expected (same name on both sides — a rename or
+    /// add/drop is a different hint) — an otherwise-stale hint is simply
+    /// ignored. Even a matching hint only ever produces a statement when
+    /// `dialect.supports_alter_column_type()` is `true` (Postgres only,
+    /// for now); see the module doc for why.
+    pub changed_column_types: Vec<(String, String)>,
 }
 
 impl AutogenerateOptions {
@@ -104,6 +124,23 @@ impl AutogenerateOptions {
                     && !live_columns.contains(new_name.as_str())
             })
             .map(|(_, old_name, new_name)| (old_name.as_str(), new_name.as_str()))
+            .collect()
+    }
+
+    fn changed_column_types_for<'a>(
+        &'a self,
+        table: &str,
+        live_columns: &std::collections::HashSet<&str>,
+        expected_columns: &std::collections::HashSet<&str>,
+    ) -> std::collections::HashSet<&'a str> {
+        self.changed_column_types
+            .iter()
+            .filter(|(t, column)| {
+                t == table
+                    && live_columns.contains(column.as_str())
+                    && expected_columns.contains(column.as_str())
+            })
+            .map(|(_, column)| column.as_str())
             .collect()
     }
 }
@@ -178,6 +215,23 @@ pub fn diff(
                                 .to_sql(dialect)
                                 .0,
                         );
+                    }
+                }
+
+                if dialect.supports_alter_column_type() {
+                    let changed_types = options.changed_column_types_for(
+                        &table.name,
+                        &live_columns,
+                        &expected_columns,
+                    );
+                    for col in &table.columns {
+                        if changed_types.contains(col.name) {
+                            statements.push(
+                                AlterTable::alter_column_type(&table.name, col.name, col.ty)
+                                    .to_sql(dialect)
+                                    .0,
+                            );
+                        }
                     }
                 }
             }
@@ -423,6 +477,7 @@ mod tests {
                 "display_name".to_string(),
             )],
             allow_drop_tables: Vec::new(),
+            changed_column_types: Vec::new(),
         };
 
         let statements = diff(&QuestionMarkDialect, &expected, &existing, &options);
@@ -461,6 +516,7 @@ mod tests {
         let options = AutogenerateOptions {
             renamed_columns: vec![("users".to_string(), "foo".to_string(), "bar".to_string())],
             allow_drop_tables: Vec::new(),
+            changed_column_types: Vec::new(),
         };
 
         let mut statements = diff(&QuestionMarkDialect, &expected, &existing, &options);
@@ -492,6 +548,7 @@ mod tests {
         let options = AutogenerateOptions {
             renamed_columns: Vec::new(),
             allow_drop_tables: vec!["legacy_sessions".to_string()],
+            changed_column_types: Vec::new(),
         };
 
         let statements = diff(&QuestionMarkDialect, &expected, &existing, &options);
@@ -524,6 +581,151 @@ mod tests {
                 &existing,
                 &AutogenerateOptions::default(),
             ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_matching_type_change_hint_produces_an_alter_column_type_on_postgres() {
+        use crate::dialect::NumberedDialect;
+
+        let expected = vec![table_spec(
+            "users",
+            vec![
+                spec("id", ColumnType::I64, false),
+                spec("age", ColumnType::I64, false),
+            ],
+            Some("id"),
+        )];
+        let mut existing = HashMap::new();
+        existing.insert(
+            "users".to_string(),
+            TableSchema {
+                name: "users".to_string(),
+                columns: vec![live_column("id", false), live_column("age", false)],
+                unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                indexes: Vec::new(),
+            },
+        );
+        let options = AutogenerateOptions {
+            renamed_columns: Vec::new(),
+            allow_drop_tables: Vec::new(),
+            changed_column_types: vec![("users".to_string(), "age".to_string())],
+        };
+
+        let statements = diff(&NumberedDialect, &expected, &existing, &options);
+        assert_eq!(
+            statements,
+            vec![
+                r#"ALTER TABLE "users" ALTER COLUMN "age" TYPE BIGINT USING "age"::BIGINT"#
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unhinted_same_named_column_never_gets_a_type_change_even_on_postgres() {
+        use crate::dialect::NumberedDialect;
+
+        let expected = vec![table_spec(
+            "users",
+            vec![spec("age", ColumnType::I64, false)],
+            None,
+        )];
+        let mut existing = HashMap::new();
+        existing.insert(
+            "users".to_string(),
+            TableSchema {
+                name: "users".to_string(),
+                columns: vec![live_column("age", false)],
+                unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                indexes: Vec::new(),
+            },
+        );
+
+        assert_eq!(
+            diff(
+                &NumberedDialect,
+                &expected,
+                &existing,
+                &AutogenerateOptions::default(),
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_stale_type_change_hint_naming_a_column_missing_from_either_side_is_ignored() {
+        use crate::dialect::NumberedDialect;
+
+        let expected = vec![table_spec(
+            "users",
+            vec![spec("age", ColumnType::I64, false)],
+            None,
+        )];
+        let mut existing = HashMap::new();
+        existing.insert(
+            "users".to_string(),
+            TableSchema {
+                name: "users".to_string(),
+                columns: vec![live_column("age", false)],
+                unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                indexes: Vec::new(),
+            },
+        );
+        // "nickname" isn't a column of "users" on either side.
+        let options = AutogenerateOptions {
+            renamed_columns: Vec::new(),
+            allow_drop_tables: Vec::new(),
+            changed_column_types: vec![("users".to_string(), "nickname".to_string())],
+        };
+
+        assert_eq!(
+            diff(&NumberedDialect, &expected, &existing, &options),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_type_change_hint_is_ignored_on_a_dialect_that_cant_alter_a_columns_type_directly() {
+        // The same hint that produces a statement on Postgres (see
+        // `a_matching_type_change_hint_produces_an_alter_column_type_on_postgres`)
+        // produces nothing at all on SQLite, which has no direct `ALTER
+        // COLUMN ... TYPE` support — `diff` checks
+        // `Dialect::supports_alter_column_type()` before ever building the
+        // statement, rather than reaching `AlterTable::alter_column_type`'s
+        // own panic for an unsupported dialect.
+        let expected = vec![table_spec(
+            "users",
+            vec![spec("age", ColumnType::I64, false)],
+            None,
+        )];
+        let mut existing = HashMap::new();
+        existing.insert(
+            "users".to_string(),
+            TableSchema {
+                name: "users".to_string(),
+                columns: vec![live_column("age", false)],
+                unique_constraints: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                indexes: Vec::new(),
+            },
+        );
+        let options = AutogenerateOptions {
+            renamed_columns: Vec::new(),
+            allow_drop_tables: Vec::new(),
+            changed_column_types: vec![("users".to_string(), "age".to_string())],
+        };
+
+        assert_eq!(
+            diff(&QuestionMarkDialect, &expected, &existing, &options),
             Vec::<String>::new()
         );
     }

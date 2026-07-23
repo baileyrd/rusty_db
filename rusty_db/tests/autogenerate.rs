@@ -266,6 +266,7 @@ async fn a_rename_hint_produces_a_data_preserving_rename_column() -> rusty_db::R
             "display_name".to_string(),
         )],
         allow_drop_tables: Vec::new(),
+        changed_column_types: Vec::new(),
     };
     let statements = engine.autogenerate_migration(&expected, &options).await?;
     assert_eq!(
@@ -305,6 +306,7 @@ async fn an_allow_listed_table_absent_from_expected_gets_dropped() -> rusty_db::
     let options = AutogenerateOptions {
         renamed_columns: Vec::new(),
         allow_drop_tables: vec!["legacy_sessions".to_string()],
+        changed_column_types: Vec::new(),
     };
     let statements = engine.autogenerate_migration(&[], &options).await?;
     assert_eq!(

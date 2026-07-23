@@ -66,6 +66,39 @@ pub trait Dialect: Send + Sync {
         true
     }
 
+    /// Whether this dialect supports directly changing an existing
+    /// column's type in place (`ALTER COLUMN ... TYPE ...`/`MODIFY
+    /// COLUMN ...`). Postgres does; MySQL/MariaDB's `MODIFY COLUMN`
+    /// requires restating the column's *entire* definition (nullability,
+    /// default, ...) or those get silently reset to their own defaults,
+    /// a correctness trap this crate doesn't attempt to navigate yet;
+    /// SQLite has no direct support at all — changing a column's type
+    /// there needs a full create-copy-drop-rename table rebuild, also not
+    /// attempted. Both keep the default of `false`.
+    fn supports_alter_column_type(&self) -> bool {
+        false
+    }
+
+    /// Renders `ALTER TABLE <table> ALTER COLUMN <column> TYPE <ty>` (with
+    /// a `USING` cast, so it also works for conversions Postgres won't
+    /// perform implicitly) — only ever called when
+    /// `supports_alter_column_type()` is `true`; panics otherwise, since
+    /// there's no portable rendering to fall back to. See
+    /// `supports_alter_column_type`'s own doc for why MySQL/SQLite don't
+    /// override this.
+    fn alter_column_type_sql(
+        &self,
+        table: &str,
+        column: &str,
+        ty: &crate::query::ColumnType,
+    ) -> String {
+        let _ = (table, column, ty);
+        panic!(
+            "{:?} does not support directly altering a column's type",
+            self.name()
+        )
+    }
+
     /// Whether this dialect supports two-phase (prepared) commit — a
     /// transaction that's durably prepared on one call and only later,
     /// possibly from an entirely different connection, either finalized or
@@ -146,6 +179,28 @@ impl Dialect for NumberedDialect {
 
     fn supports_two_phase_commit(&self) -> bool {
         true
+    }
+
+    fn supports_alter_column_type(&self) -> bool {
+        true
+    }
+
+    fn alter_column_type_sql(
+        &self,
+        table: &str,
+        column: &str,
+        ty: &crate::query::ColumnType,
+    ) -> String {
+        let quoted_column = self.quote_ident(column);
+        let rendered_ty = self.column_type_sql(ty);
+        format!(
+            "ALTER TABLE {} ALTER COLUMN {} TYPE {} USING {}::{}",
+            self.quote_ident(table),
+            quoted_column,
+            rendered_ty,
+            quoted_column,
+            rendered_ty,
+        )
     }
 
     fn column_type_sql(&self, ty: &crate::query::ColumnType) -> String {
