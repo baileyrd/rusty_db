@@ -1149,6 +1149,127 @@ async fn belongs_to_joined_with_a_filter_narrows_the_child_batch() -> rusty_db::
 }
 
 #[tokio::test]
+async fn many_to_many_joined_matches_the_select_in_result_despite_colliding_id_columns(
+) -> rusty_db::Result<()> {
+    // Post and Tag both map their own "id" column too.
+    let engine = engine_with_schema().await?;
+
+    let rust_post = Post {
+        id: 1,
+        title: "Why Rust".to_string(),
+    };
+    let db_post = Post {
+        id: 2,
+        title: "Databases 101".to_string(),
+    };
+    // A third post with no tags at all, to prove it still appears in the
+    // parent list but has no entry in the targets map.
+    let untagged_post = Post {
+        id: 3,
+        title: "Untagged".to_string(),
+    };
+    engine.execute(&rust_post.insert()).await?;
+    engine.execute(&db_post.insert()).await?;
+    engine.execute(&untagged_post.insert()).await?;
+
+    let rust_tag = Tag {
+        id: 1,
+        name: "rust".to_string(),
+    };
+    let db_tag = Tag {
+        id: 2,
+        name: "databases".to_string(),
+    };
+    let systems_tag = Tag {
+        id: 3,
+        name: "systems".to_string(),
+    };
+    engine.execute(&rust_tag.insert()).await?;
+    engine.execute(&db_tag.insert()).await?;
+    engine.execute(&systems_tag.insert()).await?;
+
+    // rust_post: rust + systems; db_post: rust + databases.
+    insert_post_tag(&engine, rust_post.id, rust_tag.id).await?;
+    insert_post_tag(&engine, rust_post.id, systems_tag.id).await?;
+    insert_post_tag(&engine, db_post.id, rust_tag.id).await?;
+    insert_post_tag(&engine, db_post.id, db_tag.id).await?;
+
+    let (parents, tags_by_post): (Vec<Post>, HashMap<i64, Vec<Tag>>) =
+        rusty_db::relations::load_many_to_many_joined(
+            &engine,
+            None,
+            "id",
+            "post_tags",
+            "post_id",
+            "tag_id",
+            "id",
+        )
+        .await?;
+
+    // Every post comes back exactly once, including the untagged one — the
+    // join's per-tag row repetition was correctly deduplicated.
+    let mut parent_ids: Vec<i64> = parents.iter().map(|p| p.id).collect();
+    parent_ids.sort();
+    assert_eq!(parent_ids, vec![1, 2, 3]);
+
+    let mut rust_post_tags = tags_by_post.get(&rust_post.id).unwrap().clone();
+    rust_post_tags.sort_by_key(|t| t.id);
+    assert_eq!(rust_post_tags, vec![rust_tag.clone(), systems_tag.clone()]);
+    let mut db_post_tags = tags_by_post.get(&db_post.id).unwrap().clone();
+    db_post_tags.sort_by_key(|t| t.id);
+    assert_eq!(db_post_tags, vec![rust_tag.clone(), db_tag.clone()]);
+    // A targetless parent still appears in the parent list, but has no
+    // entry at all in the targets map — same as `load_many_to_many`'s shape.
+    assert!(!tags_by_post.contains_key(&untagged_post.id));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn many_to_many_joined_with_a_filter_narrows_the_parent_batch() -> rusty_db::Result<()> {
+    let engine = engine_with_schema().await?;
+
+    let rust_post = Post {
+        id: 1,
+        title: "Why Rust".to_string(),
+    };
+    let db_post = Post {
+        id: 2,
+        title: "Databases 101".to_string(),
+    };
+    engine.execute(&rust_post.insert()).await?;
+    engine.execute(&db_post.insert()).await?;
+
+    let rust_tag = Tag {
+        id: 1,
+        name: "rust".to_string(),
+    };
+    engine.execute(&rust_tag.insert()).await?;
+    insert_post_tag(&engine, rust_post.id, rust_tag.id).await?;
+    insert_post_tag(&engine, db_post.id, rust_tag.id).await?;
+
+    let filter = Post::table().col("id").eq(1_i64);
+    let (parents, tags_by_post): (Vec<Post>, HashMap<i64, Vec<Tag>>) =
+        rusty_db::relations::load_many_to_many_joined(
+            &engine,
+            Some(filter),
+            "id",
+            "post_tags",
+            "post_id",
+            "tag_id",
+            "id",
+        )
+        .await?;
+
+    assert_eq!(parents, vec![rust_post.clone()]);
+    assert!(tags_by_post.contains_key(&rust_post.id));
+    // db_post's tag genuinely exists but db_post was excluded by the filter.
+    assert!(!tags_by_post.contains_key(&db_post.id));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn delete_cascading_deletes_cascade_delete_children_and_the_parent() -> rusty_db::Result<()> {
     let engine = engine_with_schema().await?;
 
