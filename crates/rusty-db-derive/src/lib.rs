@@ -652,7 +652,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         .map(|spec| {
             let select_in = expand_has_many(struct_ident, &core, primary_key, spec)?;
             let subquery = expand_has_many_via_subquery(struct_ident, &core, primary_key, spec)?;
-            Ok(quote! { #select_in #subquery })
+            let joined = expand_has_many_joined(struct_ident, &core, primary_key, spec)?;
+            Ok(quote! { #select_in #subquery #joined })
         })
         .collect::<syn::Result<Vec<_>>>()?;
 
@@ -661,7 +662,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         .map(|spec| {
             let select_in = expand_has_one(struct_ident, &core, primary_key, spec)?;
             let subquery = expand_has_one_via_subquery(struct_ident, &core, primary_key, spec)?;
-            Ok(quote! { #select_in #subquery })
+            let joined = expand_has_one_joined(struct_ident, &core, primary_key, spec)?;
+            Ok(quote! { #select_in #subquery #joined })
         })
         .collect::<syn::Result<Vec<_>>>()?;
 
@@ -670,7 +672,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         .map(|spec| {
             let select_in = expand_belongs_to(struct_ident, &core, &fields, spec)?;
             let subquery = expand_belongs_to_via_subquery(struct_ident, &core, &fields, spec)?;
-            Ok(quote! { #select_in #subquery })
+            let joined = expand_belongs_to_joined(struct_ident, &core, &fields, spec)?;
+            Ok(quote! { #select_in #subquery #joined })
         })
         .collect::<syn::Result<Vec<_>>>()?;
 
@@ -680,7 +683,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             let select_in = expand_many_to_many(struct_ident, &core, primary_key, spec)?;
             let subquery =
                 expand_many_to_many_via_subquery(struct_ident, &core, primary_key, spec)?;
-            Ok(quote! { #select_in #subquery })
+            let joined = expand_many_to_many_joined(struct_ident, &core, primary_key, spec)?;
+            Ok(quote! { #select_in #subquery #joined })
         })
         .collect::<syn::Result<Vec<_>>>()?;
 
@@ -842,6 +846,60 @@ fn expand_has_many_via_subquery(
     })
 }
 
+/// "joined"-strategy alternative to `expand_has_many`'s generated method:
+/// fetches every matching `Self` row (via an optional `filter` on `Self`'s
+/// own table) together with its `Child` rows in a single `LEFT JOIN` query
+/// instead of a second round trip — see
+/// `rusty_db_core::relations::load_many_joined`.
+fn expand_has_many_joined(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[has_many(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_column = &pk.column;
+    let pk_ty = &pk.ty;
+    let child = &spec.target;
+    let fk_column = &spec.foreign_key;
+
+    let child_name = child
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}s_joined", child_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "joined"-strategy eager load of every matching `#struct_ident`
+            /// row (`filter` on this type's own table, `None` for no filter)
+            /// together with its `#child` rows, in a single `LEFT JOIN`
+            /// query — see `rusty_db_core::relations::load_many_joined`.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                filter: ::std::option::Option<#core::Expr>,
+            ) -> #core::Result<(
+                ::std::vec::Vec<#struct_ident>,
+                ::std::collections::HashMap<#pk_ty, ::std::vec::Vec<#child>>,
+            )> {
+                #core::relations::load_many_joined::<#struct_ident, #child, #pk_ty>(
+                    engine,
+                    filter,
+                    #pk_column,
+                    #fk_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
 /// `#[has_one(Child, foreign_key = "...")]` generates a batched loader keyed
 /// by `Self`'s own primary key (which the child's `foreign_key` column
 /// references) — the same direction as `#[has_many(...)]`, but for a
@@ -939,6 +997,61 @@ fn expand_has_one_via_subquery(
                 #core::relations::load_has_one_via_subquery::<#child, #pk_ty>(
                     engine,
                     parent_ids,
+                    #pk_column,
+                    #fk_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// "joined"-strategy alternative to `expand_has_one`'s generated method —
+/// see `expand_has_many_joined` for what `filter` means, and
+/// `rusty_db_core::relations::load_has_one_joined` for the same one-to-one
+/// conflict check `expand_has_one` shares.
+fn expand_has_one_joined(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[has_one(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_column = &pk.column;
+    let pk_ty = &pk.ty;
+    let child = &spec.target;
+    let fk_column = &spec.foreign_key;
+
+    let child_name = child
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}_joined", child_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "joined"-strategy eager load of every matching `#struct_ident`
+            /// row (`filter` on this type's own table, `None` for no filter)
+            /// together with the single `#child` row (if any) referencing
+            /// it, in a single `LEFT JOIN` query. `Err(Error::Conflict)` if
+            /// more than one `#child` row references the same parent — see
+            /// `rusty_db_core::relations::load_has_one_joined`.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                filter: ::std::option::Option<#core::Expr>,
+            ) -> #core::Result<(
+                ::std::vec::Vec<#struct_ident>,
+                ::std::collections::HashMap<#pk_ty, #child>,
+            )> {
+                #core::relations::load_has_one_joined::<#struct_ident, #child, #pk_ty>(
+                    engine,
+                    filter,
                     #pk_column,
                     #fk_column,
                 )
@@ -1050,6 +1163,67 @@ fn expand_many_to_many_via_subquery(
                 #core::relations::load_many_to_many_via_subquery::<#target, #pk_ty>(
                     engine,
                     parent_ids,
+                    #pk_column,
+                    #through,
+                    #local_key,
+                    #foreign_key,
+                    target_key_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// "joined"-strategy alternative to `expand_many_to_many`'s generated
+/// method — see `expand_has_many_joined` for what `filter` means, and
+/// `rusty_db_core::relations::load_many_to_many_joined` for the rest.
+fn expand_many_to_many_joined(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &ManyToManySpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[many_to_many(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_column = &pk.column;
+    let pk_ty = &pk.ty;
+    let target = &spec.target;
+    let through = &spec.through;
+    let local_key = &spec.local_key;
+    let foreign_key = &spec.foreign_key;
+
+    let target_name = target
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}s_joined", target_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "joined"-strategy eager load of every matching `#struct_ident`
+            /// row (`filter` on this type's own table, `None` for no filter)
+            /// together with every `#target` row related to it through the
+            /// `#through` join table, in a single two-hop `LEFT JOIN` query
+            /// — see `rusty_db_core::relations::load_many_to_many_joined`.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                filter: ::std::option::Option<#core::Expr>,
+            ) -> #core::Result<(
+                ::std::vec::Vec<#struct_ident>,
+                ::std::collections::HashMap<#pk_ty, ::std::vec::Vec<#target>>,
+            )> {
+                let target_key_column = <#target as #core::Mapped>::PRIMARY_KEY.expect(
+                    "#[many_to_many(...)] target must have a #[table(primary_key)] field",
+                );
+                #core::relations::load_many_to_many_joined::<#struct_ident, #target, #pk_ty>(
+                    engine,
+                    filter,
                     #pk_column,
                     #through,
                     #local_key,
@@ -1303,6 +1477,65 @@ fn expand_belongs_to_via_subquery(
                 #core::relations::load_one_via_subquery::<#parent, #fk_ty>(
                     engine,
                     foreign_key_ids,
+                    #fk_column,
+                    parent_key_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// "joined"-strategy alternative to `expand_belongs_to`'s generated method
+/// — the deduplication direction flips relative to
+/// `expand_has_many_joined`/`expand_has_one_joined` (see
+/// `rusty_db_core::relations::load_one_joined`'s own doc for why). Doesn't
+/// re-validate `cascade` — `expand_belongs_to` already rejects it for this
+/// attribute, and runs first (see the `?` chaining at the call site).
+fn expand_belongs_to_joined(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    fields: &[FieldInfo],
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let fk_column_value = spec.foreign_key.value();
+    let fk_field = fields.iter().find(|f| f.column == fk_column_value).ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.foreign_key,
+            format!("no field maps to column {fk_column_value:?}; #[belongs_to(...)]'s foreign_key must name a column on this struct"),
+        )
+    })?;
+    let fk_ty = &fk_field.ty;
+    let fk_column = &spec.foreign_key;
+    let parent = &spec.target;
+
+    let parent_name = parent
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}_joined", parent_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "joined"-strategy eager load of every matching `#struct_ident`
+            /// row (`filter` on this type's own table, `None` for no filter)
+            /// together with the `#parent` row it references, in a single
+            /// `LEFT JOIN` query — see
+            /// `rusty_db_core::relations::load_one_joined`.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                filter: ::std::option::Option<#core::Expr>,
+            ) -> #core::Result<(
+                ::std::vec::Vec<#struct_ident>,
+                ::std::collections::HashMap<#fk_ty, #parent>,
+            )> {
+                let parent_key_column = <#parent as #core::Mapped>::PRIMARY_KEY.expect(
+                    "#[belongs_to(...)] target must have a #[table(primary_key)] field",
+                );
+                #core::relations::load_one_joined::<#struct_ident, #parent, #fk_ty>(
+                    engine,
+                    filter,
                     #fk_column,
                     parent_key_column,
                 )
