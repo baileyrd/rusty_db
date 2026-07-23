@@ -653,7 +653,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             let select_in = expand_has_many(struct_ident, &core, primary_key, spec)?;
             let subquery = expand_has_many_via_subquery(struct_ident, &core, primary_key, spec)?;
             let joined = expand_has_many_joined(struct_ident, &core, primary_key, spec)?;
-            Ok(quote! { #select_in #subquery #joined })
+            let joined_from_query =
+                expand_has_many_joined_from_query(struct_ident, &core, primary_key, spec)?;
+            Ok(quote! { #select_in #subquery #joined #joined_from_query })
         })
         .collect::<syn::Result<Vec<_>>>()?;
 
@@ -663,7 +665,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             let select_in = expand_has_one(struct_ident, &core, primary_key, spec)?;
             let subquery = expand_has_one_via_subquery(struct_ident, &core, primary_key, spec)?;
             let joined = expand_has_one_joined(struct_ident, &core, primary_key, spec)?;
-            Ok(quote! { #select_in #subquery #joined })
+            let joined_from_query =
+                expand_has_one_joined_from_query(struct_ident, &core, primary_key, spec)?;
+            Ok(quote! { #select_in #subquery #joined #joined_from_query })
         })
         .collect::<syn::Result<Vec<_>>>()?;
 
@@ -673,7 +677,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             let select_in = expand_belongs_to(struct_ident, &core, &fields, spec)?;
             let subquery = expand_belongs_to_via_subquery(struct_ident, &core, &fields, spec)?;
             let joined = expand_belongs_to_joined(struct_ident, &core, &fields, spec)?;
-            Ok(quote! { #select_in #subquery #joined })
+            let joined_from_query =
+                expand_belongs_to_joined_from_query(struct_ident, &core, &fields, spec)?;
+            Ok(quote! { #select_in #subquery #joined #joined_from_query })
         })
         .collect::<syn::Result<Vec<_>>>()?;
 
@@ -684,7 +690,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             let subquery =
                 expand_many_to_many_via_subquery(struct_ident, &core, primary_key, spec)?;
             let joined = expand_many_to_many_joined(struct_ident, &core, primary_key, spec)?;
-            Ok(quote! { #select_in #subquery #joined })
+            let joined_from_query =
+                expand_many_to_many_joined_from_query(struct_ident, &core, primary_key, spec)?;
+            Ok(quote! { #select_in #subquery #joined #joined_from_query })
         })
         .collect::<syn::Result<Vec<_>>>()?;
 
@@ -900,6 +908,59 @@ fn expand_has_many_joined(
     })
 }
 
+/// Like `expand_has_many_joined`'s generated method, but instead of a
+/// plain `filter`, takes an arbitrary `Select` on `Self`'s own table —
+/// see `rusty_db_core::relations::load_many_joined_from_query`.
+fn expand_has_many_joined_from_query(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[has_many(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_column = &pk.column;
+    let pk_ty = &pk.ty;
+    let child = &spec.target;
+    let fk_column = &spec.foreign_key;
+
+    let child_name = child
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}s_joined_from_query", child_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "joined"-strategy eager load of every `#struct_ident` row
+            /// selected by `parents` (which must select every one of this
+            /// type's own columns, each under its own column name) together
+            /// with its `#child` rows, in a single `LEFT JOIN` query — see
+            /// `rusty_db_core::relations::load_many_joined_from_query`.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                parents: #core::Select,
+            ) -> #core::Result<(
+                ::std::vec::Vec<#struct_ident>,
+                ::std::collections::HashMap<#pk_ty, ::std::vec::Vec<#child>>,
+            )> {
+                #core::relations::load_many_joined_from_query::<#struct_ident, #child, #pk_ty>(
+                    engine,
+                    parents,
+                    #pk_column,
+                    #fk_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
 /// `#[has_one(Child, foreign_key = "...")]` generates a batched loader keyed
 /// by `Self`'s own primary key (which the child's `foreign_key` column
 /// references) — the same direction as `#[has_many(...)]`, but for a
@@ -1052,6 +1113,61 @@ fn expand_has_one_joined(
                 #core::relations::load_has_one_joined::<#struct_ident, #child, #pk_ty>(
                     engine,
                     filter,
+                    #pk_column,
+                    #fk_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// Like `expand_has_one_joined`'s generated method, but instead of a
+/// plain `filter`, takes an arbitrary `Select` on `Self`'s own table —
+/// see `rusty_db_core::relations::load_has_one_joined_from_query`.
+fn expand_has_one_joined_from_query(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[has_one(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_column = &pk.column;
+    let pk_ty = &pk.ty;
+    let child = &spec.target;
+    let fk_column = &spec.foreign_key;
+
+    let child_name = child
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}_joined_from_query", child_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "joined"-strategy eager load of every `#struct_ident` row
+            /// selected by `parents` (which must select every one of this
+            /// type's own columns, each under its own column name) together
+            /// with the single `#child` row (if any) referencing it, in a
+            /// single `LEFT JOIN` query. `Err(Error::Conflict)` if more than
+            /// one `#child` row references the same parent — see
+            /// `rusty_db_core::relations::load_has_one_joined_from_query`.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                parents: #core::Select,
+            ) -> #core::Result<(
+                ::std::vec::Vec<#struct_ident>,
+                ::std::collections::HashMap<#pk_ty, #child>,
+            )> {
+                #core::relations::load_has_one_joined_from_query::<#struct_ident, #child, #pk_ty>(
+                    engine,
+                    parents,
                     #pk_column,
                     #fk_column,
                 )
@@ -1224,6 +1340,69 @@ fn expand_many_to_many_joined(
                 #core::relations::load_many_to_many_joined::<#struct_ident, #target, #pk_ty>(
                     engine,
                     filter,
+                    #pk_column,
+                    #through,
+                    #local_key,
+                    #foreign_key,
+                    target_key_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// Like `expand_many_to_many_joined`'s generated method, but instead of a
+/// plain `filter`, takes an arbitrary `Select` on `Self`'s own table —
+/// see `rusty_db_core::relations::load_many_to_many_joined_from_query`.
+fn expand_many_to_many_joined_from_query(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    primary_key: Option<&FieldInfo>,
+    spec: &ManyToManySpec,
+) -> syn::Result<TokenStream2> {
+    let pk = primary_key.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.target,
+            "#[many_to_many(...)] requires a #[table(primary_key)] field on this struct",
+        )
+    })?;
+    let pk_column = &pk.column;
+    let pk_ty = &pk.ty;
+    let target = &spec.target;
+    let through = &spec.through;
+    let local_key = &spec.local_key;
+    let foreign_key = &spec.foreign_key;
+
+    let target_name = target
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}s_joined_from_query", target_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "joined"-strategy eager load of every `#struct_ident` row
+            /// selected by `parents` (which must select every one of this
+            /// type's own columns, each under its own column name) together
+            /// with every `#target` row related to it through the
+            /// `#through` join table, in a single two-hop `LEFT JOIN` query
+            /// — see
+            /// `rusty_db_core::relations::load_many_to_many_joined_from_query`.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                parents: #core::Select,
+            ) -> #core::Result<(
+                ::std::vec::Vec<#struct_ident>,
+                ::std::collections::HashMap<#pk_ty, ::std::vec::Vec<#target>>,
+            )> {
+                let target_key_column = <#target as #core::Mapped>::PRIMARY_KEY.expect(
+                    "#[many_to_many(...)] target must have a #[table(primary_key)] field",
+                );
+                #core::relations::load_many_to_many_joined_from_query::<#struct_ident, #target, #pk_ty>(
+                    engine,
+                    parents,
                     #pk_column,
                     #through,
                     #local_key,
@@ -1536,6 +1715,65 @@ fn expand_belongs_to_joined(
                 #core::relations::load_one_joined::<#struct_ident, #parent, #fk_ty>(
                     engine,
                     filter,
+                    #fk_column,
+                    parent_key_column,
+                )
+                .await
+            }
+        }
+    })
+}
+
+/// Like `expand_belongs_to_joined`'s generated method, but instead of a
+/// plain `filter`, takes an arbitrary `Select` on `Self`'s own table —
+/// see `rusty_db_core::relations::load_one_joined_from_query`. Doesn't
+/// re-validate `cascade` — `expand_belongs_to` already rejects it for
+/// this attribute, and runs first (see the `?` chaining at the call site).
+fn expand_belongs_to_joined_from_query(
+    struct_ident: &syn::Ident,
+    core: &TokenStream2,
+    fields: &[FieldInfo],
+    spec: &RelationSpec,
+) -> syn::Result<TokenStream2> {
+    let fk_column_value = spec.foreign_key.value();
+    let fk_field = fields.iter().find(|f| f.column == fk_column_value).ok_or_else(|| {
+        syn::Error::new_spanned(
+            &spec.foreign_key,
+            format!("no field maps to column {fk_column_value:?}; #[belongs_to(...)]'s foreign_key must name a column on this struct"),
+        )
+    })?;
+    let fk_ty = &fk_field.ty;
+    let fk_column = &spec.foreign_key;
+    let parent = &spec.target;
+
+    let parent_name = parent
+        .segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default();
+    let method_ident = format_ident!("load_{}_joined_from_query", parent_name.to_snake_case());
+
+    Ok(quote! {
+        impl #struct_ident {
+            /// "joined"-strategy eager load of every `#struct_ident` row
+            /// selected by `children` (which must select every one of this
+            /// type's own columns, each under its own column name) together
+            /// with the `#parent` row it references, in a single
+            /// `LEFT JOIN` query — see
+            /// `rusty_db_core::relations::load_one_joined_from_query`.
+            pub async fn #method_ident(
+                engine: &#core::Engine,
+                children: #core::Select,
+            ) -> #core::Result<(
+                ::std::vec::Vec<#struct_ident>,
+                ::std::collections::HashMap<#fk_ty, #parent>,
+            )> {
+                let parent_key_column = <#parent as #core::Mapped>::PRIMARY_KEY.expect(
+                    "#[belongs_to(...)] target must have a #[table(primary_key)] field",
+                );
+                #core::relations::load_one_joined_from_query::<#struct_ident, #parent, #fk_ty>(
+                    engine,
+                    children,
                     #fk_column,
                     parent_key_column,
                 )
