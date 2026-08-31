@@ -1,5 +1,11 @@
 # rusty_db
 
+> **This repository has moved.** `rusty_db` now lives at
+> [`crates/rusty_db`](https://github.com/Rusty-Mill/rusty_mill/tree/main/crates/rusty_db)
+> in the [`rusty_mill`](https://github.com/Rusty-Mill/rusty_mill) monorepo, with full commit
+> history preserved. This repository is kept for historical reference and is no longer
+> developed; please open issues and pull requests against `rusty_mill` instead.
+
 A Rust take on [SQLAlchemy Core](https://docs.sqlalchemy.org/en/20/core/): a single, database-agnostic query builder and connection API that lets you swap the underlying database without touching application code.
 
 ## Architecture
